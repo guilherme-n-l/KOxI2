@@ -1,0 +1,170 @@
+{
+  description = "KOxI v2 - Kernel Oxidation Instrument, Rust rewrite";
+
+  inputs = {
+    nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";
+    flake-utils.url = "github:numtide/flake-utils";
+    git-hooks = {
+      url = "github:cachix/git-hooks.nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
+
+  outputs =
+    {
+      self,
+      nixpkgs,
+      flake-utils,
+      git-hooks,
+      ...
+    }:
+    # Not eachDefaultSystem: that list still contains x86_64-darwin,
+    # which nixpkgs 26.11 (current unstable) dropped and hard-errors on.
+    flake-utils.lib.eachSystem
+      [
+        "x86_64-linux"
+        "aarch64-linux"
+        "aarch64-darwin"
+      ]
+      (
+        system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          inherit (pkgs) lib;
+
+          # Tools that run on the build machine while compiling koxi itself
+          # (buildPlatform under cross-compilation).
+          nativeBuildInputs = with pkgs; [
+            rustc
+            cargo
+            pkg-config
+          ];
+
+          # Libraries linked into the koxi binary (hostPlatform under cross).
+          # openssl covers the usual -sys crates (openssl-sys, libgit2);
+          # adjust as Cargo dependencies land.
+          buildInputs = with pkgs; [
+            openssl
+          ];
+
+          # Runtime tool environment: everything the harness shells out to,
+          # mirroring block/dependencies.md from KOxI v1. Not build
+          # dependencies of the crate.
+          extraPackages =
+            # Kernel / BusyBox / dropbear / fio build chain. Linux-only:
+            # kernels are built natively, never from a darwin host.
+            lib.optionals pkgs.stdenv.hostPlatform.isLinux (
+              with pkgs;
+              [
+                gcc
+                gnumake
+                patch
+                autoconf
+                automake
+                libtool
+                bc
+                flex
+                bison
+                perl
+                elfutils # libelf
+                pahole
+                ncurses # menuconfig
+                kmod # modpost, depmod
+                musl # musl-gcc for the static initramfs userland
+                util-linux # setsid
+                rust-bindgen # rnull (Rust-for-Linux) bindings
+              ]
+            )
+            # Archive / download
+            ++ (with pkgs; [
+              wget
+              gzip
+              xz
+              bzip2
+              cpio
+              unzip
+            ])
+            # VM + SSH
+            ++ (with pkgs; [
+              qemu # qemu-system-x86_64
+              openssh
+            ])
+            # Fuzzing, static analysis, utilities
+            ++ (with pkgs; [
+              go # syzkaller build
+              cloc
+              jq
+              git
+            ]);
+
+          # Dev-only helpers; never needed to build or run koxi.
+          devPackages = with pkgs; [
+            rust-analyzer
+            clippy
+            rustfmt
+            shellcheck
+            shfmt
+            nixfmt
+            # LSP servers enabled in .nvim.lua (rust-analyzer above)
+            nixd
+            bash-language-server
+            taplo
+          ];
+
+          # Git pre-commit hooks; also run repo-wide by `nix flake check`.
+          pre-commit = git-hooks.lib.${system}.run {
+            src = ./.;
+            hooks = {
+              rustfmt.enable = true;
+              clippy.enable = true;
+              nixfmt-rfc-style = {
+                enable = true;
+                # Avoids the deprecated nixfmt-rfc-style alias the hook
+                # defaults to.
+                package = pkgs.nixfmt;
+              };
+              shellcheck.enable = true;
+              shfmt.enable = true;
+            };
+          };
+
+          koxi = pkgs.rustPlatform.buildRustPackage {
+            pname = "koxi";
+            version = "0.1.0";
+            src = self;
+            cargoLock.lockFile = ./Cargo.lock;
+            inherit nativeBuildInputs buildInputs;
+            meta = {
+              description = "Kernel Oxidation Instrument - Rust rewrite";
+              mainProgram = "koxi";
+            };
+          };
+        in
+        {
+          packages = {
+            inherit koxi;
+            default = koxi;
+          };
+
+          checks = {
+            inherit pre-commit;
+          };
+
+          devShells.default = pkgs.mkShell {
+            inherit nativeBuildInputs buildInputs;
+            packages = extraPackages ++ devPackages ++ pre-commit.enabledPackages;
+
+            # Installs the git hooks on shell entry.
+            shellHook = pre-commit.shellHook;
+
+            # rust-src: used by rust-analyzer and by the kernel's Rust
+            # (rnull) build, which needs the standard library sources.
+            env.RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+          };
+
+          # nixfmt-tree = treefmt wrapper; bare nixfmt reads stdin under
+          # `nix fmt` instead of walking the tree.
+          formatter = pkgs.nixfmt-tree;
+        }
+      );
+}
