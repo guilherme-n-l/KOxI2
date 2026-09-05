@@ -47,7 +47,8 @@ fn kbuild_arch(target: &str) -> Option<(&'static str, &'static str)> {
 
 /// Bumped when the build steps themselves change, so artifacts built
 /// by an older recipe never fingerprint-match the new one.
-const RECIPE: u32 = 1;
+/// r2: harvest kernel modules into artifacts/.
+const RECIPE: u32 = 2;
 
 pub struct Options {
     pub force: bool,
@@ -58,6 +59,17 @@ pub struct Options {
     pub cc: String,
     /// Build target arch in kbuild vocabulary (see [`kbuild_arch`]).
     pub target: String,
+    /// Kernel modules to harvest into artifacts/ after the build.
+    pub modules: Vec<Module>,
+}
+
+/// A module to harvest: its tree-relative path and artifact name.
+/// Missing modules warn rather than fail — a registry driver may be
+/// built-in (=y) or absent from the config; phases that require a
+/// specific module validate at their own step.
+pub struct Module {
+    pub file: String,
+    pub tree_path: std::path::PathBuf,
 }
 
 /// Ensure the kernel image is built; returns its path
@@ -86,10 +98,14 @@ pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
     let toolchain = toolchain_id(&opts.cc, logs);
     let expected = fingerprint(source_sha, &kconfig.sha256, &toolchain);
 
+    let harvested_missing = |file: &str| !artifacts.join(file).is_file();
     if artifact.is_file()
         && !opts.force
         && !opts.menuconfig
         && ctx.lock.builds.get(&build_key) == Some(&expected)
+        && !opts.modules.iter().any(|module| {
+            ctx.lock.artifacts.contains_key(&module.file) && harvested_missing(&module.file)
+        })
     {
         debug!("kernel image cached at {}", artifact.display());
         return Ok(artifact);
@@ -160,6 +176,29 @@ pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
         }
         fs::create_dir_all(&artifacts)?;
         fs::copy(&bzimage, &artifact)?;
+        ctx.lock
+            .artifacts
+            .insert(BZIMAGE.to_owned(), fetch::sha256(&artifact, logs)?);
+
+        // Harvest the requested modules and lock their hashes; the
+        // scratch (and the .kos in it) is gone after this function.
+        for module in &opts.modules {
+            let built = tree.join(&module.tree_path);
+            if !built.is_file() {
+                warn!(
+                    "module {} not produced by this config (built-in or disabled); skipping",
+                    module.file
+                );
+                ctx.lock.artifacts.remove(&module.file);
+                continue;
+            }
+            let dest = artifacts.join(&module.file);
+            fs::copy(&built, &dest)?;
+            ctx.lock
+                .artifacts
+                .insert(module.file.clone(), fetch::sha256(&dest, logs)?);
+            info!("harvested {}", dest.display());
+        }
 
         // Re-hash the config actually used (menuconfig may have
         // changed it) so the recorded fingerprint matches the image.

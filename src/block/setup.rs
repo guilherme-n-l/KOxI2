@@ -86,6 +86,18 @@ fn drive(ctx: &mut Ctx, opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
         .target
         .clone()
         .unwrap_or_else(|| "x86_64".to_owned());
+    // Harvest every registry driver's module; built-ins warn and are
+    // skipped inside the build.
+    let modules = ctx
+        .config
+        .block
+        .drivers
+        .values()
+        .map(|driver| kernel::build::Module {
+            file: driver.ko.clone(),
+            tree_path: driver.ko_dir.join(&driver.ko),
+        })
+        .collect();
     let image = kernel::build::build(
         ctx,
         &kernel::build::Options {
@@ -94,6 +106,7 @@ fn drive(ctx: &mut Ctx, opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
             skip_build: opts.skip_build,
             cc,
             target,
+            modules,
         },
     )?;
     info!("kernel image ready at {}", image.display());

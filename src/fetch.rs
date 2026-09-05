@@ -368,7 +368,8 @@ fn download(url: &str, dest: &Path, logs: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-fn sha256(path: &Path, logs: &Path) -> Result<String, Error> {
+/// sha256 of a file, via the same sha256sum used everywhere else.
+pub fn sha256(path: &Path, logs: &Path) -> Result<String, Error> {
     let mut cmd = Command::new("sha256sum");
     cmd.arg(path);
     let stdout = cmd::stdout(cmd, "sha256sum", logs)?;
