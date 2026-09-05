@@ -111,9 +111,9 @@ pub fn command() -> Command {
             opt("logfile", "LOGFILE")
                 .value_name("path")
                 .value_parser(value_parser!(PathBuf))
-                .default_value("out/run.log")
+                .default_value("run.log")
                 .conflicts_with("nologfile")
-                .help("Log file (default resolved under KOXI_HOME)"),
+                .help("Log file (default: KOXI_HOME/log/<project>/<run-id>/run.log)"),
         )
         .arg(flag("nologfile", "NOLOGFILE").help("Discard subprocess output"))
         .arg(flag("nocache", "NOCACHE").help("Clear the KOXI_HOME download cache before running"))
@@ -138,7 +138,7 @@ pub fn command() -> Command {
             opt("initrd", "INITRD")
                 .value_name("path")
                 .value_parser(value_parser!(PathBuf))
-                .default_value("out/initramfs.cpio.gz")
+                .default_value("artifacts/initramfs.cpio.gz")
                 .help_heading("VM / benchmark")
                 .help("Initrd"),
         )
@@ -498,7 +498,7 @@ mod tests {
         let opts = super::Opts::from_matches(sub);
         assert_eq!(opts.smp, 4);
         assert_eq!(opts.fio_qd, vec![1, 32, 256]);
-        assert_eq!(opts.logfile, std::path::PathBuf::from("out/run.log"));
+        assert_eq!(opts.logfile, std::path::PathBuf::from("run.log"));
         assert!(!opts.yes);
     }
 }

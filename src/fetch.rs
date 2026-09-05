@@ -18,8 +18,9 @@ use crate::cmd;
 use crate::config::{Config, Source};
 use crate::lock::{Lock, LockedSource};
 
-/// Download/extract cache under the koxi home (`--nocache` clears it).
-pub const OUT_DIR: &str = "out";
+/// Reusable downloads under the koxi home (`--nocache` clears it):
+/// tarballs, extracted source trees, git checkouts and mirrors.
+pub const CACHE_DIR: &str = "cache";
 
 /// Tools every fetch shells out to; `block test` preflights these.
 pub const REQUIRED_TOOLS: &[&str] = &["wget", "sha256sum", "tar", "git"];
@@ -44,11 +45,13 @@ pub struct Ctx<'a> {
     /// The koxi home (see [`koxi_home`]): anchors the artifact cache.
     pub home: &'a Path,
     pub lock: &'a mut Lock,
+    /// Per-run task log directory (`log/<project>/<run-id>`).
+    pub logs: &'a Path,
     pub assume_yes: bool,
 }
 
 /// Ensure the tarball source `name` is downloaded, verified, and
-/// extracted; returns the source tree (`out/<name>-<version>`, which
+/// extracted; returns the source tree (`cache/<name>-<version>`, which
 /// must be the tarball's top-level directory).
 pub fn tarball(name: &str, ctx: &mut Ctx) -> Result<PathBuf, Error> {
     let source = lookup(name, ctx.config)?;
@@ -59,8 +62,8 @@ pub fn tarball(name: &str, ctx: &mut Ctx) -> Result<PathBuf, Error> {
         });
     };
 
-    let out = ctx.home.join(OUT_DIR);
-    let logs = out.join("logs");
+    let out = ctx.home.join(CACHE_DIR);
+    let logs = ctx.logs;
     fs::create_dir_all(&out)?;
 
     let tarball = out.join(tarball_name(url)?);
@@ -69,11 +72,11 @@ pub fn tarball(name: &str, ctx: &mut Ctx) -> Result<PathBuf, Error> {
     let stamp = out.join(format!(".{stem}.extracted"));
 
     if tarball.exists() {
-        let sha = sha256(&tarball, &logs)?;
+        let sha = sha256(&tarball, logs)?;
         if ctx.lock.satisfies(name, source) {
             match ctx.lock.sources.get(name) {
                 Some(LockedSource::Tarball { sha256: locked, .. }) if *locked == sha => {
-                    return ensure_extracted(name, &tarball, &out, &src_dir, &stamp, &logs);
+                    return ensure_extracted(name, &tarball, &out, &src_dir, &stamp, logs);
                 }
                 // Locked hash differs: stale or corrupt file, refetch.
                 _ => {}
@@ -91,12 +94,12 @@ pub fn tarball(name: &str, ctx: &mut Ctx) -> Result<PathBuf, Error> {
                     sha256: sha,
                 },
             );
-            return ensure_extracted(name, &tarball, &out, &src_dir, &stamp, &logs);
+            return ensure_extracted(name, &tarball, &out, &src_dir, &stamp, logs);
         }
     }
 
-    download(url, &tarball, &logs)?;
-    let sha = sha256(&tarball, &logs)?;
+    download(url, &tarball, logs)?;
+    let sha = sha256(&tarball, logs)?;
     match ctx.lock.sources.get(name) {
         Some(LockedSource::Tarball { sha256: locked, .. }) if ctx.lock.satisfies(name, source) => {
             if *locked != sha {
@@ -130,10 +133,10 @@ pub fn tarball(name: &str, ctx: &mut Ctx) -> Result<PathBuf, Error> {
         }
     }
     reset_extraction(&src_dir, &stamp)?;
-    extract_verified(name, &tarball, &out, &src_dir, &stamp, &logs)
+    extract_verified(name, &tarball, &out, &src_dir, &stamp, logs)
 }
 
-/// Ensure the git source `name` is cloned into `out/<name>` and checked
+/// Ensure the git source `name` is cloned into `cache/<name>` and checked
 /// out at the locked commit, resolving and locking the declared rev on
 /// first use; returns the checkout path.
 pub fn git(name: &str, ctx: &mut Ctx) -> Result<PathBuf, Error> {
@@ -145,8 +148,8 @@ pub fn git(name: &str, ctx: &mut Ctx) -> Result<PathBuf, Error> {
         });
     };
 
-    let out = ctx.home.join(OUT_DIR);
-    let logs = out.join("logs");
+    let out = ctx.home.join(CACHE_DIR);
+    let logs = ctx.logs;
     fs::create_dir_all(&out)?;
     let repo = out.join(name);
 
@@ -158,7 +161,7 @@ pub fn git(name: &str, ctx: &mut Ctx) -> Result<PathBuf, Error> {
         info!("cloning {url}");
         let mut clone = Command::new("git");
         clone.arg("clone").arg(url).arg(&repo);
-        cmd::status(clone, "git-clone", &logs)?;
+        cmd::status(clone, "git-clone", logs)?;
     }
 
     let locked_commit = match ctx.lock.sources.get(name) {
@@ -170,7 +173,7 @@ pub fn git(name: &str, ctx: &mut Ctx) -> Result<PathBuf, Error> {
     let commit = match locked_commit {
         Some(commit) => commit,
         None => {
-            let commit = resolve_commit(&repo, rev, &logs)?;
+            let commit = resolve_commit(&repo, rev, logs)?;
             ctx.lock.sources.insert(
                 name.to_owned(),
                 LockedSource::Git {
@@ -183,15 +186,15 @@ pub fn git(name: &str, ctx: &mut Ctx) -> Result<PathBuf, Error> {
         }
     };
 
-    if head_commit(&repo, &logs)? != commit {
-        checkout_commit(&repo, &commit, &logs)?;
+    if head_commit(&repo, logs)? != commit {
+        checkout_commit(&repo, &commit, logs)?;
     }
     debug!("{name}: checked out {commit}");
     Ok(repo)
 }
 
 /// Ensure the git-meta source `name` — a bare, blob-filtered history
-/// mirror for commit mining — exists in `out/<name>.git` with the
+/// mirror for commit mining — exists in `cache/<name>.git` with the
 /// locked commit available; returns the repo path. Never checked out.
 pub fn git_meta(name: &str, ctx: &mut Ctx) -> Result<PathBuf, Error> {
     let source = lookup(name, ctx.config)?;
@@ -202,8 +205,8 @@ pub fn git_meta(name: &str, ctx: &mut Ctx) -> Result<PathBuf, Error> {
         });
     };
 
-    let out = ctx.home.join(OUT_DIR);
-    let logs = out.join("logs");
+    let out = ctx.home.join(CACHE_DIR);
+    let logs = ctx.logs;
     fs::create_dir_all(&out)?;
     let repo = out.join(format!("{name}.git"));
 
@@ -220,7 +223,7 @@ pub fn git_meta(name: &str, ctx: &mut Ctx) -> Result<PathBuf, Error> {
             .arg("--filter=blob:none")
             .arg(url)
             .arg(&repo);
-        cmd::status(clone, "git-clone", &logs)?;
+        cmd::status(clone, "git-clone", logs)?;
     }
 
     let locked_commit = match ctx.lock.sources.get(name) {
@@ -231,11 +234,11 @@ pub fn git_meta(name: &str, ctx: &mut Ctx) -> Result<PathBuf, Error> {
     };
     let commit = match locked_commit {
         Some(commit) => {
-            ensure_commit(&repo, &commit, &logs)?;
+            ensure_commit(&repo, &commit, logs)?;
             commit
         }
         None => {
-            let commit = resolve_commit(&repo, rev, &logs)?;
+            let commit = resolve_commit(&repo, rev, logs)?;
             ctx.lock.sources.insert(
                 name.to_owned(),
                 LockedSource::GitMeta {
@@ -281,7 +284,7 @@ pub fn tarball_path(name: &str, ctx: &Ctx) -> Result<(PathBuf, String), Error> {
             expected: "tarball (version + url)",
         });
     };
-    let out = ctx.home.join(OUT_DIR);
+    let out = ctx.home.join(CACHE_DIR);
     Ok((out.join(tarball_name(url)?), format!("{name}-{version}")))
 }
 

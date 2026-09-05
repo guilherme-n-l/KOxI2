@@ -13,7 +13,7 @@ use crate::{fuzz, kernel, virt};
 
 use super::fio;
 
-pub fn setup(opts: &Opts) -> ExitCode {
+pub fn setup(opts: &Opts, logs: &std::path::Path) -> ExitCode {
     let project = match Project::locate() {
         Ok(project) => project,
         Err(err) => return fail(err),
@@ -23,11 +23,15 @@ pub fn setup(opts: &Opts) -> ExitCode {
         Err(err) => return fail(err),
     };
 
-    let out = home.join(fetch::OUT_DIR);
-    if opts.nocache && out.exists() {
-        info!("clearing cache {}", out.display());
-        if let Err(err) = clear_cache(&out) {
-            return fail(err);
+    if opts.nocache {
+        for sub in [fetch::CACHE_DIR, "tmp"] {
+            let dir = home.join(sub);
+            if dir.exists() {
+                info!("clearing {}", dir.display());
+                if let Err(err) = fs::remove_dir_all(&dir) {
+                    return fail(err);
+                }
+            }
         }
     }
 
@@ -43,6 +47,7 @@ pub fn setup(opts: &Opts) -> ExitCode {
             root: &project.root,
             home: &home,
             lock: &mut lock,
+            logs,
             assume_yes: opts.yes,
         };
         drive(&mut ctx, opts)
@@ -99,24 +104,6 @@ fn drive(ctx: &mut Ctx, opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
     info!("syzkaller source ready at {}", syzkaller.display());
     let fio = fio::setup(ctx)?;
     info!("fio source ready at {}", fio.display());
-    Ok(())
-}
-
-/// Remove cached tarballs and trees but keep logs — `run.log` is open
-/// for writing at this point, and `logs/` is history, not cache.
-fn clear_cache(out: &std::path::Path) -> std::io::Result<()> {
-    for entry in fs::read_dir(out)? {
-        let entry = entry?;
-        let path = entry.path();
-        if entry.file_name() == "logs" || path.extension().is_some_and(|ext| ext == "log") {
-            continue;
-        }
-        if entry.file_type()?.is_dir() {
-            fs::remove_dir_all(&path)?;
-        } else {
-            fs::remove_file(&path)?;
-        }
-    }
     Ok(())
 }
 

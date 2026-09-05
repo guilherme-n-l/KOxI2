@@ -1,14 +1,15 @@
 //! Build the kernel image (v1 `kernel/linux-*/build`).
 //!
 //! For determinism every build starts from a pristine tree: the
-//! verified tarball is re-extracted into scratch under `out/build/`,
-//! the `linux/config` asset is applied, and only then does make run.
-//! Scratch is deleted after a successful build and kept on failure
-//! for debugging (it lives under the home rather than the system
-//! /tmp, which is often RAM-backed tmpfs — too small for a kernel
-//! tree). A build is skipped when the artifact exists and the lock's
-//! input fingerprint (recipe version, tarball sha, config sha,
-//! toolchain identity) is unchanged.
+//! verified tarball is re-extracted into a mktemp-style scratch dir
+//! under `tmp/` in the koxi home, the `linux/config` asset is
+//! applied, and only then does make run. Scratch auto-deletes after
+//! a successful build and is kept on failure for debugging (it lives
+//! under the home rather than the system /tmp, which is often
+//! RAM-backed tmpfs — too small for a kernel tree). A build is
+//! skipped when the artifact exists and the lock's input fingerprint
+//! (recipe version, tarball sha, config sha, toolchain identity) is
+//! unchanged.
 
 use std::fmt;
 use std::fs;
@@ -70,8 +71,7 @@ pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
         kbuild_arch(&opts.target).ok_or_else(|| Error::UnsupportedTarget(opts.target.clone()))?;
     let build_key = format!("linux-{}", opts.target);
 
-    let out = ctx.home.join(fetch::OUT_DIR);
-    let logs = out.join("logs");
+    let logs = ctx.logs;
     let artifacts = ctx.root.join(ARTIFACTS_DIR);
     let artifact = artifacts.join(BZIMAGE);
 
@@ -83,7 +83,7 @@ pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
     else {
         return Err(Error::NotFetched);
     };
-    let toolchain = toolchain_id(&opts.cc, &logs);
+    let toolchain = toolchain_id(&opts.cc, logs);
     let expected = fingerprint(source_sha, &kconfig.sha256, &toolchain);
 
     if artifact.is_file()
@@ -95,84 +95,91 @@ pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
         return Ok(artifact);
     }
 
-    // Pristine tree: wipe and re-extract, never build in the shared
-    // source extraction.
-    let build_root = out.join("build");
-    let tree = build_root.join(&stem);
-    if tree.exists() {
-        fs::remove_dir_all(&tree)?;
-    }
-    fs::create_dir_all(&build_root)?;
-    info!("extracting pristine {} for build", stem);
-    let mut tar = Command::new("tar");
-    tar.arg("-xf").arg(&tarball).arg("-C").arg(&build_root);
-    cmd::status(tar, "tar-build", &logs)?;
-    if !tree.is_dir() {
-        return Err(Error::UnexpectedLayout(tree));
-    }
+    // Pristine tree in a mktemp-style scratch dir: unique per build,
+    // auto-deleted on success, kept on failure for debugging. Never
+    // build in the shared source extraction.
+    let tmp_root = ctx.home.join("tmp");
+    fs::create_dir_all(&tmp_root)?;
+    let scratch = tempfile::Builder::new()
+        .prefix(&format!("{stem}-"))
+        .tempdir_in(&tmp_root)?;
+    let tree = scratch.path().join(&stem);
 
-    fs::write(tree.join(".config"), kconfig.contents.as_bytes())?;
-
-    if opts.menuconfig {
-        menuconfig(&tree, arch, &opts.cc)?;
-    }
-
-    info!("configuring kernel (olddefconfig)");
-    cmd::status(
-        make(&tree, arch, &opts.cc, &["olddefconfig"]),
-        "make-olddefconfig",
-        &logs,
-    )?;
-
-    if opts.menuconfig {
-        // Persist the tuned config as the project override so future
-        // runs use it (v1 copied it back into the repo).
-        let dest = assets::default_override_path(ctx.root, "linux/config");
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
+    let result = (|| -> Result<(), Error> {
+        info!("extracting pristine {} for build", stem);
+        let mut tar = Command::new("tar");
+        tar.arg("-xf").arg(&tarball).arg("-C").arg(scratch.path());
+        cmd::status(tar, "tar-build", logs)?;
+        if !tree.is_dir() {
+            return Err(Error::UnexpectedLayout(tree.clone()));
         }
-        fs::copy(tree.join(".config"), &dest)?;
-        info!("persisted menuconfig result to {}", dest.display());
+
+        fs::write(tree.join(".config"), kconfig.contents.as_bytes())?;
+
+        if opts.menuconfig {
+            menuconfig(&tree, arch, &opts.cc)?;
+        }
+
+        info!("configuring kernel (olddefconfig)");
+        cmd::status(
+            make(&tree, arch, &opts.cc, &["olddefconfig"]),
+            "make-olddefconfig",
+            logs,
+        )?;
+
+        if opts.menuconfig {
+            // Persist the tuned config as the project override so
+            // future runs use it (v1 copied it back into the repo).
+            let dest = assets::default_override_path(ctx.root, "linux/config");
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(tree.join(".config"), &dest)?;
+            info!("persisted menuconfig result to {}", dest.display());
+        }
+
+        if opts.skip_build {
+            warn!("kernel build skipped (--skip-build); image may be stale or missing");
+            return Ok(());
+        }
+
+        let jobs = thread::available_parallelism().map_or(1, |n| n.get());
+        info!(
+            "building kernel with {jobs} jobs (log: {})",
+            logs.join("make-kernel.log").display()
+        );
+        cmd::status(
+            make(&tree, arch, &opts.cc, &["-j", &jobs.to_string()]),
+            "make-kernel",
+            logs,
+        )?;
+
+        let bzimage = tree.join(image_path);
+        if !bzimage.is_file() {
+            return Err(Error::MissingImage(bzimage));
+        }
+        fs::create_dir_all(&artifacts)?;
+        fs::copy(&bzimage, &artifact)?;
+
+        // Re-hash the config actually used (menuconfig may have
+        // changed it) so the recorded fingerprint matches the image.
+        let built_with = assets::load_locked(ctx.root, ctx.config, "linux/config", ctx.lock)?;
+        let source_sha = match ctx.lock.sources.get(SOURCE) {
+            Some(LockedSource::Tarball { sha256, .. }) => sha256.clone(),
+            _ => return Err(Error::NotFetched),
+        };
+        ctx.lock.builds.insert(
+            build_key,
+            fingerprint(&source_sha, &built_with.sha256, &toolchain),
+        );
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        let kept = scratch.keep();
+        warn!("build scratch kept for debugging at {}", kept.display());
+        return Err(err);
     }
-
-    if opts.skip_build {
-        warn!("kernel build skipped (--skip-build); image may be stale or missing");
-        return Ok(artifact);
-    }
-
-    let jobs = thread::available_parallelism().map_or(1, |n| n.get());
-    info!(
-        "building kernel with {jobs} jobs (log: {})",
-        logs.join("make-kernel.log").display()
-    );
-    cmd::status(
-        make(&tree, arch, &opts.cc, &["-j", &jobs.to_string()]),
-        "make-kernel",
-        &logs,
-    )?;
-
-    let bzimage = tree.join(image_path);
-    if !bzimage.is_file() {
-        return Err(Error::MissingImage(bzimage));
-    }
-    fs::create_dir_all(&artifacts)?;
-    fs::copy(&bzimage, &artifact)?;
-
-    // Re-hash the config actually used (menuconfig may have changed
-    // it) so the recorded fingerprint matches the built image.
-    let built_with = assets::load_locked(ctx.root, ctx.config, "linux/config", ctx.lock)?;
-    let source_sha = match ctx.lock.sources.get(SOURCE) {
-        Some(LockedSource::Tarball { sha256, .. }) => sha256.clone(),
-        _ => return Err(Error::NotFetched),
-    };
-    ctx.lock.builds.insert(
-        build_key,
-        fingerprint(&source_sha, &built_with.sha256, &toolchain),
-    );
-
-    // Scratch served its purpose; failures above keep it for
-    // debugging instead.
-    fs::remove_dir_all(&tree)?;
 
     info!("kernel image at {}", artifact.display());
     Ok(artifact)
