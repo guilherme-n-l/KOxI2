@@ -61,4 +61,14 @@ fi
 # Public-key auth only (-s); keys and authorized_keys are baked.
 dropbearmulti dropbear -p 22 -F -s &
 
+# koxi.shell=1: interactive console session — banner, then power off
+# on ENTER, returning the console (cable-free bare-metal smoke).
+if grep -q 'koxi\.shell' /proc/cmdline; then
+	echo
+	echo "hello world — KOxI guest is up ($(uname -r))"
+	echo "press ENTER to power off and relinquish the console"
+	read -r _
+	poweroff -f
+fi
+
 while :; do sleep 3600; done
