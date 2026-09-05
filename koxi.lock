@@ -40,6 +40,7 @@ commit = "4f7b22a0cea479ab522e99815d78a4ad5784b1da"
 [builds]
 busybox = "r1:b8cc24c9574d809e7279c3be349795c5d5ceb6fdf19ca709f80cde50e47de314:5ff2a6ecd6469fb2057953c2b5fdc7e3f3631c27d918e935197a01fed75244e3:/nix/store/ikkacy1s962pz7j35xz1vyl536w69i6c-musl-1.2.6-dev/bin/musl-gcc:gcc (GCC) 15.3.0"
 dropbear = "r1:0d1f7ca711cfc336dc8a85e672cab9cfd8223a02fe2da0a4a7aeb58c9e113634:/nix/store/ikkacy1s962pz7j35xz1vyl536w69i6c-musl-1.2.6-dev/bin/musl-gcc:gcc (GCC) 15.3.0"
+fio = "r1:aee29e9dd739b4ffc3939169de0b342988f32302b35b966649c87b2319a9548a:/nix/store/ikkacy1s962pz7j35xz1vyl536w69i6c-musl-1.2.6-dev/bin/musl-gcc:gcc (GCC) 15.3.0"
 linux-x86_64 = "r2:303079a8250b8f381f82b03f90463d12ac98d4f6b149b761ea75af1323521357:6b6eecb8c97746310992143ef559155fd430b58ddcfdbfaf535212505651dc12:gcc (GCC) 15.3.0|rustc 1.91.1 (ed61e7d7e 2025-11-07) (built from a source tarball)"
 
 [artifacts]
@@ -47,6 +48,7 @@ linux-x86_64 = "r2:303079a8250b8f381f82b03f90463d12ac98d4f6b149b761ea75af1323521
 busybox = "a1b48acca7377c15aca756a534d9aca70ada43fca85aa3d178eaedae9bdb2696"
 bzImage = "4f3ef7de8d4ec5f24206c633e9509d72cc9b87c105f2105d8f4a1169e94845e4"
 dropbearmulti = "67191dd623efaf8a1c264ff4d99c32529397b17b1cad1d81bd8497a93d758f69"
+fio = "919e5eeef9ad6fe3d0bda244ab41c5e240d4f26141e435c1728519f8194b7a4b"
 "loop.ko" = "9ffdf08dc8620bfa7fed387c1fee976d9d23acbdb2254129645a939d09a75c86"
 "nbd.ko" = "d6f4d634365a1d16e4d9b072b872c7aef86e5278a97cb7f63949b94c7986a6d2"
 "null_blk.ko" = "99ad03cc5833b479c3e34f1eb0632a422b1e731f419e44cd4e85cfdbc0bff970"
