@@ -283,6 +283,7 @@ pub fn probe_version(cc: &str) -> String {
 pub enum Error {
     NotLinux,
     NotFetched(&'static str),
+    MissingPrereq(String),
     UnexpectedLayout(PathBuf),
     MissingBinary(PathBuf),
     Io(std::io::Error),
@@ -323,6 +324,12 @@ impl fmt::Display for Error {
                 write!(
                     f,
                     "the {name} source is not locked yet (fetch step missing)"
+                )
+            }
+            Error::MissingPrereq(what) => {
+                write!(
+                    f,
+                    "prerequisite artifact {what} missing (run earlier build steps)"
                 )
             }
             Error::UnexpectedLayout(tree) => write!(

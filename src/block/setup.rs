@@ -161,6 +161,13 @@ fn drive(ctx: &mut Ctx, opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
     info!("fio ready at {}", fio_bin.display());
+    let initramfs = virt::initramfs::build(
+        ctx,
+        &virt::build::Options {
+            force: opts.force_build,
+        },
+    )?;
+    info!("initramfs ready at {}", initramfs.display());
     Ok(())
 }
 

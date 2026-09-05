@@ -1,4 +1,8 @@
 #!/bin/sh
+# Minimal init: only what cannot be known before boot. All static
+# state (users, ssh host + client keys, authorized_keys) is baked
+# into the image at build time.
+
 mkdir -p /proc /sys/kernel/config /sys/kernel/debug /dev /mnt /tmp
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
@@ -37,26 +41,7 @@ if [ -s /mnt/driver_setup/spec ] && [ -x /mnt/scripts/vm_driver_setup ]; then
 	fi
 fi
 
-echo "root:x:0:0:root:/root:/bin/sh" >/etc/passwd
-echo "root:yO22ckRKNTUd6:20535:0:99999:7:::" >/etc/shadow
-echo "/bin/sh" >/etc/shells
-
-mkdir -p /root/.ssh
-chmod 700 /root/.ssh
-
-mkdir -p /etc/dropbear
-for ktype in rsa ecdsa ed25519; do
-	keyfile="/mnt/dropbear_${ktype}_host_key"
-	[ -f "$keyfile" ] || dropbearmulti dropbearkey -t "$ktype" -f "$keyfile"
-	cp "$keyfile" "/etc/dropbear/dropbear_${ktype}_host_key"
-	chmod 600 "/etc/dropbear/dropbear_${ktype}_host_key"
-done
-
-cat /mnt/.ssh/*.pub >/root/.ssh/authorized_keys 2>/dev/null || true
-chmod 600 /root/.ssh/authorized_keys
-
-# modprobe tun # No /lib/modules support yet
-
-dropbearmulti dropbear -p 22 -F &
+# Public-key auth only (-s); keys and authorized_keys are baked.
+dropbearmulti dropbear -p 22 -F -s &
 
 while :; do sleep 3600; done
