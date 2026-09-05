@@ -53,6 +53,7 @@ const DROPBEAR_CONFIGURE: &[&str] = &[
     "--disable-harden",
 ];
 
+/// Shared by the static-userland builds (busybox, dropbear, fio).
 pub struct Options {
     pub force: bool,
 }
@@ -73,7 +74,7 @@ pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
         sha256: source_sha, ..
     }) = ctx.lock.sources.get(SOURCE)
     else {
-        return Err(Error::NotFetched);
+        return Err(Error::NotFetched(SOURCE));
     };
 
     // The resolved compiler is part of the identity: on nix MUSL_GCC
@@ -147,7 +148,7 @@ pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
         let used = assets::load_locked(ctx.root, ctx.config, "busybox/config", ctx.lock)?;
         let source_sha = match ctx.lock.sources.get(SOURCE) {
             Some(LockedSource::Tarball { sha256, .. }) => sha256.clone(),
-            _ => return Err(Error::NotFetched),
+            _ => return Err(Error::NotFetched(SOURCE)),
         };
         ctx.lock.builds.insert(
             SOURCE.to_owned(),
@@ -182,7 +183,7 @@ pub fn build_dropbear(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
         sha256: source_sha, ..
     }) = ctx.lock.sources.get("dropbear")
     else {
-        return Err(Error::NotFetched);
+        return Err(Error::NotFetched("dropbear"));
     };
     let cc = musl_cc();
     let toolchain = format!("{cc}:{}", probe_version(&cc));
@@ -262,11 +263,11 @@ pub fn build_dropbear(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
 
 /// The static-userland compiler: `$MUSL_GCC` (set by the flake to an
 /// absolute store path) or `musl-gcc` from PATH.
-fn musl_cc() -> String {
+pub fn musl_cc() -> String {
     std::env::var("MUSL_GCC").unwrap_or_else(|_| "musl-gcc".to_owned())
 }
 
-fn probe_version(cc: &str) -> String {
+pub fn probe_version(cc: &str) -> String {
     let output = Command::new(cc).arg("--version").output();
     match output {
         Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
@@ -281,7 +282,7 @@ fn probe_version(cc: &str) -> String {
 #[derive(Debug)]
 pub enum Error {
     NotLinux,
-    NotFetched,
+    NotFetched(&'static str),
     UnexpectedLayout(PathBuf),
     MissingBinary(PathBuf),
     Io(std::io::Error),
@@ -317,24 +318,20 @@ impl From<cmd::Error> for Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::NotLinux => write!(f, "the busybox build requires a Linux host"),
-            Error::NotFetched => {
+            Error::NotLinux => write!(f, "this build step requires a Linux host"),
+            Error::NotFetched(name) => {
                 write!(
                     f,
-                    "the busybox source is not locked yet (fetch step missing)"
+                    "the {name} source is not locked yet (fetch step missing)"
                 )
             }
             Error::UnexpectedLayout(tree) => write!(
                 f,
-                "extracting the busybox tarball did not produce {}",
+                "extracting the tarball did not produce {}",
                 tree.display()
             ),
             Error::MissingBinary(path) => {
-                write!(
-                    f,
-                    "busybox build finished without producing {}",
-                    path.display()
-                )
+                write!(f, "build finished without producing {}", path.display())
             }
             Error::Io(err) => write!(f, "{err}"),
             Error::Asset(err) => write!(f, "{err}"),

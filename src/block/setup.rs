@@ -147,6 +147,13 @@ fn drive(ctx: &mut Ctx, opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
     info!("syzkaller source ready at {}", syzkaller.display());
     let fio = fio::setup(ctx)?;
     info!("fio source ready at {}", fio.display());
+    let fio_bin = fio::build(
+        ctx,
+        &virt::build::Options {
+            force: opts.force_build,
+        },
+    )?;
+    info!("fio ready at {}", fio_bin.display());
     Ok(())
 }
 
