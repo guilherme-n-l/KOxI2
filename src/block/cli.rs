@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use clap::builder::FalseyValueParser;
+use clap::parser::ValueSource;
 use clap::{value_parser, Arg, ArgAction, ArgMatches, Command};
 
 /// Boolean flag, available to every subcommand. The env var enables
@@ -36,7 +37,9 @@ pub fn command() -> Command {
                 .about("Verify system deps, user config, and setup state")
                 .arg(Arg::new("suite").num_args(0..).help("Test suites to run")),
         )
-        .subcommand(Command::new("clean").about("Remove build artifacts (preserves results/)"))
+        .subcommand(
+            Command::new("clean").about("Remove built artifacts (artifacts/; results preserved)"),
+        )
         .subcommand(Command::new("perf").about("Run performance benchmarks"))
         .subcommand(Command::new("fuzz").about("Run fuzzing campaigns"))
         .subcommand(Command::new("static").about("Static analysis (loc, ast, commits)"))
@@ -424,7 +427,7 @@ impl Opts {
             *matches.get_one::<T>(name).expect("defaulted")
         }
 
-        Self {
+        let mut opts = Self {
             p1: matches.get_flag("p1"),
             only: strings(matches, "only"),
             output: path(matches, "output"),
@@ -480,6 +483,47 @@ impl Opts {
             bootstrap_resamples: copied(matches, "bootstrap-resamples"),
             validated_cwe: matches.get_one::<PathBuf>("validated-cwe").cloned(),
             validated_crashes: matches.get_one::<PathBuf>("validated-crashes").cloned(),
+        };
+        opts.apply_profiles(matches);
+        opts
+    }
+
+    /// v1 `_set_quick` / `_set_longrun`: profile defaults applied only
+    /// where the user didn't set the knob explicitly.
+    fn apply_profiles(&mut self, matches: &ArgMatches) {
+        let defaulted = |name: &str| matches.value_source(name) == Some(ValueSource::DefaultValue);
+        if self.quick {
+            if defaulted("fio-bs") {
+                self.fio_bs = vec!["4k".to_owned()];
+            }
+            if defaulted("fio-rw") {
+                self.fio_rw = vec!["randread".to_owned()];
+            }
+            if defaulted("fio-qd") {
+                self.fio_qd = vec![1];
+            }
+            if defaulted("fio-reps") {
+                self.fio_reps = 3;
+            }
+            if defaulted("fio-runtime") {
+                self.fio_runtime = 5;
+            }
+            if defaulted("fuzz-campaigns") {
+                self.fuzz_campaigns = 1;
+            }
+            if defaulted("fuzz-hours") {
+                self.fuzz_hours = 0.01;
+            }
+        } else if self.longrun {
+            if defaulted("fuzz-campaigns") {
+                self.fuzz_campaigns = 30;
+            }
+            if defaulted("fuzz-hours") {
+                self.fuzz_hours = 24.0;
+            }
+            if defaulted("fio-reps") {
+                self.fio_reps = 50;
+            }
         }
     }
 }
@@ -489,6 +533,28 @@ mod tests {
     #[test]
     fn cli_is_well_formed() {
         super::command().debug_assert();
+    }
+
+    #[test]
+    fn quick_and_longrun_fill_unset_knobs() {
+        let matches = super::command().get_matches_from(["block", "perf", "--quick"]);
+        let (_, sub) = matches.subcommand().unwrap();
+        let opts = super::Opts::from_matches(sub);
+        assert_eq!(opts.fio_reps, 3);
+        assert_eq!(opts.fuzz_hours, 0.01);
+        assert_eq!(opts.fio_qd, vec![1]);
+
+        let matches =
+            super::command().get_matches_from(["block", "perf", "--quick", "--fio-reps", "10"]);
+        let (_, sub) = matches.subcommand().unwrap();
+        let opts = super::Opts::from_matches(sub);
+        assert_eq!(opts.fio_reps, 10, "explicit flag beats the profile");
+
+        let matches = super::command().get_matches_from(["block", "fuzz", "--longrun"]);
+        let (_, sub) = matches.subcommand().unwrap();
+        let opts = super::Opts::from_matches(sub);
+        assert_eq!(opts.fuzz_hours, 24.0);
+        assert_eq!(opts.fio_reps, 50);
     }
 
     #[test]

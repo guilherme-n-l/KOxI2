@@ -33,9 +33,18 @@ pub fn run(matches: &ArgMatches) -> ExitCode {
         opts.debug,
         (!opts.nologfile).then_some(opts.logfile.as_path()),
     );
+    // Run header: lands in the run log (TRACE sink) without console
+    // noise at the default level.
+    tracing::debug!(
+        "koxi {} | argv {:?} | cwd {} | logs {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::args().collect::<Vec<_>>(),
+        std::env::current_dir().map_or_else(|_| "?".into(), |cwd| cwd.display().to_string()),
+        logs.display()
+    );
     match name {
         "setup" => setup::setup(&opts, &logs),
-        "test" => test::test(&opts),
+        "test" => test::test(&opts, &logs),
         "clean" => clean(&opts),
         "perf" => perf(&opts),
         "fuzz" => fuzz(&opts),
@@ -48,8 +57,27 @@ pub fn run(matches: &ArgMatches) -> ExitCode {
     }
 }
 
+/// Remove the project's built artifacts (artifacts/); results and
+/// the shared home cache are untouched (that's --nocache).
 fn clean(_opts: &Opts) -> ExitCode {
-    not_implemented("clean")
+    let project = match Project::locate() {
+        Ok(project) => project,
+        Err(err) => {
+            eprintln!("koxi block clean: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let artifacts = project.root.join(crate::kernel::build::ARTIFACTS_DIR);
+    if artifacts.exists() {
+        if let Err(err) = std::fs::remove_dir_all(&artifacts) {
+            eprintln!("koxi block clean: {err}");
+            return ExitCode::FAILURE;
+        }
+        println!("removed {}", artifacts.display());
+    } else {
+        println!("nothing to clean ({} absent)", artifacts.display());
+    }
+    ExitCode::SUCCESS
 }
 
 fn perf(_opts: &Opts) -> ExitCode {
