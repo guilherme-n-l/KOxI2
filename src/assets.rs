@@ -41,6 +41,10 @@ pub const ASSETS: &[Asset] = &[
         name: "virt/init",
         contents: include_str!("../assets/virt/init"),
     },
+    Asset {
+        name: "virt/udhcpc-script",
+        contents: include_str!("../assets/virt/udhcpc-script"),
+    },
 ];
 
 fn embedded(name: &str) -> Option<&'static Asset> {

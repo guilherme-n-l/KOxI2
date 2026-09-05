@@ -22,10 +22,27 @@ if [ -f /mnt/.vm_extra_shares ]; then
 	done </mnt/.vm_extra_shares
 fi
 
+# Network from the kernel cmdline: koxi.net=dhcp,
+# koxi.net=<addr>/<prefix>,<gateway>, or (absent) the qemu slirp
+# defaults — the same image serves qemu and bare metal.
 ip link set lo up
 ip link set eth0 up
-ip addr add 10.0.2.15/24 dev eth0
-ip route add default via 10.0.2.2
+net="$(sed -n 's/.*koxi\.net=\([^ ]*\).*/\1/p' /proc/cmdline)"
+case "$net" in
+dhcp)
+	udhcpc -i eth0 -n -q -s /etc/udhcpc.script
+	;;
+"")
+	ip addr add 10.0.2.15/24 dev eth0
+	ip route add default via 10.0.2.2
+	;;
+*)
+	addr="${net%%,*}"
+	gw="${net#*,}"
+	ip addr add "$addr" dev eth0
+	[ "$gw" != "$net" ] && ip route add default via "$gw"
+	;;
+esac
 
 if [ -s /mnt/driver_setup/spec ] && [ -x /mnt/scripts/vm_driver_setup ]; then
 	driver_spec="$(cat /mnt/driver_setup/spec)"

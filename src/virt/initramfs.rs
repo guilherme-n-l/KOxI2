@@ -62,6 +62,7 @@ pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
         }
     }
     let init = assets::load_locked(ctx.root, ctx.config, "virt/init", ctx.lock)?;
+    let udhcpc = assets::load_locked(ctx.root, ctx.config, "virt/udhcpc-script", ctx.lock)?;
     let pubkey = ensure_client_key(&artifacts, logs)?;
     let pubkey_sha = fetch::sha256(&pubkey, logs)?;
     let host_keys = ensure_host_keys(&artifacts, logs)?;
@@ -72,8 +73,8 @@ pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
     }
 
     let expected = format!(
-        "r{RECIPE}:{busybox_sha}:{dropbear_sha}:{fio_sha}:{}:{pubkey_sha}:{host_keys_sha}",
-        init.sha256
+        "r{RECIPE}:{busybox_sha}:{dropbear_sha}:{fio_sha}:{}:{}:{pubkey_sha}:{host_keys_sha}",
+        init.sha256, udhcpc.sha256
     );
     if artifact.is_file() && !opts.force && ctx.lock.builds.get(TARGET) == Some(&expected) {
         debug!("initramfs cached at {}", artifact.display());
@@ -135,6 +136,11 @@ pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
 
         fs::write(root.join("init"), init.contents.as_bytes())?;
         fs::set_permissions(root.join("init"), fs::Permissions::from_mode(0o755))?;
+        fs::write(root.join("etc/udhcpc.script"), udhcpc.contents.as_bytes())?;
+        fs::set_permissions(
+            root.join("etc/udhcpc.script"),
+            fs::Permissions::from_mode(0o755),
+        )?;
 
         fs::copy(&pubkey, root.join("root/.ssh/authorized_keys"))?;
         fs::set_permissions(

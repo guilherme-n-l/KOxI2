@@ -57,6 +57,24 @@ Builds are deterministic by construction: every build re-extracts a
 pristine tree into scratch, applies the config asset, and records its
 input fingerprint in the lock.
 
+## Bare metal (kexec)
+
+The same two artifacts boot real hardware for perf runs. On a target
+with Secure Boot off (`mokutil --sb-state`, `cat
+/sys/kernel/security/lockdown`) and kexec-tools installed:
+
+```sh
+kexec -l bzImage --initrd=initramfs.cpio.gz \
+      --append="console=tty0 koxi.net=dhcp"
+kexec -e   # warm-boots into the test kernel immediately
+```
+
+`koxi.net=` selects guest networking: `dhcp`,
+`<addr>/<prefix>,<gateway>`, or omit it for the qemu slirp defaults.
+Wired Ethernet only (the image carries no WiFi stack); `reboot -f`
+in the guest falls back to the resident OS via the normal
+bootloader. Fuzzing stays qemu-only by design.
+
 ## Known limitations
 
 - Concurrent runs sharing `$KOXI_HOME` have no cache locking (scratch
