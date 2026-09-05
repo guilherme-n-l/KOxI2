@@ -129,6 +129,13 @@ fn drive(ctx: &mut Ctx, opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
     let (busybox, dropbear) = virt::setup::setup(ctx)?;
     info!("busybox source ready at {}", busybox.display());
     info!("dropbear source ready at {}", dropbear.display());
+    let busybox_bin = virt::build::build(
+        ctx,
+        &virt::build::Options {
+            force: opts.force_build,
+        },
+    )?;
+    info!("busybox ready at {}", busybox_bin.display());
     let syzkaller = fuzz::setup::setup(ctx)?;
     info!("syzkaller source ready at {}", syzkaller.display());
     let fio = fio::setup(ctx)?;

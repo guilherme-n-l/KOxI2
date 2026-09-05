@@ -1,0 +1,228 @@
+//! Build the static BusyBox for the initramfs (v1
+//! `kernel/busybox-*/build`): pristine tarball extract into tempdir
+//! scratch, apply the `busybox/config` asset, `yes "" | make
+//! oldconfig`, then a static musl build. The binary is harvested to
+//! `artifacts/busybox` and sha-locked; the build is skipped when the
+//! input fingerprint (recipe, tarball sha, config sha, musl-gcc
+//! identity) is unchanged.
+
+use std::fmt;
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+use std::thread;
+
+use tracing::{debug, info, warn};
+
+use crate::fetch::{self, Ctx};
+use crate::kernel::build::ARTIFACTS_DIR;
+use crate::lock::LockedSource;
+use crate::{assets, cmd};
+
+/// Artifact and lock key.
+pub const BUSYBOX: &str = "busybox";
+
+/// koxi.toml sources key.
+const SOURCE: &str = "busybox";
+
+/// Bumped when the build steps themselves change.
+const RECIPE: u32 = 1;
+
+pub struct Options {
+    pub force: bool,
+}
+
+/// Ensure the static busybox is built; returns `artifacts/busybox`.
+pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
+    if !cfg!(target_os = "linux") {
+        return Err(Error::NotLinux);
+    }
+
+    let logs = ctx.logs;
+    let artifacts = ctx.root.join(ARTIFACTS_DIR);
+    let artifact = artifacts.join(BUSYBOX);
+
+    let config = assets::load_locked(ctx.root, ctx.config, "busybox/config", ctx.lock)?;
+    let (tarball, stem) = fetch::tarball_path(SOURCE, ctx)?;
+    let Some(LockedSource::Tarball {
+        sha256: source_sha, ..
+    }) = ctx.lock.sources.get(SOURCE)
+    else {
+        return Err(Error::NotFetched);
+    };
+
+    // The resolved compiler is part of the identity: on nix MUSL_GCC
+    // is a store path, so a musl/gcc bump changes the fingerprint.
+    let cc = musl_cc();
+    let toolchain = format!("{cc}:{}", probe_version(&cc));
+    let expected = format!("r{RECIPE}:{source_sha}:{}:{toolchain}", config.sha256);
+
+    if artifact.is_file() && !opts.force && ctx.lock.builds.get(SOURCE) == Some(&expected) {
+        debug!("busybox cached at {}", artifact.display());
+        return Ok(artifact);
+    }
+
+    let tmp_root = ctx.home.join("tmp");
+    fs::create_dir_all(&tmp_root)?;
+    let scratch = tempfile::Builder::new()
+        .prefix(&format!("{stem}-"))
+        .tempdir_in(&tmp_root)?;
+    let tree = scratch.path().join(&stem);
+
+    let result = (|| -> Result<(), Error> {
+        info!("extracting pristine {stem} for build");
+        let mut tar = Command::new("tar");
+        tar.arg("-xf").arg(&tarball).arg("-C").arg(scratch.path());
+        cmd::status(tar, "tar-build", logs)?;
+        if !tree.is_dir() {
+            return Err(Error::UnexpectedLayout(tree.clone()));
+        }
+
+        fs::write(tree.join(".config"), config.contents.as_bytes())?;
+
+        // v1: `yes "" | make oldconfig` — accept defaults for any
+        // symbol the asset does not pin.
+        info!("configuring busybox (oldconfig)");
+        let mut oldconfig = Command::new("sh");
+        oldconfig
+            .arg("-c")
+            .arg(format!("yes '' | make -C '{}' oldconfig", tree.display()));
+        cmd::status(oldconfig, "make-busybox-oldconfig", logs)?;
+
+        let jobs = thread::available_parallelism().map_or(1, |n| n.get());
+        info!(
+            "building busybox with {jobs} jobs (log: {})",
+            logs.join("make-busybox.log").display()
+        );
+        let mut make = Command::new("make");
+        make.arg("-C")
+            .arg(&tree)
+            .arg(format!("CC={cc}"))
+            // v1 parity: lets musl-gcc find kernel headers on
+            // FHS hosts; harmless where /usr/include is absent.
+            .arg("CFLAGS=-idirafter /usr/include")
+            // The nix cc-wrapper injects hardening flags (fortify,
+            // -Werror=format-security) that busybox's old printf
+            // patterns fail; inert outside nix.
+            .env("NIX_HARDENING_ENABLE", "")
+            .arg("-j")
+            .arg(jobs.to_string());
+        cmd::status(make, "make-busybox", logs)?;
+
+        let built = tree.join("busybox");
+        if !built.is_file() {
+            return Err(Error::MissingBinary(built));
+        }
+        fs::create_dir_all(&artifacts)?;
+        fs::copy(&built, &artifact)?;
+        ctx.lock
+            .artifacts
+            .insert(BUSYBOX.to_owned(), fetch::sha256(&artifact, logs)?);
+
+        let used = assets::load_locked(ctx.root, ctx.config, "busybox/config", ctx.lock)?;
+        let source_sha = match ctx.lock.sources.get(SOURCE) {
+            Some(LockedSource::Tarball { sha256, .. }) => sha256.clone(),
+            _ => return Err(Error::NotFetched),
+        };
+        ctx.lock.builds.insert(
+            SOURCE.to_owned(),
+            format!("r{RECIPE}:{source_sha}:{}:{toolchain}", used.sha256),
+        );
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        let kept = scratch.keep();
+        warn!("build scratch kept for debugging at {}", kept.display());
+        return Err(err);
+    }
+
+    info!("busybox at {}", artifact.display());
+    Ok(artifact)
+}
+
+/// The static-userland compiler: `$MUSL_GCC` (set by the flake to an
+/// absolute store path) or `musl-gcc` from PATH.
+fn musl_cc() -> String {
+    std::env::var("MUSL_GCC").unwrap_or_else(|_| "musl-gcc".to_owned())
+}
+
+fn probe_version(cc: &str) -> String {
+    let output = Command::new(cc).arg("--version").output();
+    match output {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned(),
+        _ => "unknown".to_owned(),
+    }
+}
+
+#[derive(Debug)]
+pub enum Error {
+    NotLinux,
+    NotFetched,
+    UnexpectedLayout(PathBuf),
+    MissingBinary(PathBuf),
+    Io(std::io::Error),
+    Asset(assets::Error),
+    Fetch(fetch::Error),
+    Cmd(cmd::Error),
+}
+
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        Error::Io(err)
+    }
+}
+
+impl From<assets::Error> for Error {
+    fn from(err: assets::Error) -> Self {
+        Error::Asset(err)
+    }
+}
+
+impl From<fetch::Error> for Error {
+    fn from(err: fetch::Error) -> Self {
+        Error::Fetch(err)
+    }
+}
+
+impl From<cmd::Error> for Error {
+    fn from(err: cmd::Error) -> Self {
+        Error::Cmd(err)
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::NotLinux => write!(f, "the busybox build requires a Linux host"),
+            Error::NotFetched => {
+                write!(
+                    f,
+                    "the busybox source is not locked yet (fetch step missing)"
+                )
+            }
+            Error::UnexpectedLayout(tree) => write!(
+                f,
+                "extracting the busybox tarball did not produce {}",
+                tree.display()
+            ),
+            Error::MissingBinary(path) => {
+                write!(
+                    f,
+                    "busybox build finished without producing {}",
+                    path.display()
+                )
+            }
+            Error::Io(err) => write!(f, "{err}"),
+            Error::Asset(err) => write!(f, "{err}"),
+            Error::Fetch(err) => write!(f, "{err}"),
+            Error::Cmd(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
