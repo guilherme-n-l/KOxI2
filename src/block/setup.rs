@@ -145,6 +145,13 @@ fn drive(ctx: &mut Ctx, opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
     info!("dropbear ready at {}", dropbear_bin.display());
     let syzkaller = fuzz::setup::setup(ctx)?;
     info!("syzkaller source ready at {}", syzkaller.display());
+    let syz_bin = fuzz::build::build(
+        ctx,
+        &virt::build::Options {
+            force: opts.force_build,
+        },
+    )?;
+    info!("syzkaller ready at {}", syz_bin.display());
     let fio = fio::setup(ctx)?;
     info!("fio source ready at {}", fio.display());
     let fio_bin = fio::build(

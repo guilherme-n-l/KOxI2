@@ -34,14 +34,6 @@ pub const ASSETS: &[Asset] = &[
         contents: include_str!("../assets/busybox/config"),
     },
     Asset {
-        name: "syzkaller/01-dashO.patch",
-        contents: include_str!("../assets/syzkaller/01-dashO.patch"),
-    },
-    Asset {
-        name: "syzkaller/02-noWerror.patch",
-        contents: include_str!("../assets/syzkaller/02-noWerror.patch"),
-    },
-    Asset {
         name: "syzkaller/generic.cfg.in",
         contents: include_str!("../assets/syzkaller/generic.cfg.in"),
     },
