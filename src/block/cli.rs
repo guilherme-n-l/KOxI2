@@ -113,10 +113,10 @@ pub fn command() -> Command {
                 .value_parser(value_parser!(PathBuf))
                 .default_value("out/run.log")
                 .conflicts_with("nologfile")
-                .help("Log file for subprocess output"),
+                .help("Log file (default resolved under KOXI_HOME)"),
         )
         .arg(flag("nologfile", "NOLOGFILE").help("Discard subprocess output"))
-        .arg(flag("nocache", "NOCACHE").help("Clear download cache (out/) before running"))
+        .arg(flag("nocache", "NOCACHE").help("Clear the KOXI_HOME download cache before running"))
         .arg(flag("skip-build", "SKIP_BUILD").help("Skip kernel build (initramfs still rebuilt)"))
         .arg(flag("yes", "ASSUME_YES").help("Assume yes for interactive prompts"))
         // VM / benchmark

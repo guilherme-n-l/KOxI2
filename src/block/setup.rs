@@ -1,46 +1,95 @@
-use std::path::Path;
+//! `koxi block setup` — acquire and verify every third-party source.
+
+use std::fs;
 use std::process::ExitCode;
 
-use clap::ArgMatches;
+use tracing::{error, info, warn};
 
-use crate::config::{Config, CONFIG_PATH};
+use crate::block::cli::Opts;
+use crate::config::Project;
+use crate::fetch::{self, Ctx};
+use crate::lock::{Lock, LOCK_PATH};
 use crate::{fuzz, kernel, virt};
 
 use super::fio;
 
-pub fn setup(_matches: &ArgMatches) -> ExitCode {
-    let config = match Config::load(Path::new(CONFIG_PATH)) {
-        Ok(config) => config,
+pub fn setup(opts: &Opts) -> ExitCode {
+    let project = match Project::locate() {
+        Ok(project) => project,
+        Err(err) => return fail(err),
+    };
+    let home = match fetch::koxi_home() {
+        Ok(home) => home,
         Err(err) => return fail(err),
     };
 
-    match kernel::setup::setup(&config) {
-        Ok(dir) => ready("kernel", &dir),
-        Err(err) => return fail(err),
-    }
-    match virt::setup::setup(&config) {
-        Ok((busybox, dropbear)) => {
-            ready("busybox", &busybox);
-            ready("dropbear", &dropbear);
+    let out = home.join(fetch::OUT_DIR);
+    if opts.nocache && out.exists() {
+        info!("clearing cache {}", out.display());
+        if let Err(err) = clear_cache(&out) {
+            return fail(err);
         }
-        Err(err) => return fail(err),
     }
-    match fuzz::setup::setup(&config) {
-        Ok(dir) => ready("syzkaller", &dir),
+
+    let lock_path = project.root.join(LOCK_PATH);
+    let mut lock = match Lock::load(&lock_path) {
+        Ok(lock) => lock.unwrap_or_default(),
         Err(err) => return fail(err),
+    };
+
+    let result = {
+        let mut ctx = Ctx {
+            config: &project.config,
+            home: &home,
+            lock: &mut lock,
+            assume_yes: opts.yes,
+        };
+        drive(&mut ctx)
+    };
+
+    // Save even on failure so already-resolved sources stay locked.
+    if let Err(err) = lock.save(&lock_path) {
+        warn!("could not save {}: {err}", lock_path.display());
     }
-    match fio::setup(&config) {
-        Ok(dir) => ready("fio", &dir),
-        Err(err) => return fail(err),
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => fail(err),
     }
-    ExitCode::SUCCESS
 }
 
-fn ready(name: &str, dir: &Path) {
-    eprintln!("{name} source ready at {}", dir.display());
+fn drive(ctx: &mut Ctx) -> Result<(), fetch::Error> {
+    let kernel = kernel::setup::setup(ctx)?;
+    info!("kernel source ready at {}", kernel.display());
+    let (busybox, dropbear) = virt::setup::setup(ctx)?;
+    info!("busybox source ready at {}", busybox.display());
+    info!("dropbear source ready at {}", dropbear.display());
+    let syzkaller = fuzz::setup::setup(ctx)?;
+    info!("syzkaller source ready at {}", syzkaller.display());
+    let fio = fio::setup(ctx)?;
+    info!("fio source ready at {}", fio.display());
+    Ok(())
+}
+
+/// Remove cached tarballs and trees but keep logs — `run.log` is open
+/// for writing at this point, and `logs/` is history, not cache.
+fn clear_cache(out: &std::path::Path) -> std::io::Result<()> {
+    for entry in fs::read_dir(out)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_name() == "logs" || path.extension().is_some_and(|ext| ext == "log") {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(&path)?;
+        } else {
+            fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
 }
 
 fn fail(err: impl std::fmt::Display) -> ExitCode {
-    eprintln!("koxi block setup: {err}");
+    error!("koxi block setup: {err}");
     ExitCode::FAILURE
 }

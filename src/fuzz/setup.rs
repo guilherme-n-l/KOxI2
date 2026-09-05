@@ -3,11 +3,10 @@
 
 use std::path::PathBuf;
 
-use crate::config::Config;
-use crate::fetch;
+use crate::fetch::{self, Ctx};
 
 /// Ensure the syzkaller checkout is present at the locked commit;
 /// returns its path.
-pub fn setup(config: &Config) -> Result<PathBuf, fetch::Error> {
-    fetch::git("syzkaller", config)
+pub fn setup(ctx: &mut Ctx) -> Result<PathBuf, fetch::Error> {
+    fetch::git("syzkaller", ctx)
 }

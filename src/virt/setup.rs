@@ -2,13 +2,12 @@
 
 use std::path::PathBuf;
 
-use crate::config::Config;
-use crate::fetch;
+use crate::fetch::{self, Ctx};
 
 /// Ensure the VM userland sources are present and verified; returns
 /// the (busybox, dropbear) source trees.
-pub fn setup(config: &Config) -> Result<(PathBuf, PathBuf), fetch::Error> {
-    let busybox = fetch::tarball("busybox", config)?;
-    let dropbear = fetch::tarball("dropbear", config)?;
+pub fn setup(ctx: &mut Ctx) -> Result<(PathBuf, PathBuf), fetch::Error> {
+    let busybox = fetch::tarball("busybox", ctx)?;
+    let dropbear = fetch::tarball("dropbear", ctx)?;
     Ok((busybox, dropbear))
 }

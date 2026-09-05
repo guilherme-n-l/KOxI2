@@ -114,11 +114,46 @@ impl Config {
     }
 }
 
+/// A located project: the directory holding `koxi.toml`, which anchors
+/// `koxi.lock` and the `out/` cache regardless of the working directory.
+#[derive(Debug)]
+pub struct Project {
+    pub root: PathBuf,
+    pub config: Config,
+}
+
+impl Project {
+    /// Search for `koxi.toml` upward from the working directory,
+    /// cargo-style. Artifacts do not live here — see
+    /// `fetch::koxi_home` for the global cache.
+    pub fn locate() -> Result<Self, Error> {
+        let cwd = std::env::current_dir().map_err(Error::Io)?;
+        for dir in cwd.ancestors() {
+            if let Some(project) = Self::at(dir)? {
+                return Ok(project);
+            }
+        }
+        Err(Error::NoProject(cwd))
+    }
+
+    fn at(dir: &Path) -> Result<Option<Self>, Error> {
+        let candidate = dir.join(CONFIG_PATH);
+        if !candidate.is_file() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            root: dir.to_owned(),
+            config: Config::load(&candidate)?,
+        }))
+    }
+}
+
 #[derive(Debug)]
 pub enum Error {
     Io(std::io::Error),
     Parse(toml::de::Error),
     Invalid(String),
+    NoProject(PathBuf),
 }
 
 impl fmt::Display for Error {
@@ -127,6 +162,11 @@ impl fmt::Display for Error {
             Error::Io(err) => write!(f, "reading config: {err}"),
             Error::Parse(err) => write!(f, "parsing config: {err}"),
             Error::Invalid(msg) => write!(f, "invalid config: {msg}"),
+            Error::NoProject(cwd) => write!(
+                f,
+                "no {CONFIG_PATH} found (searched from {} upward)",
+                cwd.display()
+            ),
         }
     }
 }
