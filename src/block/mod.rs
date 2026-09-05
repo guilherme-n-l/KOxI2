@@ -4,6 +4,7 @@ pub mod cli;
 pub mod fio;
 pub mod setup;
 pub mod test;
+pub mod vm;
 
 use std::process::ExitCode;
 
@@ -45,6 +46,7 @@ pub fn run(matches: &ArgMatches) -> ExitCode {
     match name {
         "setup" => setup::setup(&opts, &logs),
         "test" => test::test(&opts, &logs),
+        "vm" => vm::vm(&opts, sub, &logs),
         "clean" => clean(&opts),
         "perf" => perf(&opts),
         "fuzz" => fuzz(&opts),
