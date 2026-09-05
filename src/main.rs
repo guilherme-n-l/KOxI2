@@ -1,5 +1,6 @@
 mod assets;
 mod block;
+mod clean;
 mod cmd;
 mod config;
 mod fetch;
@@ -22,6 +23,7 @@ fn command() -> Command {
         .arg_required_else_help(true)
         .subcommand(block::cli::command())
         .subcommand(assets::command())
+        .subcommand(clean::command())
         .subcommand(nix::command())
 }
 
@@ -30,6 +32,7 @@ fn main() -> ExitCode {
     match matches.subcommand() {
         Some(("block", sub)) => block::run(sub),
         Some(("assets", sub)) => assets::run(sub),
+        Some(("clean", _)) => clean::run(),
         Some(("nix", sub)) => nix::run(sub),
         _ => unreachable!("subcommand is required"),
     }

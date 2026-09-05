@@ -58,7 +58,8 @@ pub fn run(matches: &ArgMatches) -> ExitCode {
 }
 
 /// Remove the project's built artifacts (artifacts/); results and
-/// the shared home cache are untouched (that's --nocache).
+/// the shared home are untouched (orphaned scratch is `koxi clean`,
+/// the download cache is --nocache).
 fn clean(_opts: &Opts) -> ExitCode {
     let project = match Project::locate() {
         Ok(project) => project,

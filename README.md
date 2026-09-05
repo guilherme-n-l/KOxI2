@@ -59,7 +59,8 @@ input fingerprint in the lock.
 - Concurrent runs sharing `$KOXI_HOME` have no cache locking (scratch
   dirs are collision-safe; the cache is not).
 - A killed build (SIGKILL / power loss) can orphan `tmp/` entries;
-  `--nocache` is the only sweep.
+  `koxi clean` (or `--nocache`) sweeps them. Don't run either
+  concurrently with a build — scratch dirs carry no liveness marker.
 - The cache never garbage-collects superseded versions.
 - The lock format is strict (`deny_unknown_fields`, `version = 1`):
   older binaries hard-fail on newer locks. Bump the version whenever a
