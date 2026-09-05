@@ -3,6 +3,10 @@
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";
+    # Kernel-era rust toolchain: kernel 6.19 fails to compile under
+    # rustc >= 1.9x from unstable (custom-target gating, E0310), while
+    # 25.11's 1.91 is contemporary with the kernel and builds it clean.
+    nixpkgs-kernel-rust.url = "github:nixos/nixpkgs/nixos-25.11";
     flake-utils.url = "github:numtide/flake-utils";
     git-hooks = {
       url = "github:cachix/git-hooks.nix";
@@ -14,6 +18,7 @@
     {
       self,
       nixpkgs,
+      nixpkgs-kernel-rust,
       flake-utils,
       git-hooks,
       ...
@@ -30,6 +35,7 @@
         system:
         let
           pkgs = import nixpkgs { inherit system; };
+          krustPkgs = import nixpkgs-kernel-rust { inherit system; };
           inherit (pkgs) lib;
 
           # Tools that run on the build machine while compiling koxi itself
@@ -72,11 +78,13 @@
                 ncurses # menuconfig
                 kmod # modpost, depmod
                 util-linux # setsid
-                # Rust-for-Linux (rnull): kernel 6.19 needs rustc >=
-                # 1.78 and bindgen >= 0.65; without these on PATH,
-                # Kconfig silently disables CONFIG_RUST.
-                rustc
-                rust-bindgen
+                # Rust-for-Linux (rnull): without rustc/bindgen on
+                # PATH, Kconfig silently disables CONFIG_RUST. Pinned
+                # to the kernel-era toolchain (see the input comment);
+                # rustfmt quiets bindgen's post-processing.
+                krustPkgs.rustc
+                krustPkgs.rust-bindgen
+                krustPkgs.rustfmt
               ]
             )
             # Archive / download
@@ -110,7 +118,7 @@
           # rust-src).
           runtimeEnv = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
             MUSL_GCC = "${pkgs.musl.dev}/bin/musl-gcc";
-            RUST_LIB_SRC = "${pkgs.rustPlatform.rustLibSrc}";
+            RUST_LIB_SRC = "${krustPkgs.rustPlatform.rustLibSrc}";
           };
 
           # Dev-only helpers; never needed to build or run koxi.
