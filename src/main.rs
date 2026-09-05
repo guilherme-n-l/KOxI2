@@ -1,5 +1,6 @@
 mod assets;
 mod block;
+mod cmd;
 mod config;
 mod fetch;
 mod fuzz;

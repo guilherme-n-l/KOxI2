@@ -7,13 +7,14 @@
 //! git; subprocess output is teed to per-task files under `out/logs/`.
 
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::Command;
 
 use tracing::{debug, info, warn};
 
+use crate::cmd;
 use crate::config::{Config, Source};
 use crate::lock::{Lock, LockedSource};
 
@@ -37,7 +38,10 @@ pub fn koxi_home() -> Result<PathBuf, Error> {
 /// loaded and saved once per run by the driver, not per fetch.
 pub struct Ctx<'a> {
     pub config: &'a Config,
-    /// The koxi home (see [`koxi_home`]), not the project root.
+    /// The project root (where koxi.toml lives): anchors asset
+    /// overrides and the lock.
+    pub root: &'a Path,
+    /// The koxi home (see [`koxi_home`]): anchors the artifact cache.
     pub home: &'a Path,
     pub lock: &'a mut Lock,
     pub assume_yes: bool,
@@ -154,7 +158,7 @@ pub fn git(name: &str, ctx: &mut Ctx) -> Result<PathBuf, Error> {
         info!("cloning {url}");
         let mut clone = Command::new("git");
         clone.arg("clone").arg(url).arg(&repo);
-        command_status(clone, "git-clone", &logs)?;
+        cmd::status(clone, "git-clone", &logs)?;
     }
 
     let locked_commit = match ctx.lock.sources.get(name) {
@@ -216,7 +220,7 @@ pub fn git_meta(name: &str, ctx: &mut Ctx) -> Result<PathBuf, Error> {
             .arg("--filter=blob:none")
             .arg(url)
             .arg(&repo);
-        command_status(clone, "git-clone", &logs)?;
+        cmd::status(clone, "git-clone", &logs)?;
     }
 
     let locked_commit = match ctx.lock.sources.get(name) {
@@ -266,6 +270,19 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(not(unix))]
 fn is_executable(path: &Path) -> bool {
     path.is_file()
+}
+
+/// The cached tarball location and `<name>-<version>` stem of a
+/// tarball source — for build steps that re-extract pristine trees.
+pub fn tarball_path(name: &str, ctx: &Ctx) -> Result<(PathBuf, String), Error> {
+    let Source::Tarball { version, url } = lookup(name, ctx.config)? else {
+        return Err(Error::WrongKind {
+            name: name.to_owned(),
+            expected: "tarball (version + url)",
+        });
+    };
+    let out = ctx.home.join(OUT_DIR);
+    Ok((out.join(tarball_name(url)?), format!("{name}-{version}")))
 }
 
 fn lookup<'c>(name: &str, config: &'c Config) -> Result<&'c Source, Error> {
@@ -340,9 +357,9 @@ fn download(url: &str, dest: &Path, logs: &Path) -> Result<(), Error> {
     let partial = PathBuf::from(format!("{}.part", dest.display()));
     let mut wget = Command::new("wget");
     wget.arg("-O").arg(&partial).arg(url);
-    if let Err(err) = command_status(wget, "wget", logs) {
+    if let Err(err) = cmd::status(wget, "wget", logs) {
         let _ = fs::remove_file(&partial);
-        return Err(err);
+        return Err(err.into());
     }
     fs::rename(&partial, dest)?;
     Ok(())
@@ -351,19 +368,19 @@ fn download(url: &str, dest: &Path, logs: &Path) -> Result<(), Error> {
 fn sha256(path: &Path, logs: &Path) -> Result<String, Error> {
     let mut cmd = Command::new("sha256sum");
     cmd.arg(path);
-    let stdout = command_stdout(cmd, "sha256sum", logs)?;
+    let stdout = cmd::stdout(cmd, "sha256sum", logs)?;
     stdout
         .split_whitespace()
         .next()
         .map(str::to_owned)
-        .ok_or(Error::MalformedOutput("sha256sum"))
+        .ok_or(Error::Cmd(cmd::Error::Malformed("sha256sum")))
 }
 
 fn extract(tarball: &Path, out: &Path, logs: &Path) -> Result<(), Error> {
     info!("extracting {}", tarball.display());
     let mut tar = Command::new("tar");
     tar.arg("-xf").arg(tarball).arg("-C").arg(out);
-    command_status(tar, "tar", logs)
+    Ok(cmd::status(tar, "tar", logs)?)
 }
 
 fn git_in(repo: &Path, args: &[&str]) -> Command {
@@ -373,7 +390,11 @@ fn git_in(repo: &Path, args: &[&str]) -> Command {
 }
 
 fn head_commit(repo: &Path, logs: &Path) -> Result<String, Error> {
-    command_stdout(git_in(repo, &["rev-parse", "HEAD"]), "git-rev-parse", logs)
+    Ok(cmd::stdout(
+        git_in(repo, &["rev-parse", "HEAD"]),
+        "git-rev-parse",
+        logs,
+    )?)
 }
 
 /// Resolve a commit hash or tag to a full commit hash, fetching from
@@ -381,7 +402,7 @@ fn head_commit(repo: &Path, logs: &Path) -> Result<String, Error> {
 fn resolve_commit(repo: &Path, rev: &str, logs: &Path) -> Result<String, Error> {
     let spec = format!("{rev}^{{commit}}");
     let rev_parse = |spec: &str| {
-        command_stdout(
+        cmd::stdout(
             git_in(repo, &["rev-parse", "--verify", spec]),
             "git-rev-parse",
             logs,
@@ -390,20 +411,20 @@ fn resolve_commit(repo: &Path, rev: &str, logs: &Path) -> Result<String, Error> 
     if let Ok(commit) = rev_parse(&spec) {
         return Ok(commit);
     }
-    let _ = command_status(git_in(repo, &["fetch", "origin", rev]), "git-fetch", logs);
-    let _ = command_status(
+    let _ = cmd::status(git_in(repo, &["fetch", "origin", rev]), "git-fetch", logs);
+    let _ = cmd::status(
         git_in(repo, &["fetch", "--tags", "origin"]),
         "git-fetch",
         logs,
     );
-    rev_parse(&spec)
+    Ok(rev_parse(&spec)?)
 }
 
 /// Require `commit` to be present locally, fetching it when missing.
 fn ensure_commit(repo: &Path, commit: &str, logs: &Path) -> Result<(), Error> {
     let spec = format!("{commit}^{{commit}}");
     let verify = || {
-        command_stdout(
+        cmd::stdout(
             git_in(repo, &["rev-parse", "--verify", &spec]),
             "git-rev-parse",
             logs,
@@ -412,17 +433,18 @@ fn ensure_commit(repo: &Path, commit: &str, logs: &Path) -> Result<(), Error> {
     if verify().is_ok() {
         return Ok(());
     }
-    command_status(
+    cmd::status(
         git_in(repo, &["fetch", "origin", commit]),
         "git-fetch",
         logs,
     )?;
-    verify().map(|_| ())
+    verify()?;
+    Ok(())
 }
 
 fn checkout_commit(repo: &Path, commit: &str, logs: &Path) -> Result<(), Error> {
     let checkout = || {
-        command_status(
+        cmd::status(
             git_in(repo, &["checkout", "--detach", commit]),
             "git-checkout",
             logs,
@@ -431,50 +453,12 @@ fn checkout_commit(repo: &Path, commit: &str, logs: &Path) -> Result<(), Error> 
     if checkout().is_ok() {
         return Ok(());
     }
-    command_status(
+    cmd::status(
         git_in(repo, &["fetch", "origin", commit]),
         "git-fetch",
         logs,
     )?;
-    checkout()
-}
-
-fn task_log(logs: &Path, label: &str) -> Result<(File, PathBuf), Error> {
-    fs::create_dir_all(logs)?;
-    let path = logs.join(format!("{label}.log"));
-    let file = OpenOptions::new().create(true).append(true).open(&path)?;
-    Ok((file, path))
-}
-
-fn command_status(mut cmd: Command, label: &'static str, logs: &Path) -> Result<(), Error> {
-    let (file, log) = task_log(logs, label)?;
-    cmd.stdout(Stdio::from(file.try_clone()?));
-    cmd.stderr(Stdio::from(file));
-    debug!("running {cmd:?} (log: {})", log.display());
-    let status = cmd.status().map_err(|err| Error::Spawn(label, err))?;
-    if !status.success() {
-        return Err(Error::CommandFailed { label, status, log });
-    }
-    Ok(())
-}
-
-fn command_stdout(mut cmd: Command, label: &'static str, logs: &Path) -> Result<String, Error> {
-    let (file, log) = task_log(logs, label)?;
-    cmd.stderr(Stdio::from(file));
-    debug!("running {cmd:?} (log: {})", log.display());
-    let output = cmd.output().map_err(|err| Error::Spawn(label, err))?;
-    if !output.status.success() {
-        return Err(Error::CommandFailed {
-            label,
-            status: output.status,
-            log,
-        });
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if stdout.is_empty() {
-        return Err(Error::MalformedOutput(label));
-    }
-    Ok(stdout)
+    Ok(checkout()?)
 }
 
 fn confirm(prompt: &str, assume_yes: bool) -> Result<bool, Error> {
@@ -507,13 +491,7 @@ pub enum Error {
     },
     ConfirmationRequired(String),
     Io(std::io::Error),
-    Spawn(&'static str, std::io::Error),
-    CommandFailed {
-        label: &'static str,
-        status: ExitStatus,
-        log: PathBuf,
-    },
-    MalformedOutput(&'static str),
+    Cmd(cmd::Error),
     HashMismatch {
         name: String,
         expected: String,
@@ -524,6 +502,12 @@ pub enum Error {
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
         Error::Io(err)
+    }
+}
+
+impl From<cmd::Error> for Error {
+    fn from(err: cmd::Error) -> Self {
+        Error::Cmd(err)
     }
 }
 
@@ -547,11 +531,7 @@ impl fmt::Display for Error {
                 "{prompt} — confirmation needed but stdin is not a terminal; rerun with --yes"
             ),
             Error::Io(err) => write!(f, "{err}"),
-            Error::Spawn(label, err) => write!(f, "running {label}: {err}"),
-            Error::CommandFailed { label, status, log } => {
-                write!(f, "{label} failed: {status} (see {})", log.display())
-            }
-            Error::MalformedOutput(label) => write!(f, "unexpected {label} output"),
+            Error::Cmd(err) => write!(f, "{err}"),
             Error::HashMismatch {
                 name,
                 expected,

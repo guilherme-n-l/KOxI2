@@ -119,14 +119,20 @@ pub fn command() -> Command {
         .arg(flag("nocache", "NOCACHE").help("Clear the KOXI_HOME download cache before running"))
         .arg(flag("skip-build", "SKIP_BUILD").help("Skip kernel build (initramfs still rebuilt)"))
         .arg(flag("yes", "ASSUME_YES").help("Assume yes for interactive prompts"))
+        .arg(
+            opt("cc", "CC")
+                .value_name("compiler")
+                .default_value("gcc")
+                .help("C compiler for the kernel build (e.g. clang)"),
+        )
         // VM / benchmark
         .arg(
             opt("kernel", "KERNEL")
                 .value_name("path")
                 .value_parser(value_parser!(PathBuf))
-                .default_value("out/bzImage")
+                .default_value("artifacts/bzImage")
                 .help_heading("VM / benchmark")
-                .help("Kernel bzImage"),
+                .help("Kernel bzImage (default resolved under the project root)"),
         )
         .arg(
             opt("initrd", "INITRD")
@@ -357,6 +363,7 @@ pub struct Opts {
     pub nocache: bool,
     pub skip_build: bool,
     pub yes: bool,
+    pub cc: String,
     pub kernel: PathBuf,
     pub initrd: PathBuf,
     pub port: u16,
@@ -432,6 +439,7 @@ impl Opts {
             nocache: matches.get_flag("nocache"),
             skip_build: matches.get_flag("skip-build"),
             yes: matches.get_flag("yes"),
+            cc: matches.get_one::<String>("cc").cloned().expect("defaulted"),
             kernel: path(matches, "kernel"),
             initrd: path(matches, "initrd"),
             port: copied(matches, "port"),

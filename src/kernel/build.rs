@@ -1,0 +1,291 @@
+//! Build the kernel image (v1 `kernel/linux-*/build`).
+//!
+//! For determinism every build starts from a pristine tree: the
+//! verified tarball is re-extracted into scratch under `out/build/`,
+//! the `linux/config` asset is applied, and only then does make run.
+//! Scratch is deleted after a successful build and kept on failure
+//! for debugging (it lives under the home rather than the system
+//! /tmp, which is often RAM-backed tmpfs — too small for a kernel
+//! tree). A build is skipped when the artifact exists and the lock's
+//! input fingerprint (recipe version, tarball sha, config sha,
+//! toolchain identity) is unchanged.
+
+use std::fmt;
+use std::fs;
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+
+use tracing::{debug, info, warn};
+
+use crate::assets;
+use crate::cmd;
+use crate::fetch::{self, Ctx};
+use crate::lock::LockedSource;
+
+/// Project-relative directory for build outputs. Artifacts are
+/// project-scoped (unlike sources) because they derive from
+/// project-editable inputs like the kconfig asset.
+pub const ARTIFACTS_DIR: &str = "artifacts";
+
+/// The built kernel image.
+pub const BZIMAGE: &str = "bzImage";
+
+/// koxi.toml sources key for the kernel.
+const SOURCE: &str = "linux";
+
+/// Kernel build target in kbuild vocabulary (`ARCH`), and the lock
+/// key for the build fingerprint. The harness drives x86_64 guests.
+const ARCH: &str = "x86_64";
+const BUILD_TARGET: &str = "linux-x86_64";
+
+/// Bumped when the build steps themselves change, so artifacts built
+/// by an older recipe never fingerprint-match the new one.
+const RECIPE: u32 = 1;
+
+pub struct Options {
+    pub force: bool,
+    pub menuconfig: bool,
+    pub skip_build: bool,
+    /// C compiler passed to make as CC= (kbuild ignores the CC env
+    /// var, so it must be an explicit make variable).
+    pub cc: String,
+}
+
+/// Ensure the kernel image is built; returns its path
+/// (`out/bzImage`).
+pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
+    if !cfg!(target_os = "linux") {
+        return Err(Error::NotLinux);
+    }
+
+    let out = ctx.home.join(fetch::OUT_DIR);
+    let logs = out.join("logs");
+    let artifacts = ctx.root.join(ARTIFACTS_DIR);
+    let artifact = artifacts.join(BZIMAGE);
+
+    let kconfig = assets::load_locked(ctx.root, ctx.config, "linux/config", ctx.lock)?;
+    let (tarball, stem) = fetch::tarball_path(SOURCE, ctx)?;
+    let Some(LockedSource::Tarball {
+        sha256: source_sha, ..
+    }) = ctx.lock.sources.get(SOURCE)
+    else {
+        return Err(Error::NotFetched);
+    };
+    let toolchain = toolchain_id(&opts.cc, &logs);
+    let expected = fingerprint(source_sha, &kconfig.sha256, &toolchain);
+
+    if artifact.is_file()
+        && !opts.force
+        && !opts.menuconfig
+        && ctx.lock.builds.get(BUILD_TARGET) == Some(&expected)
+    {
+        debug!("kernel image cached at {}", artifact.display());
+        return Ok(artifact);
+    }
+
+    // Pristine tree: wipe and re-extract, never build in the shared
+    // source extraction.
+    let build_root = out.join("build");
+    let tree = build_root.join(&stem);
+    if tree.exists() {
+        fs::remove_dir_all(&tree)?;
+    }
+    fs::create_dir_all(&build_root)?;
+    info!("extracting pristine {} for build", stem);
+    let mut tar = Command::new("tar");
+    tar.arg("-xf").arg(&tarball).arg("-C").arg(&build_root);
+    cmd::status(tar, "tar-build", &logs)?;
+    if !tree.is_dir() {
+        return Err(Error::UnexpectedLayout(tree));
+    }
+
+    fs::write(tree.join(".config"), kconfig.contents.as_bytes())?;
+
+    if opts.menuconfig {
+        menuconfig(&tree, &opts.cc)?;
+    }
+
+    info!("configuring kernel (olddefconfig)");
+    cmd::status(
+        make(&tree, &opts.cc, &["olddefconfig"]),
+        "make-olddefconfig",
+        &logs,
+    )?;
+
+    if opts.menuconfig {
+        // Persist the tuned config as the project override so future
+        // runs use it (v1 copied it back into the repo).
+        let dest = assets::default_override_path(ctx.root, "linux/config");
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(tree.join(".config"), &dest)?;
+        info!("persisted menuconfig result to {}", dest.display());
+    }
+
+    if opts.skip_build {
+        warn!("kernel build skipped (--skip-build); image may be stale or missing");
+        return Ok(artifact);
+    }
+
+    let jobs = thread::available_parallelism().map_or(1, |n| n.get());
+    info!(
+        "building kernel with {jobs} jobs (log: {})",
+        logs.join("make-kernel.log").display()
+    );
+    cmd::status(
+        make(&tree, &opts.cc, &["-j", &jobs.to_string()]),
+        "make-kernel",
+        &logs,
+    )?;
+
+    let bzimage = tree.join("arch/x86/boot/bzImage");
+    if !bzimage.is_file() {
+        return Err(Error::MissingImage(bzimage));
+    }
+    fs::create_dir_all(&artifacts)?;
+    fs::copy(&bzimage, &artifact)?;
+
+    // Re-hash the config actually used (menuconfig may have changed
+    // it) so the recorded fingerprint matches the built image.
+    let built_with = assets::load_locked(ctx.root, ctx.config, "linux/config", ctx.lock)?;
+    let source_sha = match ctx.lock.sources.get(SOURCE) {
+        Some(LockedSource::Tarball { sha256, .. }) => sha256.clone(),
+        _ => return Err(Error::NotFetched),
+    };
+    ctx.lock.builds.insert(
+        BUILD_TARGET.to_owned(),
+        fingerprint(&source_sha, &built_with.sha256, &toolchain),
+    );
+
+    // Scratch served its purpose; failures above keep it for
+    // debugging instead.
+    fs::remove_dir_all(&tree)?;
+
+    info!("kernel image at {}", artifact.display());
+    Ok(artifact)
+}
+
+/// Everything that determines the image bytes: recipe version,
+/// source, config, and the toolchain that compiles it.
+fn fingerprint(source_sha: &str, config_sha: &str, toolchain: &str) -> String {
+    format!("r{RECIPE}:{source_sha}:{config_sha}:{toolchain}")
+}
+
+/// Compiler identity (the configured CC + rustc when present); a
+/// toolchain bump must rebuild even with identical source and config.
+fn toolchain_id(cc: &str, logs: &Path) -> String {
+    let probe = |program: &str, label: &'static str| {
+        let mut cmd = Command::new(program);
+        cmd.arg("--version");
+        crate::cmd::stdout(cmd, label, logs)
+            .map(|out| out.lines().next().unwrap_or_default().to_owned())
+            .unwrap_or_else(|_| "none".to_owned())
+    };
+    format!(
+        "{}|{}",
+        probe(cc, "cc-version"),
+        probe("rustc", "rustc-version")
+    )
+}
+
+fn make(tree: &Path, cc: &str, args: &[&str]) -> Command {
+    let mut cmd = Command::new("make");
+    cmd.arg("-C")
+        .arg(tree)
+        .arg(format!("ARCH={ARCH}"))
+        .arg(format!("CC={cc}"))
+        .args(args);
+    cmd
+}
+
+/// Interactive `make menuconfig`, inheriting the terminal.
+fn menuconfig(tree: &Path, cc: &str) -> Result<(), Error> {
+    if !std::io::stdin().is_terminal() {
+        return Err(Error::MenuconfigNeedsTty);
+    }
+    info!("running menuconfig");
+    let status = make(tree, cc, &["menuconfig"])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(Error::Io)?;
+    if !status.success() {
+        return Err(Error::Menuconfig(status));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub enum Error {
+    NotLinux,
+    NotFetched,
+    UnexpectedLayout(PathBuf),
+    MissingImage(PathBuf),
+    MenuconfigNeedsTty,
+    Menuconfig(std::process::ExitStatus),
+    Io(std::io::Error),
+    Asset(assets::Error),
+    Fetch(fetch::Error),
+    Cmd(cmd::Error),
+}
+
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        Error::Io(err)
+    }
+}
+
+impl From<assets::Error> for Error {
+    fn from(err: assets::Error) -> Self {
+        Error::Asset(err)
+    }
+}
+
+impl From<fetch::Error> for Error {
+    fn from(err: fetch::Error) -> Self {
+        Error::Fetch(err)
+    }
+}
+
+impl From<cmd::Error> for Error {
+    fn from(err: cmd::Error) -> Self {
+        Error::Cmd(err)
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::NotLinux => write!(f, "the kernel build requires a Linux host"),
+            Error::NotFetched => {
+                write!(f, "the linux source is not locked yet (fetch step missing)")
+            }
+            Error::UnexpectedLayout(tree) => write!(
+                f,
+                "extracting the kernel tarball did not produce {}",
+                tree.display()
+            ),
+            Error::MissingImage(path) => {
+                write!(
+                    f,
+                    "kernel build finished without producing {}",
+                    path.display()
+                )
+            }
+            Error::MenuconfigNeedsTty => {
+                write!(f, "--menuconfig needs an interactive terminal")
+            }
+            Error::Menuconfig(status) => write!(f, "menuconfig failed: {status}"),
+            Error::Io(err) => write!(f, "{err}"),
+            Error::Asset(err) => write!(f, "{err}"),
+            Error::Fetch(err) => write!(f, "{err}"),
+            Error::Cmd(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}

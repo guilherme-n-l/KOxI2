@@ -40,11 +40,12 @@ pub fn setup(opts: &Opts) -> ExitCode {
     let result = {
         let mut ctx = Ctx {
             config: &project.config,
+            root: &project.root,
             home: &home,
             lock: &mut lock,
             assume_yes: opts.yes,
         };
-        drive(&mut ctx)
+        drive(&mut ctx, opts)
     };
 
     // Save even on failure so already-resolved sources stay locked.
@@ -58,11 +59,21 @@ pub fn setup(opts: &Opts) -> ExitCode {
     }
 }
 
-fn drive(ctx: &mut Ctx) -> Result<(), fetch::Error> {
+fn drive(ctx: &mut Ctx, opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
     let kernel = kernel::setup::setup(ctx)?;
     info!("kernel source ready at {}", kernel.display());
     let history = kernel::setup::history(ctx)?;
     info!("kernel history mirror ready at {}", history.display());
+    let image = kernel::build::build(
+        ctx,
+        &kernel::build::Options {
+            force: opts.force_build,
+            menuconfig: opts.menuconfig,
+            skip_build: opts.skip_build,
+            cc: opts.cc.clone(),
+        },
+    )?;
+    info!("kernel image ready at {}", image.display());
     let (busybox, dropbear) = virt::setup::setup(ctx)?;
     info!("busybox source ready at {}", busybox.display());
     info!("dropbear source ready at {}", dropbear.display());

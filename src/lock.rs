@@ -32,6 +32,11 @@ pub struct Lock {
     /// user-editable, so a moved hash is staleness, not an error.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub assets: BTreeMap<String, String>,
+    /// Input fingerprint of each completed build (source sha +
+    /// config sha), keyed by build target; a build is skipped only
+    /// when its artifact exists and the fingerprint matches.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub builds: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -65,6 +70,7 @@ impl Default for Lock {
             version: LOCK_VERSION,
             sources: BTreeMap::new(),
             assets: BTreeMap::new(),
+            builds: BTreeMap::new(),
         }
     }
 }

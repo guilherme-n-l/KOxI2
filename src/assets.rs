@@ -85,21 +85,33 @@ pub fn load(root: &Path, config: &Config, name: &str) -> Result<Cow<'static, str
         .ok_or_else(|| Error::Unknown(name.to_owned()))
 }
 
-/// Load an asset, record its sha256 in the lock, and report whether
-/// it changed since the previous recorded use (true on first use).
+/// An asset loaded through the lock: its contents, content hash, and
+/// whether it changed since the previous recorded use.
+pub struct Loaded {
+    pub contents: Cow<'static, str>,
+    pub sha256: String,
+    /// True on first use and whenever the hash moved.
+    pub changed: bool,
+}
+
+/// Load an asset and record its sha256 in the lock.
 pub fn load_locked(
     root: &Path,
     config: &Config,
     name: &str,
     lock: &mut Lock,
-) -> Result<(Cow<'static, str>, bool), Error> {
+) -> Result<Loaded, Error> {
     let contents = load(root, config, name)?;
-    let sha = sha256_text(&contents)?;
-    let changed = lock.assets.get(name) != Some(&sha);
+    let sha256 = sha256_text(&contents)?;
+    let changed = lock.assets.get(name) != Some(&sha256);
     if changed {
-        lock.assets.insert(name.to_owned(), sha);
+        lock.assets.insert(name.to_owned(), sha256.clone());
     }
-    Ok((contents, changed))
+    Ok(Loaded {
+        contents,
+        sha256,
+        changed,
+    })
 }
 
 fn sha256_text(text: &str) -> Result<String, Error> {
@@ -324,15 +336,16 @@ mod tests {
         .unwrap();
         let mut lock = Lock::default();
 
-        let (_, changed) = load_locked(&root, &config, "virt/init", &mut lock).unwrap();
-        assert!(changed, "first use counts as changed");
-        let (_, changed) = load_locked(&root, &config, "virt/init", &mut lock).unwrap();
-        assert!(!changed, "unchanged asset is not stale");
+        let first = load_locked(&root, &config, "virt/init", &mut lock).unwrap();
+        assert!(first.changed, "first use counts as changed");
+        let second = load_locked(&root, &config, "virt/init", &mut lock).unwrap();
+        assert!(!second.changed, "unchanged asset is not stale");
+        assert_eq!(first.sha256, second.sha256);
 
         fs::write(root.join("init"), "two").unwrap();
-        let (contents, changed) = load_locked(&root, &config, "virt/init", &mut lock).unwrap();
-        assert!(changed, "edited asset is stale");
-        assert_eq!(contents.as_ref(), "two");
+        let edited = load_locked(&root, &config, "virt/init", &mut lock).unwrap();
+        assert!(edited.changed, "edited asset is stale");
+        assert_eq!(edited.contents.as_ref(), "two");
         fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -12,8 +12,6 @@ use clap::ArgMatches;
 
 use cli::Opts;
 
-use crate::config::Project;
-
 /// Dispatch a parsed `koxi block <command>` invocation.
 pub fn run(matches: &ArgMatches) -> ExitCode {
     let (name, sub) = matches.subcommand().expect("subcommand is required");
