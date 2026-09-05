@@ -4,6 +4,7 @@ mod fetch;
 mod fuzz;
 mod kernel;
 mod lock;
+mod logging;
 mod virt;
 
 use std::process::ExitCode;
