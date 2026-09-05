@@ -553,6 +553,118 @@ impl std::error::Error for Error {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+
+    struct Fixture {
+        home: tempfile::TempDir,
+        root: tempfile::TempDir,
+        config: Config,
+        lock: Lock,
+    }
+
+    /// A home whose cache holds a tiny thing-1.0.tar.gz whose top
+    /// directory is `topdir`; the source URL points at a closed port
+    /// so any download attempt fails fast and loudly.
+    fn fixture(topdir: &str) -> Fixture {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let cache = home.path().join(CACHE_DIR);
+        fs::create_dir_all(&cache).unwrap();
+
+        let staging = tempfile::tempdir().unwrap();
+        fs::create_dir_all(staging.path().join(topdir)).unwrap();
+        fs::write(staging.path().join(topdir).join("file"), "hi").unwrap();
+        let status = Command::new("tar")
+            .arg("-czf")
+            .arg(cache.join("thing-1.0.tar.gz"))
+            .arg("-C")
+            .arg(staging.path())
+            .arg(topdir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let config = Config::parse(
+            "[sources.thing]\nversion = \"1.0\"\nurl = \"http://127.0.0.1:9/thing-1.0.tar.gz\"\n",
+        )
+        .unwrap();
+        Fixture {
+            home,
+            root,
+            config,
+            lock: Lock::default(),
+        }
+    }
+
+    fn run_tarball(fx: &mut Fixture) -> Result<PathBuf, Error> {
+        let logs = fx.home.path().join("logs");
+        let mut ctx = Ctx {
+            config: &fx.config,
+            root: fx.root.path(),
+            home: fx.home.path(),
+            lock: &mut fx.lock,
+            logs: &logs,
+            assume_yes: true,
+        };
+        tarball("thing", &mut ctx)
+    }
+
+    #[test]
+    fn adopts_cached_tarball_then_serves_from_cache() {
+        let mut fx = fixture("thing-1.0");
+        let tree = run_tarball(&mut fx).unwrap();
+        assert!(tree.join("file").is_file());
+        assert!(
+            fx.lock.sources.contains_key("thing"),
+            "adoption locked the hash"
+        );
+        let stamp = fx.home.path().join(CACHE_DIR).join(".thing-1.0.extracted");
+        assert!(stamp.is_file());
+
+        // Fully cached: no re-extract (a marker in the tree survives).
+        fs::write(tree.join("marker"), "x").unwrap();
+        run_tarball(&mut fx).unwrap();
+        assert!(tree.join("marker").is_file());
+    }
+
+    #[test]
+    fn missing_stamp_forces_reextraction() {
+        let mut fx = fixture("thing-1.0");
+        let tree = run_tarball(&mut fx).unwrap();
+        fs::write(tree.join("marker"), "x").unwrap();
+        fs::remove_file(fx.home.path().join(CACHE_DIR).join(".thing-1.0.extracted")).unwrap();
+
+        run_tarball(&mut fx).unwrap();
+        assert!(
+            !tree.join("marker").exists(),
+            "interrupted extraction was redone"
+        );
+        assert!(tree.join("file").is_file());
+    }
+
+    #[test]
+    fn mismatched_tarball_layout_errors() {
+        let mut fx = fixture("wrong-1.0");
+        assert!(matches!(
+            run_tarball(&mut fx),
+            Err(Error::UnexpectedLayout { .. })
+        ));
+    }
+
+    #[test]
+    fn corrupt_cache_attempts_refetch() {
+        let mut fx = fixture("thing-1.0");
+        run_tarball(&mut fx).unwrap();
+
+        // Lock is valid but the file no longer matches it: koxi must
+        // refetch, which fails against the closed port.
+        let tarball_path = fx.home.path().join(CACHE_DIR).join("thing-1.0.tar.gz");
+        let mut bytes = fs::read(&tarball_path).unwrap();
+        bytes.push(0);
+        fs::write(&tarball_path, bytes).unwrap();
+
+        assert!(matches!(run_tarball(&mut fx), Err(Error::Cmd(_))));
+    }
 
     #[test]
     fn tarball_name_is_last_url_segment() {
