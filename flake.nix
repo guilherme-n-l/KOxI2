@@ -85,6 +85,10 @@
                 krustPkgs.rustc
                 krustPkgs.rust-bindgen
                 krustPkgs.rustfmt
+                # syzkaller probes gcc for -static and silently drops
+                # it without glibc.a — the executor must be static to
+                # run in the initramfs.
+                glibc.static
               ]
             )
             # Archive / download
