@@ -72,7 +72,11 @@
                 ncurses # menuconfig
                 kmod # modpost, depmod
                 util-linux # setsid
-                rust-bindgen # rnull (Rust-for-Linux) bindings
+                # Rust-for-Linux (rnull): kernel 6.19 needs rustc >=
+                # 1.78 and bindgen >= 0.65; without these on PATH,
+                # Kconfig silently disables CONFIG_RUST.
+                rustc
+                rust-bindgen
               ]
             )
             # Archive / download
@@ -101,8 +105,12 @@
           # enter NIX_LDFLAGS and gcc then links glibc-hosted binaries
           # against musl's libc.so, which segfault at startup. The
           # busybox build reaches musl-gcc by absolute path instead.
-          muslEnv = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          # RUST_LIB_SRC: the kernel's rust_is_available.sh needs the
+          # standard library sources (nixpkgs rustc does not bundle
+          # rust-src).
+          runtimeEnv = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
             MUSL_GCC = "${pkgs.musl.dev}/bin/musl-gcc";
+            RUST_LIB_SRC = "${pkgs.rustPlatform.rustLibSrc}";
           };
 
           # Dev-only helpers; never needed to build or run koxi.
@@ -171,7 +179,7 @@
               env = {
                 RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
               }
-              // muslEnv;
+              // runtimeEnv;
             };
 
             # Runtime environment for the harness itself: the koxi
@@ -181,7 +189,7 @@
             # no rust toolchain, no hooks.
             koxi = pkgs.mkShell {
               packages = extraPackages ++ [ koxi ];
-              env = muslEnv;
+              env = runtimeEnv;
             };
           };
 
