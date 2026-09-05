@@ -64,13 +64,31 @@ fn drive(ctx: &mut Ctx, opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
     info!("kernel source ready at {}", kernel.display());
     let history = kernel::setup::history(ctx)?;
     info!("kernel history mirror ready at {}", history.display());
+    // CLI/env --cc beats koxi.toml [build].cc beats the gcc default;
+    // target comes from [build].target.
+    let cc = if opts.cc_from_cli {
+        opts.cc.clone()
+    } else {
+        ctx.config
+            .build
+            .cc
+            .clone()
+            .unwrap_or_else(|| opts.cc.clone())
+    };
+    let target = ctx
+        .config
+        .build
+        .target
+        .clone()
+        .unwrap_or_else(|| "x86_64".to_owned());
     let image = kernel::build::build(
         ctx,
         &kernel::build::Options {
             force: opts.force_build,
             menuconfig: opts.menuconfig,
             skip_build: opts.skip_build,
-            cc: opts.cc.clone(),
+            cc,
+            target,
         },
     )?;
     info!("kernel image ready at {}", image.display());

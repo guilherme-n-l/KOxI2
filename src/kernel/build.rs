@@ -35,10 +35,14 @@ pub const BZIMAGE: &str = "bzImage";
 /// koxi.toml sources key for the kernel.
 const SOURCE: &str = "linux";
 
-/// Kernel build target in kbuild vocabulary (`ARCH`), and the lock
-/// key for the build fingerprint. The harness drives x86_64 guests.
-const ARCH: &str = "x86_64";
-const BUILD_TARGET: &str = "linux-x86_64";
+/// Supported build targets, in kbuild vocabulary: target name to
+/// (make ARCH value, image path inside the tree).
+fn kbuild_arch(target: &str) -> Option<(&'static str, &'static str)> {
+    match target {
+        "x86_64" => Some(("x86_64", "arch/x86/boot/bzImage")),
+        _ => None,
+    }
+}
 
 /// Bumped when the build steps themselves change, so artifacts built
 /// by an older recipe never fingerprint-match the new one.
@@ -51,6 +55,8 @@ pub struct Options {
     /// C compiler passed to make as CC= (kbuild ignores the CC env
     /// var, so it must be an explicit make variable).
     pub cc: String,
+    /// Build target arch in kbuild vocabulary (see [`kbuild_arch`]).
+    pub target: String,
 }
 
 /// Ensure the kernel image is built; returns its path
@@ -59,6 +65,10 @@ pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
     if !cfg!(target_os = "linux") {
         return Err(Error::NotLinux);
     }
+
+    let (arch, image_path) =
+        kbuild_arch(&opts.target).ok_or_else(|| Error::UnsupportedTarget(opts.target.clone()))?;
+    let build_key = format!("linux-{}", opts.target);
 
     let out = ctx.home.join(fetch::OUT_DIR);
     let logs = out.join("logs");
@@ -79,7 +89,7 @@ pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
     if artifact.is_file()
         && !opts.force
         && !opts.menuconfig
-        && ctx.lock.builds.get(BUILD_TARGET) == Some(&expected)
+        && ctx.lock.builds.get(&build_key) == Some(&expected)
     {
         debug!("kernel image cached at {}", artifact.display());
         return Ok(artifact);
@@ -104,12 +114,12 @@ pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
     fs::write(tree.join(".config"), kconfig.contents.as_bytes())?;
 
     if opts.menuconfig {
-        menuconfig(&tree, &opts.cc)?;
+        menuconfig(&tree, arch, &opts.cc)?;
     }
 
     info!("configuring kernel (olddefconfig)");
     cmd::status(
-        make(&tree, &opts.cc, &["olddefconfig"]),
+        make(&tree, arch, &opts.cc, &["olddefconfig"]),
         "make-olddefconfig",
         &logs,
     )?;
@@ -136,12 +146,12 @@ pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
         logs.join("make-kernel.log").display()
     );
     cmd::status(
-        make(&tree, &opts.cc, &["-j", &jobs.to_string()]),
+        make(&tree, arch, &opts.cc, &["-j", &jobs.to_string()]),
         "make-kernel",
         &logs,
     )?;
 
-    let bzimage = tree.join("arch/x86/boot/bzImage");
+    let bzimage = tree.join(image_path);
     if !bzimage.is_file() {
         return Err(Error::MissingImage(bzimage));
     }
@@ -156,7 +166,7 @@ pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
         _ => return Err(Error::NotFetched),
     };
     ctx.lock.builds.insert(
-        BUILD_TARGET.to_owned(),
+        build_key,
         fingerprint(&source_sha, &built_with.sha256, &toolchain),
     );
 
@@ -191,23 +201,23 @@ fn toolchain_id(cc: &str, logs: &Path) -> String {
     )
 }
 
-fn make(tree: &Path, cc: &str, args: &[&str]) -> Command {
+fn make(tree: &Path, arch: &str, cc: &str, args: &[&str]) -> Command {
     let mut cmd = Command::new("make");
     cmd.arg("-C")
         .arg(tree)
-        .arg(format!("ARCH={ARCH}"))
+        .arg(format!("ARCH={arch}"))
         .arg(format!("CC={cc}"))
         .args(args);
     cmd
 }
 
 /// Interactive `make menuconfig`, inheriting the terminal.
-fn menuconfig(tree: &Path, cc: &str) -> Result<(), Error> {
+fn menuconfig(tree: &Path, arch: &str, cc: &str) -> Result<(), Error> {
     if !std::io::stdin().is_terminal() {
         return Err(Error::MenuconfigNeedsTty);
     }
     info!("running menuconfig");
-    let status = make(tree, cc, &["menuconfig"])
+    let status = make(tree, arch, cc, &["menuconfig"])
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -223,6 +233,7 @@ fn menuconfig(tree: &Path, cc: &str) -> Result<(), Error> {
 pub enum Error {
     NotLinux,
     NotFetched,
+    UnsupportedTarget(String),
     UnexpectedLayout(PathBuf),
     MissingImage(PathBuf),
     MenuconfigNeedsTty,
@@ -261,6 +272,9 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::NotLinux => write!(f, "the kernel build requires a Linux host"),
+            Error::UnsupportedTarget(target) => {
+                write!(f, "unsupported build target {target} (supported: x86_64)")
+            }
             Error::NotFetched => {
                 write!(f, "the linux source is not locked yet (fetch step missing)")
             }

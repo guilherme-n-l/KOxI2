@@ -7,6 +7,12 @@
 # editing with `koxi assets dump <name>`.
 # [assets]
 # "linux/config" = "my-configs/kasan.config"
+#
+# Toolchain declaration; --cc (or the CC env var) overrides cc for
+# one-off runs. target uses kbuild vocabulary (only x86_64 today).
+# [build]
+# cc = "clang"
+# target = "x86_64"
 
 [sources.linux]
 version = "6.19"

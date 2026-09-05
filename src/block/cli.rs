@@ -364,6 +364,9 @@ pub struct Opts {
     pub skip_build: bool,
     pub yes: bool,
     pub cc: String,
+    /// Whether --cc came from the CLI/env rather than clap's default,
+    /// so koxi.toml [build].cc can fill the gap.
+    pub cc_from_cli: bool,
     pub kernel: PathBuf,
     pub initrd: PathBuf,
     pub port: u16,
@@ -440,6 +443,8 @@ impl Opts {
             skip_build: matches.get_flag("skip-build"),
             yes: matches.get_flag("yes"),
             cc: matches.get_one::<String>("cc").cloned().expect("defaulted"),
+            cc_from_cli: matches.value_source("cc")
+                != Some(clap::parser::ValueSource::DefaultValue),
             kernel: path(matches, "kernel"),
             initrd: path(matches, "initrd"),
             port: copied(matches, "port"),

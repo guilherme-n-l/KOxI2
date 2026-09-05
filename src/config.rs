@@ -20,9 +20,25 @@ pub struct Config {
     /// project root. Undeclared assets use the embedded defaults.
     #[serde(default)]
     pub assets: BTreeMap<String, PathBuf>,
+    /// Toolchain declaration (`[build]`).
+    #[serde(default)]
+    pub build: BuildConfig,
     /// Block-harness configuration (`[block]`).
     #[serde(default)]
     pub block: BlockConfig,
+}
+
+/// Project-declared toolchain for builds. The --cc flag (or CC env)
+/// overrides `cc` for one-off runs.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildConfig {
+    /// C compiler name or path (default: gcc).
+    #[serde(default)]
+    pub cc: Option<String>,
+    /// Build target arch in kbuild vocabulary (default: x86_64).
+    #[serde(default)]
+    pub target: Option<String>,
 }
 
 /// Everything block-specific: the driver registry (v1 `drivers.cfg`).
@@ -198,6 +214,22 @@ mod tests {
             Some("null_blk")
         );
         assert!(config.sources.contains_key("linux"));
+    }
+
+    #[test]
+    fn build_section_parses() {
+        let config = Config::parse(
+            r#"
+            [sources]
+            [build]
+            cc = "clang"
+            target = "x86_64"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.build.cc.as_deref(), Some("clang"));
+        assert_eq!(config.build.target.as_deref(), Some("x86_64"));
+        assert_eq!(Config::parse("[sources]").unwrap().build.cc, None);
     }
 
     #[test]
