@@ -43,6 +43,14 @@ pub enum Source {
         /// exact commit recorded in `koxi.lock`.
         rev: String,
     },
+    /// History-only mirror: cloned bare with blobs filtered out and
+    /// never checked out. For commit mining, not for building.
+    GitMeta {
+        #[serde(rename = "git-meta")]
+        git_meta: String,
+        /// Required pin, as in [`Source::Git`].
+        rev: String,
+    },
 }
 
 /// One driver registry entry (v1 `[drivers "<name>"]`).
@@ -186,6 +194,29 @@ mod tests {
             Some("null_blk")
         );
         assert!(config.sources.contains_key("linux"));
+    }
+
+    #[test]
+    fn git_meta_source_parses_and_requires_rev() {
+        let config = Config::parse(
+            r#"
+            [sources.linux-meta]
+            git-meta = "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
+            rev = "v6.19"
+            "#,
+        )
+        .unwrap();
+        assert!(matches!(
+            config.sources["linux-meta"],
+            Source::GitMeta { .. }
+        ));
+        assert!(Config::parse(
+            r#"
+            [sources.linux-meta]
+            git-meta = "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
+            "#,
+        )
+        .is_err());
     }
 
     #[test]

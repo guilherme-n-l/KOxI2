@@ -9,3 +9,9 @@ use crate::fetch::{self, Ctx};
 pub fn setup(ctx: &mut Ctx) -> Result<PathBuf, fetch::Error> {
     fetch::tarball("linux", ctx)
 }
+
+/// Ensure the kernel history mirror (bare, metadata-only) is present
+/// for commit mining; returns the repo path.
+pub fn history(ctx: &mut Ctx) -> Result<PathBuf, fetch::Error> {
+    fetch::git_meta("linux-meta", ctx)
+}

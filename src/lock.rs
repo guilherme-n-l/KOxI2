@@ -44,6 +44,14 @@ pub enum LockedSource {
         /// The exact commit the pin resolved to.
         commit: String,
     },
+    GitMeta {
+        #[serde(rename = "git-meta")]
+        git_meta: String,
+        /// The pin as declared in `koxi.toml` (commit hash or tag).
+        rev: String,
+        /// The exact commit the pin resolved to.
+        commit: String,
+    },
 }
 
 impl Default for Lock {
@@ -92,6 +100,13 @@ impl Lock {
                     rev: cfg_rev,
                 },
             ) => git == cfg_git && rev == cfg_rev,
+            (
+                Some(LockedSource::GitMeta { git_meta, rev, .. }),
+                Source::GitMeta {
+                    git_meta: cfg_url,
+                    rev: cfg_rev,
+                },
+            ) => git_meta == cfg_url && rev == cfg_rev,
             _ => false,
         }
     }

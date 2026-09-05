@@ -186,6 +186,67 @@ pub fn git(name: &str, ctx: &mut Ctx) -> Result<PathBuf, Error> {
     Ok(repo)
 }
 
+/// Ensure the git-meta source `name` — a bare, blob-filtered history
+/// mirror for commit mining — exists in `out/<name>.git` with the
+/// locked commit available; returns the repo path. Never checked out.
+pub fn git_meta(name: &str, ctx: &mut Ctx) -> Result<PathBuf, Error> {
+    let source = lookup(name, ctx.config)?;
+    let Source::GitMeta { git_meta: url, rev } = source else {
+        return Err(Error::WrongKind {
+            name: name.to_owned(),
+            expected: "git-meta (git-meta + rev)",
+        });
+    };
+
+    let out = ctx.home.join(OUT_DIR);
+    let logs = out.join("logs");
+    fs::create_dir_all(&out)?;
+    let repo = out.join(format!("{name}.git"));
+
+    if repo.exists() && !repo.join("HEAD").is_file() {
+        warn!("removing incomplete mirror {}", repo.display());
+        fs::remove_dir_all(&repo)?;
+    }
+    if !repo.exists() {
+        info!("cloning {url} (bare, history only)");
+        let mut clone = Command::new("git");
+        clone
+            .arg("clone")
+            .arg("--bare")
+            .arg("--filter=blob:none")
+            .arg(url)
+            .arg(&repo);
+        command_status(clone, "git-clone", &logs)?;
+    }
+
+    let locked_commit = match ctx.lock.sources.get(name) {
+        Some(LockedSource::GitMeta { commit, .. }) if ctx.lock.satisfies(name, source) => {
+            Some(commit.clone())
+        }
+        _ => None,
+    };
+    let commit = match locked_commit {
+        Some(commit) => {
+            ensure_commit(&repo, &commit, &logs)?;
+            commit
+        }
+        None => {
+            let commit = resolve_commit(&repo, rev, &logs)?;
+            ctx.lock.sources.insert(
+                name.to_owned(),
+                LockedSource::GitMeta {
+                    git_meta: url.clone(),
+                    rev: rev.clone(),
+                    commit: commit.clone(),
+                },
+            );
+            commit
+        }
+    };
+    debug!("{name}: history mirror holds {commit}");
+    Ok(repo)
+}
+
 /// Locate `tool` on PATH.
 pub fn find_tool(tool: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
@@ -336,6 +397,27 @@ fn resolve_commit(repo: &Path, rev: &str, logs: &Path) -> Result<String, Error> 
         logs,
     );
     rev_parse(&spec)
+}
+
+/// Require `commit` to be present locally, fetching it when missing.
+fn ensure_commit(repo: &Path, commit: &str, logs: &Path) -> Result<(), Error> {
+    let spec = format!("{commit}^{{commit}}");
+    let verify = || {
+        command_stdout(
+            git_in(repo, &["rev-parse", "--verify", &spec]),
+            "git-rev-parse",
+            logs,
+        )
+    };
+    if verify().is_ok() {
+        return Ok(());
+    }
+    command_status(
+        git_in(repo, &["fetch", "origin", commit]),
+        "git-fetch",
+        logs,
+    )?;
+    verify().map(|_| ())
 }
 
 fn checkout_commit(repo: &Path, commit: &str, logs: &Path) -> Result<(), Error> {

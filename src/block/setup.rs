@@ -61,6 +61,8 @@ pub fn setup(opts: &Opts) -> ExitCode {
 fn drive(ctx: &mut Ctx) -> Result<(), fetch::Error> {
     let kernel = kernel::setup::setup(ctx)?;
     info!("kernel source ready at {}", kernel.display());
+    let history = kernel::setup::history(ctx)?;
+    info!("kernel history mirror ready at {}", history.display());
     let (busybox, dropbear) = virt::setup::setup(ctx)?;
     info!("busybox source ready at {}", busybox.display());
     info!("dropbear source ready at {}", dropbear.display());

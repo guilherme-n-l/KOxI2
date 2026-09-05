@@ -5,6 +5,12 @@
 version = "6.19"
 url = "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.19.tar.xz"
 
+# git-meta: bare, blob-filtered history mirror for commit mining;
+# never checked out or built.
+[sources.linux-meta]
+git-meta = "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
+rev = "v6.19"
+
 [sources.busybox]
 version = "1.36.1"
 url = "https://busybox.net/downloads/busybox-1.36.1.tar.bz2"
