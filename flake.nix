@@ -150,16 +150,27 @@
             inherit pre-commit;
           };
 
-          devShells.default = pkgs.mkShell {
-            inherit nativeBuildInputs buildInputs;
-            packages = extraPackages ++ devPackages ++ pre-commit.enabledPackages;
+          devShells = {
+            default = pkgs.mkShell {
+              inherit nativeBuildInputs buildInputs;
+              packages = extraPackages ++ devPackages ++ pre-commit.enabledPackages;
 
-            # Installs the git hooks on shell entry.
-            shellHook = pre-commit.shellHook;
+              # Installs the git hooks on shell entry.
+              shellHook = pre-commit.shellHook;
 
-            # rust-src: used by rust-analyzer and by the kernel's Rust
-            # (rnull) build, which needs the standard library sources.
-            env.RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+              # rust-src: used by rust-analyzer and by the kernel's Rust
+              # (rnull) build, which needs the standard library sources.
+              env.RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+            };
+
+            # Runtime environment for the harness itself: the koxi
+            # binary plus everything it shells out to in order to
+            # build and run the pipeline (kernel/userland toolchains,
+            # qemu, syzkaller build deps). Not for developing koxi —
+            # no rust toolchain, no hooks.
+            koxi = pkgs.mkShell {
+              packages = extraPackages ++ [ koxi ];
+            };
           };
 
           # nixfmt-tree = treefmt wrapper; bare nixfmt reads stdin under
