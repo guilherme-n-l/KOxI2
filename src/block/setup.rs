@@ -136,6 +136,13 @@ fn drive(ctx: &mut Ctx, opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
     info!("busybox ready at {}", busybox_bin.display());
+    let dropbear_bin = virt::build::build_dropbear(
+        ctx,
+        &virt::build::Options {
+            force: opts.force_build,
+        },
+    )?;
+    info!("dropbear ready at {}", dropbear_bin.display());
     let syzkaller = fuzz::setup::setup(ctx)?;
     info!("syzkaller source ready at {}", syzkaller.display());
     let fio = fio::setup(ctx)?;

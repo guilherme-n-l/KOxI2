@@ -34,10 +34,6 @@ pub const ASSETS: &[Asset] = &[
         contents: include_str!("../assets/busybox/config"),
     },
     Asset {
-        name: "dropbear/01-cppflags.patch",
-        contents: include_str!("../assets/dropbear/01-cppflags.patch"),
-    },
-    Asset {
         name: "syzkaller/01-dashO.patch",
         contents: include_str!("../assets/syzkaller/01-dashO.patch"),
     },

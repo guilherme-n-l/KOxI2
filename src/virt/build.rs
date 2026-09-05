@@ -22,11 +22,36 @@ use crate::{assets, cmd};
 /// Artifact and lock key.
 pub const BUSYBOX: &str = "busybox";
 
+/// Artifact name; the lock build key is "dropbear".
+pub const DROPBEARMULTI: &str = "dropbearmulti";
+
 /// koxi.toml sources key.
 const SOURCE: &str = "busybox";
 
 /// Bumped when the build steps themselves change.
 const RECIPE: u32 = 1;
+
+/// v1's configure flags, minus the libxcrypt plumbing (CPPFLAGS /
+/// LDFLAGS / LIBS=-lutil and the cppflags-reorder patch): musl
+/// provides crypt() and openpty() in libc, so none of it is needed.
+const DROPBEAR_CONFIGURE: &[&str] = &[
+    "--enable-static",
+    "--enable-bundled-libtom",
+    "--disable-zlib",
+    "--disable-pam",
+    "--disable-syslog",
+    "--disable-shadow",
+    "--disable-lastlog",
+    "--disable-utmp",
+    "--disable-utmpx",
+    "--disable-wtmp",
+    "--disable-wtmpx",
+    "--disable-loginfunc",
+    "--disable-pututline",
+    "--disable-pututxline",
+    "--enable-openpty",
+    "--disable-harden",
+];
 
 pub struct Options {
     pub force: bool,
@@ -138,6 +163,100 @@ pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
     }
 
     info!("busybox at {}", artifact.display());
+    Ok(artifact)
+}
+
+/// Ensure the static dropbear multibinary is built; returns
+/// `artifacts/dropbearmulti`.
+pub fn build_dropbear(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
+    if !cfg!(target_os = "linux") {
+        return Err(Error::NotLinux);
+    }
+
+    let logs = ctx.logs;
+    let artifacts = ctx.root.join(ARTIFACTS_DIR);
+    let artifact = artifacts.join(DROPBEARMULTI);
+
+    let (tarball, stem) = fetch::tarball_path("dropbear", ctx)?;
+    let Some(LockedSource::Tarball {
+        sha256: source_sha, ..
+    }) = ctx.lock.sources.get("dropbear")
+    else {
+        return Err(Error::NotFetched);
+    };
+    let cc = musl_cc();
+    let toolchain = format!("{cc}:{}", probe_version(&cc));
+    // No config asset: the configure flags are part of the recipe.
+    let expected = format!("r{RECIPE}:{source_sha}:{toolchain}");
+
+    if artifact.is_file() && !opts.force && ctx.lock.builds.get("dropbear") == Some(&expected) {
+        debug!("dropbear cached at {}", artifact.display());
+        return Ok(artifact);
+    }
+
+    let tmp_root = ctx.home.join("tmp");
+    fs::create_dir_all(&tmp_root)?;
+    let scratch = tempfile::Builder::new()
+        .prefix(&format!("{stem}-"))
+        .tempdir_in(&tmp_root)?;
+    let tree = scratch.path().join(&stem);
+
+    let result = (|| -> Result<(), Error> {
+        info!("extracting pristine {stem} for build");
+        let mut tar = Command::new("tar");
+        tar.arg("-xf").arg(&tarball).arg("-C").arg(scratch.path());
+        cmd::status(tar, "tar-build", logs)?;
+        if !tree.is_dir() {
+            return Err(Error::UnexpectedLayout(tree.clone()));
+        }
+
+        info!("configuring dropbear");
+        let mut configure = Command::new("./configure");
+        configure
+            .current_dir(&tree)
+            .args(DROPBEAR_CONFIGURE)
+            .env("CC", &cc)
+            .env("NIX_HARDENING_ENABLE", "");
+        cmd::status(configure, "dropbear-configure", logs)?;
+
+        let jobs = thread::available_parallelism().map_or(1, |n| n.get());
+        info!(
+            "building dropbear with {jobs} jobs (log: {})",
+            logs.join("make-dropbear.log").display()
+        );
+        let mut make = Command::new("make");
+        make.arg("-C")
+            .arg(&tree)
+            .arg("PROGRAMS=dropbear dropbearkey scp")
+            .arg("MULTI=1")
+            .arg("STATIC=1")
+            .env("NIX_HARDENING_ENABLE", "")
+            .arg("-j")
+            .arg(jobs.to_string());
+        cmd::status(make, "make-dropbear", logs)?;
+
+        let built = tree.join("dropbearmulti");
+        if !built.is_file() {
+            return Err(Error::MissingBinary(built));
+        }
+        fs::create_dir_all(&artifacts)?;
+        fs::copy(&built, &artifact)?;
+        ctx.lock
+            .artifacts
+            .insert(DROPBEARMULTI.to_owned(), fetch::sha256(&artifact, logs)?);
+        ctx.lock
+            .builds
+            .insert("dropbear".to_owned(), expected.clone());
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        let kept = scratch.keep();
+        warn!("build scratch kept for debugging at {}", kept.display());
+        return Err(err);
+    }
+
+    info!("dropbear at {}", artifact.display());
     Ok(artifact)
 }
 
