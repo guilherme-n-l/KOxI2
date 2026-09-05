@@ -1,6 +1,10 @@
 mod block;
 mod config;
+mod fetch;
+mod fuzz;
+mod kernel;
 mod lock;
+mod virt;
 
 use std::process::ExitCode;
 

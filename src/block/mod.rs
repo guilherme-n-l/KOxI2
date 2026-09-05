@@ -1,7 +1,10 @@
 //! Block-device-driver instantiation of KOxI, mirroring v1 `block/`.
 
 pub mod cli;
+pub mod fio;
+pub mod setup;
 
+use setup::setup;
 use std::process::ExitCode;
 
 use clap::ArgMatches;
@@ -22,10 +25,6 @@ pub fn run(matches: &ArgMatches) -> ExitCode {
         "all" => all(sub),
         other => unreachable!("unknown block subcommand {other}"),
     }
-}
-
-fn setup(_matches: &ArgMatches) -> ExitCode {
-    not_implemented("setup")
 }
 
 fn test(_matches: &ArgMatches) -> ExitCode {
@@ -61,7 +60,7 @@ fn debug(_matches: &ArgMatches) -> ExitCode {
 }
 
 fn all(_matches: &ArgMatches) -> ExitCode {
-    not_implemented("all")
+    setup(_matches)
 }
 
 fn not_implemented(name: &str) -> ExitCode {
