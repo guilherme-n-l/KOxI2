@@ -25,7 +25,7 @@
     }:
     # Not eachDefaultSystem: that list still contains x86_64-darwin,
     # which nixpkgs 26.11 (current unstable) dropped and hard-errors on.
-    flake-utils.lib.eachSystem
+    (flake-utils.lib.eachSystem
       [
         "x86_64-linux"
         "aarch64-linux"
@@ -205,5 +205,19 @@
           # `nix fmt` instead of walking the tree.
           formatter = pkgs.nixfmt-tree;
         }
-      );
+      )
+    )
+    // {
+      # Project starter for koxi *users* (a dir with a koxi.toml, not
+      # this repo): `nix flake init -t github:guilherme-n-l/KOxI2#koxi`
+      # or, offline, `koxi nix init`.
+      templates = rec {
+        koxi = {
+          path = ./templates/koxi;
+          description = "KOxI project runtime environment (koxi + pipeline toolchain)";
+          welcomeText = "Run `nix develop`, then `koxi block test` and `koxi block setup`.";
+        };
+        default = koxi;
+      };
+    };
 }
