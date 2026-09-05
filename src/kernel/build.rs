@@ -30,7 +30,8 @@ use crate::lock::LockedSource;
 /// project-editable inputs like the kconfig asset.
 pub const ARTIFACTS_DIR: &str = "artifacts";
 
-/// The built kernel image.
+/// The built kernel image; what it contains (KASAN etc.) is the
+/// kconfig asset's business, so the name stays neutral.
 pub const BZIMAGE: &str = "bzImage";
 
 /// koxi.toml sources key for the kernel.
@@ -63,17 +64,20 @@ pub struct Options {
     pub modules: Vec<Module>,
 }
 
-/// A module to harvest: its tree-relative path and artifact name.
-/// Missing modules warn rather than fail — a registry driver may be
-/// built-in (=y) or absent from the config; phases that require a
-/// specific module validate at their own step.
+/// A file to harvest from the built tree into artifacts/.
 pub struct Module {
     pub file: String,
     pub tree_path: std::path::PathBuf,
+    /// Required files fail the build when missing (explicit user
+    /// requests like [build].extra-artifacts); optional ones warn —
+    /// a registry driver may be built-in (=y) or absent from the
+    /// config, and phases that need a specific module validate at
+    /// their own step.
+    pub required: bool,
 }
 
 /// Ensure the kernel image is built; returns its path
-/// (`out/bzImage`).
+/// (`artifacts/bzImage`).
 pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
     if !cfg!(target_os = "linux") {
         return Err(Error::NotLinux);
@@ -185,6 +189,9 @@ pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
         for module in &opts.modules {
             let built = tree.join(&module.tree_path);
             if !built.is_file() {
+                if module.required {
+                    return Err(Error::MissingArtifact(module.tree_path.clone()));
+                }
                 warn!(
                     "module {} not produced by this config (built-in or disabled); skipping",
                     module.file
@@ -282,6 +289,7 @@ pub enum Error {
     UnsupportedTarget(String),
     UnexpectedLayout(PathBuf),
     MissingImage(PathBuf),
+    MissingArtifact(PathBuf),
     MenuconfigNeedsTty,
     Menuconfig(std::process::ExitStatus),
     Io(std::io::Error),
@@ -329,6 +337,13 @@ impl fmt::Display for Error {
                 "extracting the kernel tarball did not produce {}",
                 tree.display()
             ),
+            Error::MissingArtifact(path) => {
+                write!(
+                    f,
+                    "requested extra artifact {} was not produced by the build",
+                    path.display()
+                )
+            }
             Error::MissingImage(path) => {
                 write!(
                     f,

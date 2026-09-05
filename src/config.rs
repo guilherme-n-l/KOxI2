@@ -39,6 +39,12 @@ pub struct BuildConfig {
     /// Build target arch in kbuild vocabulary (default: x86_64).
     #[serde(default)]
     pub target: Option<String>,
+    /// Extra kernel-tree files to harvest into artifacts/ after the
+    /// build (paths relative to the tree root, e.g. vmlinux for
+    /// syzkaller symbolization). Unlike registry modules these are
+    /// explicit requests: a missing file fails the build.
+    #[serde(rename = "extra-artifacts", default)]
+    pub extra_artifacts: Vec<PathBuf>,
 }
 
 /// Everything block-specific: the driver registry (v1 `drivers.cfg`).
@@ -224,11 +230,13 @@ mod tests {
             [build]
             cc = "clang"
             target = "x86_64"
+            extra-artifacts = ["vmlinux", "System.map"]
             "#,
         )
         .unwrap();
         assert_eq!(config.build.cc.as_deref(), Some("clang"));
         assert_eq!(config.build.target.as_deref(), Some("x86_64"));
+        assert_eq!(config.build.extra_artifacts.len(), 2);
         assert_eq!(Config::parse("[sources]").unwrap().build.cc, None);
     }
 

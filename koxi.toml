@@ -10,9 +10,15 @@
 #
 # Toolchain declaration; --cc (or the CC env var) overrides cc for
 # one-off runs. target uses kbuild vocabulary (only x86_64 today).
+# extra-artifacts are kernel-tree-relative files harvested into
+# artifacts/ and sha-locked; vmlinux is what syzkaller kernel_obj
+# needs for coverage symbolization and crash decoding (the build
+# scratch is deleted, so anything later phases need must be
+# harvested).
 # [build]
 # cc = "clang"
 # target = "x86_64"
+# extra-artifacts = ["vmlinux", "System.map", ".config"]
 
 [sources.linux]
 version = "6.19"

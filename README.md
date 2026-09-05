@@ -42,10 +42,11 @@ adds the rust toolchain, LSPs, and git hooks.
   `assets/<name>` overrides them, and `[assets]` in `koxi.toml` can
   point elsewhere. `koxi assets dump` materializes defaults for
   editing.
-- **`artifacts/`** — per-project build outputs: `bzImage` plus
-  the registry drivers' kernel modules, each sha256-locked under the
-  lock's `[artifacts]` table (later: the initramfs). `koxi block
-  clean` removes them.
+- **`artifacts/`** — per-project build outputs: `bzImage` plus the
+  registry drivers' kernel modules and any `[build].extra-artifacts`
+  (e.g. `vmlinux` for syzkaller symbolization), each sha256-locked
+  under the lock's `[artifacts]` table. `koxi block clean` removes
+  them.
 - **`$KOXI_HOME`** (default `~/.koxi`) — shared across projects:
   `cache/` (tarballs, source trees, git mirrors; `--nocache` clears
   it), `tmp/` (mktemp-style build scratch, kept on failure for

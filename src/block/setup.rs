@@ -86,9 +86,10 @@ fn drive(ctx: &mut Ctx, opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
         .target
         .clone()
         .unwrap_or_else(|| "x86_64".to_owned());
-    // Harvest every registry driver's module; built-ins warn and are
-    // skipped inside the build.
-    let modules = ctx
+    // Harvest every registry driver's module (built-ins warn and are
+    // skipped) plus the explicitly requested [build].extra-artifacts
+    // (missing ones fail).
+    let mut modules: Vec<kernel::build::Module> = ctx
         .config
         .block
         .drivers
@@ -96,8 +97,23 @@ fn drive(ctx: &mut Ctx, opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
         .map(|driver| kernel::build::Module {
             file: driver.ko.clone(),
             tree_path: driver.ko_dir.join(&driver.ko),
+            required: false,
         })
         .collect();
+    for extra in &ctx.config.build.extra_artifacts {
+        let Some(file) = extra.file_name().and_then(|name| name.to_str()) else {
+            return Err(format!(
+                "[build].extra-artifacts entry {} has no file name",
+                extra.display()
+            )
+            .into());
+        };
+        modules.push(kernel::build::Module {
+            file: file.to_owned(),
+            tree_path: extra.clone(),
+            required: true,
+        });
+    }
     let image = kernel::build::build(
         ctx,
         &kernel::build::Options {
