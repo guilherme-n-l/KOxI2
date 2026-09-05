@@ -67,6 +67,7 @@
                 bison
                 perl
                 elfutils # libelf
+                openssl # certs, module signing host tools
                 pahole
                 ncurses # menuconfig
                 kmod # modpost, depmod
