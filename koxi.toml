@@ -1,0 +1,83 @@
+# KOxI harness configuration. Resolved state (exact revs, tarball
+# hashes) is recorded in koxi.lock by `koxi block setup`.
+
+[sources.linux]
+version = "6.19"
+url = "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.19.tar.xz"
+
+[sources.busybox]
+version = "1.36.1"
+url = "https://busybox.net/downloads/busybox-1.36.1.tar.bz2"
+
+[sources.dropbear]
+version = "2025.89"
+url = "https://matt.ucc.asn.au/dropbear/releases/dropbear-2025.89.tar.bz2"
+
+[sources.fio]
+version = "3.41"
+url = "https://git.kernel.org/pub/scm/linux/kernel/git/axboe/fio.git/snapshot/fio-3.41.tar.gz"
+
+# rev is required for git sources: a commit hash or tag, resolved to
+# an exact commit in koxi.lock.
+[sources.syzkaller]
+git = "https://github.com/google/syzkaller.git"
+rev = "4f7b22a0cea479ab522e99815d78a4ad5784b1da"
+
+[block.drivers.null_blk]
+role = "c"
+ko = "null_blk.ko"
+ko-dir = "drivers/block/null_blk/"
+device = "/dev/nullb0"
+gitpath = "drivers/block/null_blk/"
+insmod = "nr_devices=0"
+configfs = "nullb/nullb0"
+configfs-params = "power=1"
+
+[block.drivers.rnull]
+role = "rs"
+ko = "rnull_mod.ko"
+ko-dir = "drivers/block/rnull/"
+device = "/dev/rnullb0"
+gitpath = "drivers/block/rnull/"
+configfs = "rnull/rnullb0"
+configfs-params = "power=1"
+pair = "null_blk"
+
+[block.drivers.loop]
+role = "c"
+ko = "loop.ko"
+ko-dir = "drivers/block/"
+device = "/dev/loop0"
+gitpath = "drivers/block/loop.c"
+prep = "truncate -s 2G /tmp/loop0.img && losetup /dev/loop0 /tmp/loop0.img"
+
+[block.drivers.brd]
+role = "c"
+ko = "brd.ko"
+ko-dir = "drivers/block/"
+device = "/dev/ram0"
+gitpath = "drivers/block/brd.c"
+
+[block.drivers.zram]
+role = "c"
+ko = "zram.ko"
+ko-dir = "drivers/block/zram/"
+device = "/dev/zram0"
+gitpath = "drivers/block/zram/"
+insmod = "num_devices=1"
+prep = "echo 2G > /sys/block/zram0/disksize"
+
+[block.drivers.nbd]
+role = "c"
+ko = "nbd.ko"
+ko-dir = "drivers/block/"
+device = "/dev/nbd0"
+gitpath = "drivers/block/nbd.c"
+insmod = "nbds_max=1"
+
+[block.drivers.dm-zero]
+role = "c"
+ko = "dm-zero.ko"
+ko-dir = "drivers/md/"
+device = "/dev/mapper/zero"
+gitpath = "drivers/md/dm-zero.c"

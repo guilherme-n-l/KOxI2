@@ -1,4 +1,6 @@
 mod block;
+mod config;
+mod lock;
 
 use std::process::ExitCode;
 
