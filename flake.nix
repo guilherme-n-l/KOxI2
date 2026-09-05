@@ -70,7 +70,6 @@
                 pahole
                 ncurses # menuconfig
                 kmod # modpost, depmod
-                musl # musl-gcc for the static initramfs userland
                 util-linux # setsid
                 rust-bindgen # rnull (Rust-for-Linux) bindings
               ]
@@ -96,6 +95,14 @@
               jq
               git
             ]);
+
+          # musl must NOT be in any shell's packages: its lib dir would
+          # enter NIX_LDFLAGS and gcc then links glibc-hosted binaries
+          # against musl's libc.so, which segfault at startup. The
+          # busybox build reaches musl-gcc by absolute path instead.
+          muslEnv = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+            MUSL_GCC = "${pkgs.musl.dev}/bin/musl-gcc";
+          };
 
           # Dev-only helpers; never needed to build or run koxi.
           devPackages = with pkgs; [
@@ -160,7 +167,10 @@
 
               # rust-src: used by rust-analyzer and by the kernel's Rust
               # (rnull) build, which needs the standard library sources.
-              env.RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+              env = {
+                RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+              }
+              // muslEnv;
             };
 
             # Runtime environment for the harness itself: the koxi
@@ -170,6 +180,7 @@
             # no rust toolchain, no hooks.
             koxi = pkgs.mkShell {
               packages = extraPackages ++ [ koxi ];
+              env = muslEnv;
             };
           };
 
