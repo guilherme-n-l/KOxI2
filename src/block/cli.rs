@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use clap::builder::FalseyValueParser;
-use clap::{value_parser, Arg, ArgAction, Command};
+use clap::{value_parser, Arg, ArgAction, ArgMatches, Command};
 
 /// Boolean flag, available to every subcommand. The env var enables
 /// the flag unless empty or false-like ("0", "false", ...).
@@ -118,6 +118,7 @@ pub fn command() -> Command {
         .arg(flag("nologfile", "NOLOGFILE").help("Discard subprocess output"))
         .arg(flag("nocache", "NOCACHE").help("Clear download cache (out/) before running"))
         .arg(flag("skip-build", "SKIP_BUILD").help("Skip kernel build (initramfs still rebuilt)"))
+        .arg(flag("yes", "ASSUME_YES").help("Assume yes for interactive prompts"))
         // VM / benchmark
         .arg(
             opt("kernel", "KERNEL")
@@ -335,10 +336,156 @@ pub fn command() -> Command {
         )
 }
 
+/// Typed view of the parsed `koxi block` flags, built once per run so
+/// handlers never touch stringly `ArgMatches` lookups.
+#[derive(Debug, Clone)]
+pub struct Opts {
+    pub p1: bool,
+    pub only: Vec<String>,
+    pub output: PathBuf,
+    pub mnt: PathBuf,
+    pub campaign: Option<String>,
+    pub force_p1: bool,
+    pub force_build: bool,
+    pub menuconfig: bool,
+    pub quick: bool,
+    pub longrun: bool,
+    pub verbose: bool,
+    pub debug: bool,
+    pub logfile: PathBuf,
+    pub nologfile: bool,
+    pub nocache: bool,
+    pub skip_build: bool,
+    pub yes: bool,
+    pub kernel: PathBuf,
+    pub initrd: PathBuf,
+    pub port: u16,
+    pub smp: u32,
+    pub memory: String,
+    pub vm_timeout: u64,
+    pub fio_bs: Vec<String>,
+    pub fio_rw: Vec<String>,
+    pub fio_qd: Vec<u32>,
+    pub fio_sz: Vec<String>,
+    pub fio_reps: u32,
+    pub fio_runtime: u64,
+    pub fuzz_campaigns: u32,
+    pub fuzz_hours: f64,
+    pub fuzz_parallel: u32,
+    pub syz_cfg: Option<PathBuf>,
+    pub syz_desc: Vec<PathBuf>,
+    pub syz_root: Option<PathBuf>,
+    pub syz_manager: Option<PathBuf>,
+    pub syz_http_port: u16,
+    pub safety_threshold: f64,
+    pub perf_threshold: f64,
+    pub a12_large_threshold: f64,
+    pub alpha: f64,
+    pub bootstrap_resamples: u64,
+    pub validated_cwe: Option<PathBuf>,
+    pub validated_crashes: Option<PathBuf>,
+}
+
+impl Opts {
+    pub fn from_matches(matches: &ArgMatches) -> Self {
+        fn strings(matches: &ArgMatches, name: &str) -> Vec<String> {
+            matches
+                .get_many::<String>(name)
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect()
+        }
+        fn paths(matches: &ArgMatches, name: &str) -> Vec<PathBuf> {
+            matches
+                .get_many::<PathBuf>(name)
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect()
+        }
+        fn path(matches: &ArgMatches, name: &str) -> PathBuf {
+            matches
+                .get_one::<PathBuf>(name)
+                .cloned()
+                .expect("defaulted")
+        }
+        fn copied<T: Copy + Clone + Send + Sync + 'static>(matches: &ArgMatches, name: &str) -> T {
+            *matches.get_one::<T>(name).expect("defaulted")
+        }
+
+        Self {
+            p1: matches.get_flag("p1"),
+            only: strings(matches, "only"),
+            output: path(matches, "output"),
+            mnt: path(matches, "mnt"),
+            campaign: matches.get_one::<String>("campaign").cloned(),
+            force_p1: matches.get_flag("force-p1"),
+            force_build: matches.get_flag("force-build"),
+            menuconfig: matches.get_flag("menuconfig"),
+            quick: matches.get_flag("quick"),
+            longrun: matches.get_flag("longrun"),
+            verbose: matches.get_flag("verbose"),
+            debug: matches.get_flag("debug-output"),
+            logfile: path(matches, "logfile"),
+            nologfile: matches.get_flag("nologfile"),
+            nocache: matches.get_flag("nocache"),
+            skip_build: matches.get_flag("skip-build"),
+            yes: matches.get_flag("yes"),
+            kernel: path(matches, "kernel"),
+            initrd: path(matches, "initrd"),
+            port: copied(matches, "port"),
+            smp: copied(matches, "smp"),
+            memory: matches
+                .get_one::<String>("memory")
+                .cloned()
+                .expect("defaulted"),
+            vm_timeout: copied(matches, "vm-timeout"),
+            fio_bs: strings(matches, "fio-bs"),
+            fio_rw: strings(matches, "fio-rw"),
+            fio_qd: matches
+                .get_many::<u32>("fio-qd")
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect(),
+            fio_sz: strings(matches, "fio-sz"),
+            fio_reps: copied(matches, "fio-reps"),
+            fio_runtime: copied(matches, "fio-runtime"),
+            fuzz_campaigns: copied(matches, "fuzz-campaigns"),
+            fuzz_hours: copied(matches, "fuzz-hours"),
+            fuzz_parallel: copied(matches, "fuzz-parallel"),
+            syz_cfg: matches.get_one::<PathBuf>("syz-cfg").cloned(),
+            syz_desc: paths(matches, "syz-desc"),
+            syz_root: matches.get_one::<PathBuf>("syz-root").cloned(),
+            syz_manager: matches.get_one::<PathBuf>("syz-manager").cloned(),
+            syz_http_port: copied(matches, "syz-http-port"),
+            safety_threshold: copied(matches, "safety-threshold"),
+            perf_threshold: copied(matches, "perf-threshold"),
+            a12_large_threshold: copied(matches, "a12-large-threshold"),
+            alpha: copied(matches, "alpha"),
+            bootstrap_resamples: copied(matches, "bootstrap-resamples"),
+            validated_cwe: matches.get_one::<PathBuf>("validated-cwe").cloned(),
+            validated_crashes: matches.get_one::<PathBuf>("validated-crashes").cloned(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
     fn cli_is_well_formed() {
         super::command().debug_assert();
+    }
+
+    #[test]
+    fn opts_build_from_defaults() {
+        let matches = super::command().get_matches_from(["block", "setup"]);
+        let (_, sub) = matches.subcommand().unwrap();
+        let opts = super::Opts::from_matches(sub);
+        assert_eq!(opts.smp, 4);
+        assert_eq!(opts.fio_qd, vec![1, 32, 256]);
+        assert_eq!(opts.logfile, std::path::PathBuf::from("out/run.log"));
+        assert!(!opts.yes);
     }
 }
