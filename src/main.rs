@@ -1,3 +1,4 @@
+mod assets;
 mod block;
 mod config;
 mod fetch;
@@ -18,12 +19,14 @@ fn command() -> Command {
         .subcommand_required(true)
         .arg_required_else_help(true)
         .subcommand(block::cli::command())
+        .subcommand(assets::command())
 }
 
 fn main() -> ExitCode {
     let matches = command().get_matches();
     match matches.subcommand() {
         Some(("block", sub)) => block::run(sub),
+        Some(("assets", sub)) => assets::run(sub),
         _ => unreachable!("subcommand is required"),
     }
 }

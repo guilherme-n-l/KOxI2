@@ -16,6 +16,10 @@ pub const CONFIG_PATH: &str = "koxi.toml";
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub sources: BTreeMap<String, Source>,
+    /// Build-input overrides: asset name → file path, relative to the
+    /// project root. Undeclared assets use the embedded defaults.
+    #[serde(default)]
+    pub assets: BTreeMap<String, PathBuf>,
     /// Block-harness configuration (`[block]`).
     #[serde(default)]
     pub block: BlockConfig,

@@ -1,5 +1,12 @@
 # KOxI harness configuration. Resolved state (exact revs, tarball
 # hashes) is recorded in koxi.lock by `koxi block setup`.
+#
+# Build-input assets resolve in order: a path declared in [assets]
+# (relative to this file), then assets/<name> next to this file, then
+# the default embedded in the koxi binary. Materialize a default for
+# editing with `koxi assets dump <name>`.
+# [assets]
+# "linux/config" = "my-configs/kasan.config"
 
 [sources.linux]
 version = "6.19"

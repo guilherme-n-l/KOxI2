@@ -27,6 +27,11 @@ pub struct Lock {
     pub version: u32,
     #[serde(default)]
     pub sources: BTreeMap<String, LockedSource>,
+    /// sha256 of each build-input asset as last used, keyed by asset
+    /// name; build steps rebuild when the hash moves. Assets are
+    /// user-editable, so a moved hash is staleness, not an error.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub assets: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -59,6 +64,7 @@ impl Default for Lock {
         Self {
             version: LOCK_VERSION,
             sources: BTreeMap::new(),
+            assets: BTreeMap::new(),
         }
     }
 }
