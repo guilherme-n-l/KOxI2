@@ -45,6 +45,10 @@ pub const ASSETS: &[Asset] = &[
         name: "virt/udhcpc-script",
         contents: include_str!("../assets/virt/udhcpc-script"),
     },
+    Asset {
+        name: "virt/vm-driver-setup",
+        contents: include_str!("../assets/virt/vm-driver-setup"),
+    },
 ];
 
 fn embedded(name: &str) -> Option<&'static Asset> {

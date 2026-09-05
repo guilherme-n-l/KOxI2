@@ -44,17 +44,20 @@ dhcp)
 	;;
 esac
 
-if [ -s /mnt/driver_setup/spec ] && [ -x /mnt/scripts/vm_driver_setup ]; then
-	driver_spec="$(cat /mnt/driver_setup/spec)"
+# Driver setup from the per-run overlay initrd (a second cpio the
+# runner concatenates onto this base image, so the transport also
+# works on bare metal). Failure powers off before ssh comes up —
+# fail fast and visibly on the console.
+if [ -s /koxi/driver_setup/spec ]; then
+	driver_spec="$(cat /koxi/driver_setup/spec)"
 	driver_prep=""
-	[ -f /mnt/driver_setup/prep ] && driver_prep="$(cat /mnt/driver_setup/prep)"
+	[ -f /koxi/driver_setup/prep ] && driver_prep="$(cat /koxi/driver_setup/prep)"
 	echo "Running driver setup..."
-	if /mnt/scripts/vm_driver_setup "$driver_spec" "$driver_prep"; then
-		echo ok >/mnt/driver_setup/status
+	if /koxi/scripts/vm_driver_setup "$driver_spec" "$driver_prep"; then
+		echo ok >/koxi/driver_setup/status
 	else
-		echo failed >/mnt/driver_setup/status
 		echo "driver setup failed"
-		exit 1
+		poweroff -f
 	fi
 fi
 

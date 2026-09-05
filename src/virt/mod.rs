@@ -3,4 +3,5 @@
 
 pub mod build;
 pub mod initramfs;
+pub mod runner;
 pub mod setup;

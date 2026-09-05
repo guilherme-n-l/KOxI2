@@ -1,0 +1,43 @@
+#!/bin/sh
+# In-guest driver setup, run by /init from the per-run overlay initrd
+# (v1 block/scripts/vm_driver_setup, with modules relocated from the
+# 9p share to /koxi/modules).
+# Usage: vm_driver_setup <driver_spec> [prep]
+#   driver_spec = role:name:ko:device:insmod_params:configfs_dir:configfs_params
+#   prep = optional guest shell snippet run after module/configfs setup
+set -eu
+
+DRIVER_SPEC="${1:?Usage: $0 <driver_spec> [prep]}"
+DRIVER_PREP="${2:-}"
+
+IFS=: read -r _role DRIVER KO _device INSMOD_PARAMS CONFIGFS_DIR CONFIGFS_PARAMS <<EOF
+$DRIVER_SPEC
+EOF
+
+echo "Loading $DRIVER ($KO)..."
+if [ -n "$INSMOD_PARAMS" ]; then
+	# shellcheck disable=SC2086
+	insmod "/koxi/modules/$KO" $INSMOD_PARAMS
+else
+	insmod "/koxi/modules/$KO"
+fi
+
+if [ -n "$CONFIGFS_DIR" ]; then
+	mkdir -p "/sys/kernel/config/$CONFIGFS_DIR"
+	if [ -n "$CONFIGFS_PARAMS" ]; then
+		cfgdir="/sys/kernel/config/$CONFIGFS_DIR"
+		oldIFS="$IFS"
+		IFS=","
+		for param in $CONFIGFS_PARAMS; do
+			key="${param%%=*}"
+			val="${param#*=}"
+			echo "$val" >"${cfgdir}/${key}"
+		done
+		IFS="$oldIFS"
+	fi
+fi
+
+if [ -n "$DRIVER_PREP" ]; then
+	echo "Running prep for $DRIVER..."
+	eval "$DRIVER_PREP"
+fi

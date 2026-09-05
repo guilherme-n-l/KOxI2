@@ -9,8 +9,9 @@
 //! public-key only (no /etc/shadow, no hardcoded password hash), and
 //! everything static — passwd, host + client keys, authorized_keys —
 //! is baked at build time so /init stays minimal. Kernel modules
-//! deliberately stay OUT of the image — they ride the 9p rootmnt per
-//! run, keeping one generic image for every driver.
+//! deliberately stay OUT of the image — each run concatenates its
+//! own overlay initrd on top (see `virt::runner`), keeping one
+//! generic image for every driver.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
