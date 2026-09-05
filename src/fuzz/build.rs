@@ -108,6 +108,12 @@ pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
             .env("NIX_HARDENING_ENABLE", "")
             .arg("-j")
             .arg(jobs.to_string());
+        // Static libc for the executor's -static probe, scoped to
+        // this build only (globally it poisons host-tool links).
+        if let Ok(dir) = std::env::var("GLIBC_STATIC_LIB") {
+            let existing = std::env::var("NIX_LDFLAGS").unwrap_or_default();
+            make.env("NIX_LDFLAGS", format!("{existing} -L{dir}"));
+        }
         cmd::status(make, "make-syzkaller", logs)?;
 
         for rel in BINARIES {

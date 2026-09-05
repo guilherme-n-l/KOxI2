@@ -85,10 +85,6 @@
                 krustPkgs.rustc
                 krustPkgs.rust-bindgen
                 krustPkgs.rustfmt
-                # syzkaller probes gcc for -static and silently drops
-                # it without glibc.a — the executor must be static to
-                # run in the initramfs.
-                glibc.static
               ]
             )
             # Archive / download
@@ -123,6 +119,11 @@
           runtimeEnv = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
             MUSL_GCC = "${pkgs.musl.dev}/bin/musl-gcc";
             RUST_LIB_SRC = "${krustPkgs.rustPlatform.rustLibSrc}";
+            # Path only, deliberately NOT a shell package: static libc
+            # lib dirs on NIX_LDFLAGS half-staticize every host tool
+            # (fixdep died of a circular IFUNC this way). The syzkaller
+            # build scopes it so the executor's -static probe passes.
+            GLIBC_STATIC_LIB = "${pkgs.glibc.static}/lib";
           };
 
           # Dev-only helpers; never needed to build or run koxi.
