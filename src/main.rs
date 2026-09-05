@@ -8,6 +8,7 @@ mod fuzz;
 mod kernel;
 mod lock;
 mod logging;
+mod metal;
 mod nix;
 mod virt;
 
@@ -24,6 +25,7 @@ fn command() -> Command {
         .subcommand(block::cli::command())
         .subcommand(assets::command())
         .subcommand(clean::command())
+        .subcommand(metal::command())
         .subcommand(nix::command())
 }
 
@@ -33,6 +35,7 @@ fn main() -> ExitCode {
         Some(("block", sub)) => block::run(sub),
         Some(("assets", sub)) => assets::run(sub),
         Some(("clean", _)) => clean::run(),
+        Some(("metal", sub)) => metal::run(sub),
         Some(("nix", sub)) => nix::run(sub),
         _ => unreachable!("subcommand is required"),
     }

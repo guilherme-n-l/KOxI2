@@ -23,9 +23,30 @@ pub struct Config {
     /// Toolchain declaration (`[build]`).
     #[serde(default)]
     pub build: BuildConfig,
+    /// Bare-metal target for kexec boots (`[baremetal]`).
+    #[serde(default)]
+    pub baremetal: Option<BaremetalConfig>,
     /// Block-harness configuration (`[block]`).
     #[serde(default)]
     pub block: BlockConfig,
+}
+
+/// A kexec-capable bare-metal target (see `koxi metal`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct BaremetalConfig {
+    /// ssh destination of the resident OS (user@host).
+    pub host: String,
+    /// koxi.net= value for the test kernel (default: dhcp).
+    #[serde(default)]
+    pub net: Option<String>,
+    /// Where the test kernel's dropbear answers; defaults to the
+    /// host part of `host` (same MAC usually keeps the same lease).
+    #[serde(default)]
+    pub guest_addr: Option<String>,
+    /// Extra kernel cmdline appended after console/koxi.net.
+    #[serde(default)]
+    pub append: Option<String>,
 }
 
 /// Project-declared toolchain for builds. The --cc flag (or CC env)
@@ -220,6 +241,18 @@ mod tests {
             Some("null_blk")
         );
         assert!(config.sources.contains_key("linux"));
+    }
+
+    #[test]
+    fn baremetal_section_parses() {
+        let config = Config::parse(
+            "[sources]\n[baremetal]\nhost = \"guilh@laptop.local\"\nnet = \"dhcp\"\n",
+        )
+        .unwrap();
+        let baremetal = config.baremetal.unwrap();
+        assert_eq!(baremetal.host, "guilh@laptop.local");
+        assert_eq!(baremetal.net.as_deref(), Some("dhcp"));
+        assert!(Config::parse("[sources]").unwrap().baremetal.is_none());
     }
 
     #[test]

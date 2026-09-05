@@ -19,6 +19,12 @@
 # cc = "clang"
 # target = "x86_64"
 # extra-artifacts = ["vmlinux", "System.map", ".config"]
+#
+# Bare-metal target for kexec boots (`koxi metal boot` / `reset`).
+# The resident OS needs kexec-tools + passwordless sudo for kexec.
+# [baremetal]
+# host = "user@laptop.local"
+# net = "dhcp"
 
 [sources.linux]
 version = "6.19"
