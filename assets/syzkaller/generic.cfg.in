@@ -1,0 +1,25 @@
+{
+	"name": "@DRIVER_LABEL@-security-benchmark",
+	"syzkaller": "@SYZ_DIR@",
+	"target": "linux/amd64",
+	"kernel_obj": "@KTREE@",
+	"image": "@IMAGE@",
+	"http": "127.0.0.1:@HTTP_PORT@",
+	"workdir": "@WORKDIR@",
+	"type": "qemu",
+	"vm": {
+		"count": @VM_COUNT@,
+		"kernel": "@BZIMAGE@",
+		"initrd": "@INITRD@",
+		"cpu": 4,
+		"mem": 4096,
+		"qemu_args": "-enable-kvm -virtfs local,path=@ROOTMNT@,mount_tag=hostshare,security_model=mapped-xattr,id=hostshare"
+	},
+	"sshkey": "@SSH_KEY@",
+	"procs": 16,
+	"sandbox": "none",
+	"cover": true,
+	"reproduce": true,
+	"preserve_corpus": true,
+	"suppressions": []
+}
