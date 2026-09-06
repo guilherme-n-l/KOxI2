@@ -104,7 +104,13 @@ pub fn p1_dir(root: &Path, c_driver: &str, domain: &str, hash: &str) -> PathBuf 
     root.join("p1").join(c_driver).join(domain).join(hash)
 }
 
-pub fn p2_dir(root: &Path, c_driver: &str, rs_driver: &str, campaign: &str, domain: &str) -> PathBuf {
+pub fn p2_dir(
+    root: &Path,
+    c_driver: &str,
+    rs_driver: &str,
+    campaign: &str,
+    domain: &str,
+) -> PathBuf {
     root.join("p2")
         .join(format!("{c_driver}::{rs_driver}"))
         .join(campaign)
@@ -166,8 +172,7 @@ mod tests {
         Identity {
             domain: "perf".to_owned(),
             driver: "null_blk".to_owned(),
-            spec: "c:null_blk:null_blk.ko:/dev/nullb0:nr_devices=0:nullb/nullb0:power=1"
-                .to_owned(),
+            spec: "c:null_blk:null_blk.ko:/dev/nullb0:nr_devices=0:nullb/nullb0:power=1".to_owned(),
             prep: String::new(),
             host: "nixbox".to_owned(),
             accel: "tcg".to_owned(),
@@ -203,7 +208,11 @@ mod tests {
 
         let mut knobs = identity();
         knobs.fio.reps = 30;
-        assert_ne!(hash, identity_hash(&knobs).unwrap(), "fio knobs are identity");
+        assert_ne!(
+            hash,
+            identity_hash(&knobs).unwrap(),
+            "fio knobs are identity"
+        );
     }
 
     #[test]

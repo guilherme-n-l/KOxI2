@@ -25,6 +25,10 @@ koxi block setup   # fetch + verify all sources, build everything
 # boot the built kernel in qemu with a registry driver loaded and
 # run a command (or omit it for an interactive shell)
 koxi vm --driver rnull ls -l /dev/rnullb0
+
+# the fio benchmark matrix: C baseline (cached by content hash) then
+# the Rust pair under a named campaign; see results/*/manifest.toml
+koxi block perf --quick --campaign trial
 ```
 
 Real campaigns need an x86_64 Linux host (ideally with /dev/kvm).
@@ -61,6 +65,15 @@ adds the rust toolchain, LSPs, and git hooks.
   packs its driver module + setup spec into a small overlay cpio
   concatenated onto it (works for qemu and kexec alike), boots, and
   talks to the guest over its baked-key dropbear.
+- **`results/`** (the `--output` root) — measurement data, outside
+  the lock and the home. v1's p1/p2 skeleton: `p1/<c>/<domain>/<hash>/`
+  is a content-addressed baseline cache, `p2/<c>::<rs>/<campaign>/`
+  holds named runs. Every result root carries a `manifest.toml` whose
+  `[identity]` table is the hash input — locked artifact shas, the
+  host + accel tag (KVM and TCG numbers never pool), and the workload
+  knobs — so directories are self-describing, resumable at rep
+  granularity, and safe to rsync (baselines are referenced by hash,
+  not symlink).
 - **`$KOXI_HOME`** (default `~/.koxi`) — shared across projects:
   `cache/` (tarballs, source trees, git mirrors; `--nocache` clears
   it), `tmp/` (mktemp-style build scratch, kept on failure for

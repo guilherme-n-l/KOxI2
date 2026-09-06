@@ -226,6 +226,13 @@ pub fn command() -> Command {
                 .help_heading("Fio knobs")
                 .help("Seconds per fio run"),
         )
+        .arg(
+            opt("seed", "WORKLOAD_SEED")
+                .value_name("n")
+                .value_parser(value_parser!(u64))
+                .help_heading("Fio knobs")
+                .help("Deterministic workload shuffle seed (default: unix time)"),
+        )
         // Fuzzing
         .arg(
             opt("fuzz-campaigns", "FUZZ_CAMPAIGNS")
@@ -382,6 +389,7 @@ pub struct Opts {
     pub fio_sz: Vec<String>,
     pub fio_reps: u32,
     pub fio_runtime: u64,
+    pub seed: Option<u64>,
     pub fuzz_campaigns: u32,
     pub fuzz_hours: f64,
     pub fuzz_parallel: u32,
@@ -468,6 +476,7 @@ impl Opts {
             fio_sz: strings(matches, "fio-sz"),
             fio_reps: copied(matches, "fio-reps"),
             fio_runtime: copied(matches, "fio-runtime"),
+            seed: matches.get_one::<u64>("seed").copied(),
             fuzz_campaigns: copied(matches, "fuzz-campaigns"),
             fuzz_hours: copied(matches, "fuzz-hours"),
             fuzz_parallel: copied(matches, "fuzz-parallel"),

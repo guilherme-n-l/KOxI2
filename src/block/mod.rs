@@ -2,6 +2,8 @@
 
 pub mod cli;
 pub mod fio;
+pub mod perf;
+pub mod results;
 pub mod setup;
 pub mod test;
 
@@ -44,7 +46,7 @@ pub fn run(matches: &ArgMatches) -> ExitCode {
         "setup" => setup::setup(&opts, &logs),
         "test" => test::test(&opts, &logs),
         "clean" => clean(&opts),
-        "perf" => perf(&opts),
+        "perf" => perf::perf(&opts, &logs),
         "fuzz" => fuzz(&opts),
         "static" => static_analysis(&opts),
         "screen" => screen(&opts),
@@ -77,10 +79,6 @@ fn clean(_opts: &Opts) -> ExitCode {
         println!("nothing to clean ({} absent)", artifacts.display());
     }
     ExitCode::SUCCESS
-}
-
-fn perf(_opts: &Opts) -> ExitCode {
-    not_implemented("perf")
 }
 
 fn fuzz(_opts: &Opts) -> ExitCode {
