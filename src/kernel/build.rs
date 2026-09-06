@@ -180,14 +180,20 @@ pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
     );
 
     let harvested_missing = |file: &str| !outdir.join(file).is_file();
+    // A required file (extra-artifact) that the lock has never seen
+    // busts the cache too — it only exists inside the build scratch,
+    // so a fresh request needs a fresh build.
+    let module_missing = |module: &Module| {
+        let known = ctx.lock.artifacts.contains_key(&key(&module.file));
+        (known && harvested_missing(&module.file))
+            || (module.required && (!known || harvested_missing(&module.file)))
+    };
     if artifact.is_file()
         && !opts.force
         && !opts.menuconfig
         && ctx.lock.builds.get(&build_key) == Some(&expected)
         && !harvested_missing(EFFECTIVE_CONFIG)
-        && !opts.modules.iter().any(|module| {
-            ctx.lock.artifacts.contains_key(&key(&module.file)) && harvested_missing(&module.file)
-        })
+        && !opts.modules.iter().any(module_missing)
     {
         debug!(
             "{} kernel image cached at {}",

@@ -38,8 +38,8 @@ pub const ASSETS: &[Asset] = &[
         contents: include_str!("../assets/busybox/config"),
     },
     Asset {
-        name: "syzkaller/generic.cfg.in",
-        contents: include_str!("../assets/syzkaller/generic.cfg.in"),
+        name: "syzkaller/generic.cfg",
+        contents: include_str!("../assets/syzkaller/generic.cfg"),
     },
     Asset {
         name: "virt/init",

@@ -59,7 +59,10 @@ pub struct Identity {
     pub smp: u32,
     pub memory: String,
     pub artifacts: ArtifactShas,
-    pub fio: FioKnobs,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fio: Option<FioKnobs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuzz: Option<FuzzKnobs>,
 }
 
 /// The exact bits measured, straight from the built artifacts.
@@ -70,6 +73,12 @@ pub struct ArtifactShas {
     pub module: String,
     /// Effective kernel config (the lock's harvested `config`).
     pub kconfig: String,
+    /// syz-manager binary (fuzz domain only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub syzkaller: Option<String>,
+    /// Rendered syzkaller config template (fuzz domain only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub syz_template: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -80,6 +89,14 @@ pub struct FioKnobs {
     pub size: Vec<String>,
     pub reps: u32,
     pub runtime: u64,
+}
+
+/// v1 _domain_hash fuzz inputs: campaign count, duration, VM count.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FuzzKnobs {
+    pub campaigns: u32,
+    pub hours: f64,
+    pub parallel: u32,
 }
 
 /// Phase-2 campaign record; `baseline` is the p1 identity hash of
@@ -141,6 +158,48 @@ impl Manifest {
     }
 }
 
+/// Decide what to do with an existing campaign dir: resume when it
+/// is the same unfinished measurement, otherwise ask before wiping
+/// (v1 _ensure_clean_campaign). Returns false to skip this pair.
+pub fn clear_for_campaign(
+    dir: &Path,
+    manifest: &Manifest,
+    assume_yes: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    use std::io::IsTerminal;
+
+    if !dir.exists() {
+        return Ok(true);
+    }
+    match Manifest::load(dir)? {
+        Some(existing) if !existing.complete && existing.identity == manifest.identity => {
+            tracing::info!("resuming unfinished campaign at {}", dir.display());
+            return Ok(true);
+        }
+        _ => {}
+    }
+    let question = format!(
+        "campaign data exists at {}; delete and re-run?",
+        dir.display()
+    );
+    let wipe = if assume_yes {
+        true
+    } else if std::io::stdin().is_terminal() {
+        eprint!("{question} [y/N] ");
+        use std::io::Write;
+        std::io::stderr().flush().ok();
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        matches!(answer.trim(), "y" | "Y" | "yes")
+    } else {
+        return Err(format!("{question} (rerun with --yes or pick another --campaign)").into());
+    };
+    if wipe {
+        fs::remove_dir_all(dir)?;
+    }
+    Ok(wipe)
+}
+
 #[derive(Debug)]
 pub enum Error {
     Io(io::Error),
@@ -183,15 +242,18 @@ mod tests {
                 initrd: "i".repeat(64),
                 module: "m".repeat(64),
                 kconfig: "c".repeat(64),
+                syzkaller: None,
+                syz_template: None,
             },
-            fio: FioKnobs {
+            fio: Some(FioKnobs {
                 bs: vec!["4k".to_owned()],
                 rw: vec!["randread".to_owned()],
                 qd: vec![1],
                 size: vec!["512M".to_owned()],
                 reps: 3,
                 runtime: 5,
-            },
+            }),
+            fuzz: None,
         }
     }
 
@@ -207,7 +269,7 @@ mod tests {
         assert_ne!(hash, identity_hash(&kvm).unwrap(), "accel is identity");
 
         let mut knobs = identity();
-        knobs.fio.reps = 30;
+        knobs.fio.as_mut().unwrap().reps = 30;
         assert_ne!(
             hash,
             identity_hash(&knobs).unwrap(),

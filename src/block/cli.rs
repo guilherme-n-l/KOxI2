@@ -263,7 +263,7 @@ pub fn command() -> Command {
                 .value_name("path")
                 .value_parser(value_parser!(PathBuf))
                 .help_heading("Fuzzing")
-                .help("Syzkaller config template"),
+                .help("Base syz-manager config (JSON; machine-owned fields are overlaid)"),
         )
         .arg(
             opt("syz-desc", "SYZ_DESC")

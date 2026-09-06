@@ -87,9 +87,11 @@ fn drive(ctx: &mut Ctx, opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .unwrap_or_else(|| "x86_64".to_owned());
     // Harvest every registry driver's module (built-ins warn and are
-    // skipped) plus the explicitly requested [build].extra-artifacts
-    // (missing ones fail).
-    let mut modules: Vec<kernel::build::Module> = ctx
+    // skipped). The explicitly requested [build].extra-artifacts
+    // (missing ones fail) ride the fuzz flavor only — they exist for
+    // syzkaller symbolization, and a DWARF-laden vmlinux is dead
+    // weight next to the clean kernel.
+    let modules: Vec<kernel::build::Module> = ctx
         .config
         .block
         .drivers
@@ -100,6 +102,7 @@ fn drive(ctx: &mut Ctx, opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
             required: false,
         })
         .collect();
+    let mut fuzz_modules = modules.clone();
     for extra in &ctx.config.build.extra_artifacts {
         let Some(file) = extra.file_name().and_then(|name| name.to_str()) else {
             return Err(format!(
@@ -108,7 +111,7 @@ fn drive(ctx: &mut Ctx, opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
             )
             .into());
         };
-        modules.push(kernel::build::Module {
+        fuzz_modules.push(kernel::build::Module {
             file: file.to_owned(),
             tree_path: extra.clone(),
             required: true,
@@ -139,7 +142,7 @@ fn drive(ctx: &mut Ctx, opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
             skip_build: opts.skip_build,
             cc,
             target,
-            modules,
+            modules: fuzz_modules,
             flavor: kernel::build::Flavor::Fuzz,
         },
     )?;

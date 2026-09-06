@@ -144,6 +144,17 @@ pub fn accel() -> &'static str {
     }
 }
 
+/// Host identity for result manifests.
+pub fn hostname() -> String {
+    Command::new("hostname")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
 /// A launched qemu guest; killed on drop (the guest is stateless).
 pub struct Vm {
     child: Child,

@@ -2,6 +2,7 @@
 
 pub mod cli;
 pub mod fio;
+pub mod fuzz;
 pub mod perf;
 pub mod results;
 pub mod setup;
@@ -47,7 +48,7 @@ pub fn run(matches: &ArgMatches) -> ExitCode {
         "test" => test::test(&opts, &logs),
         "clean" => clean(&opts),
         "perf" => perf::perf(&opts, &logs),
-        "fuzz" => fuzz(&opts),
+        "fuzz" => fuzz::fuzz(&opts, &logs),
         "static" => static_analysis(&opts),
         "screen" => screen(&opts),
         "compare" => compare(&opts),
@@ -81,8 +82,29 @@ fn clean(_opts: &Opts) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn fuzz(_opts: &Opts) -> ExitCode {
-    not_implemented("fuzz")
+/// Every registered (rs, c) driver pair, filtered by --only on the
+/// C driver name (the Rust pair follows, v1-style).
+pub(crate) fn driver_pairs<'c>(
+    config: &'c crate::config::Config,
+    only: &[String],
+) -> Vec<(
+    &'c String,
+    &'c crate::config::Driver,
+    &'c String,
+    &'c crate::config::Driver,
+)> {
+    config
+        .block
+        .drivers
+        .iter()
+        .filter(|(_, driver)| driver.role == crate::config::Role::Rs)
+        .filter_map(|(rs_name, rs_driver)| {
+            let c_name = rs_driver.pair.as_ref()?;
+            let c_driver = config.block.drivers.get(c_name)?;
+            Some((rs_name, rs_driver, c_name, c_driver))
+        })
+        .filter(|(_, _, c_name, _)| only.is_empty() || only.contains(c_name))
+        .collect()
 }
 
 fn static_analysis(_opts: &Opts) -> ExitCode {

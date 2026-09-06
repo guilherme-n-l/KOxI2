@@ -8,7 +8,6 @@
 //! al., ASPLOS 2009).
 
 use std::fs;
-use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,7 +16,7 @@ use tracing::{error, info, warn};
 
 use crate::block::cli::Opts;
 use crate::block::results::{self, ArtifactShas, Campaign, FioKnobs, Identity, Manifest};
-use crate::config::{anchored, Driver, Project, Role};
+use crate::config::{anchored, Driver, Project};
 use crate::fetch;
 use crate::kernel::build::ARTIFACTS_DIR;
 use crate::lock::{Lock, LOCK_PATH};
@@ -59,7 +58,7 @@ fn drive(opts: &Opts, logs: &Path) -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("effective kernel config not locked — run `koxi block setup` first")?;
 
     let results_root = anchored(&project.root, &opts.output);
-    let host = hostname();
+    let host = runner::hostname();
     let accel = runner::accel();
     if accel == "tcg" {
         warn!("no KVM on this host — TCG numbers are smoke-only, never thesis data");
@@ -99,25 +98,15 @@ fn drive(opts: &Opts, logs: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 initrd: initrd_sha.clone(),
                 module: fetch::sha256(&artifacts.join(&driver.ko), logs)?,
                 kconfig: kconfig_sha.clone(),
+                syzkaller: None,
+                syz_template: None,
             },
-            fio: fio.clone(),
+            fio: Some(fio.clone()),
+            fuzz: None,
         })
     };
 
-    // Every registered pair, filtered by --only on the C driver name.
-    let pairs: Vec<(&String, &Driver, &String, &Driver)> = project
-        .config
-        .block
-        .drivers
-        .iter()
-        .filter(|(_, driver)| driver.role == Role::Rs)
-        .filter_map(|(rs_name, rs_driver)| {
-            let c_name = rs_driver.pair.as_ref()?;
-            let c_driver = project.config.block.drivers.get(c_name)?;
-            Some((rs_name, rs_driver, c_name, c_driver))
-        })
-        .filter(|(_, _, c_name, _)| opts.only.is_empty() || opts.only.contains(c_name))
-        .collect();
+    let pairs = super::driver_pairs(&project.config, &opts.only);
     if pairs.is_empty() {
         return Err("no matching driver pairs in the [block.drivers] registry".into());
     }
@@ -171,7 +160,7 @@ fn drive(opts: &Opts, logs: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 baseline: c_hash,
             }),
         };
-        if !clear_for_campaign(&p2_dir, &manifest, opts.yes)? {
+        if !results::clear_for_campaign(&p2_dir, &manifest, opts.yes)? {
             info!("p2 perf skipped for {c_name}::{rs_name}");
             continue;
         }
@@ -179,46 +168,6 @@ fn drive(opts: &Opts, logs: &Path) -> Result<(), Box<dyn std::error::Error>> {
         run_matrix(&ctx, rs_name, rs_driver, &p2_dir, manifest)?;
     }
     Ok(())
-}
-
-/// Decide what to do with an existing campaign dir: resume when it
-/// is the same unfinished measurement, otherwise ask before wiping
-/// (v1 _ensure_clean_campaign). Returns false to skip this pair.
-fn clear_for_campaign(
-    dir: &Path,
-    manifest: &Manifest,
-    assume_yes: bool,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    if !dir.exists() {
-        return Ok(true);
-    }
-    match Manifest::load(dir)? {
-        Some(existing) if !existing.complete && existing.identity == manifest.identity => {
-            info!("resuming unfinished campaign at {}", dir.display());
-            return Ok(true);
-        }
-        _ => {}
-    }
-    let question = format!(
-        "campaign data exists at {}; delete and re-run?",
-        dir.display()
-    );
-    let wipe = if assume_yes {
-        true
-    } else if std::io::stdin().is_terminal() {
-        eprint!("{question} [y/N] ");
-        use std::io::Write;
-        std::io::stderr().flush().ok();
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        matches!(answer.trim(), "y" | "Y" | "yes")
-    } else {
-        return Err(format!("{question} (rerun with --yes or pick another --campaign)").into());
-    };
-    if wipe {
-        fs::remove_dir_all(dir)?;
-    }
-    Ok(wipe)
 }
 
 struct MatrixCtx<'a> {
@@ -250,10 +199,15 @@ fn run_matrix(
         }
     };
     let seed = manifest.seed;
-    let reps = manifest.identity.fio.reps;
-    let runtime = manifest.identity.fio.runtime;
+    let fio = manifest
+        .identity
+        .fio
+        .clone()
+        .ok_or("perf manifest lacks its [identity.fio] table")?;
+    let reps = fio.reps;
+    let runtime = fio.runtime;
 
-    let order = shuffled(matrix(&manifest.identity.fio), seed);
+    let order = shuffled(matrix(&fio), seed);
     info!("workload seed: {seed} ({} workloads)", order.len());
 
     let rep_path = |workload: &Workload, rep: u32| {
@@ -458,16 +412,6 @@ fn annotate(
         }),
     );
     serde_json::to_string_pretty(&value).map_err(|err| err.to_string())
-}
-
-fn hostname() -> String {
-    std::process::Command::new("hostname")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 #[cfg(test)]
