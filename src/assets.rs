@@ -114,7 +114,9 @@ pub fn load_locked(
     })
 }
 
-fn sha256_text(text: &str) -> Result<String, Error> {
+/// sha256 of a string via the host sha256sum (same tool the rest of
+/// the pipeline trusts for artifact hashing).
+pub fn sha256_text(text: &str) -> Result<String, Error> {
     let mut child = Process::new("sha256sum")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
