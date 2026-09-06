@@ -1,0 +1,8 @@
+{
+  // Oracle generators exist to call scipy; scipy's bundled stubs
+  // type mannwhitneyu/wilcoxon results as a private "_" class with
+  // no visible attributes, so attribute checks against them are
+  // pure noise here. Standard mode otherwise.
+  "typeCheckingMode": "standard",
+  "reportAttributeAccessIssue": "none"
+}

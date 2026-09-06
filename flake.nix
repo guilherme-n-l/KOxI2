@@ -157,6 +157,46 @@
             };
           };
 
+          # Oracle fixture generation for src/stats.rs: lint the
+          # generator scripts, then regenerate the golden JSONs from
+          # THIS flake's nixpkgs, so the pinned scipy/R versions come
+          # from flake.lock and never from a machine channel. The
+          # closure (python+scipy, R+pROC, linters) is realized only
+          # when the app runs — deliberately not part of any dev
+          # shell. Usage: nix run .#gen-stats-fixtures
+          gen-stats-fixtures = pkgs.writeShellApplication {
+            name = "gen-stats-fixtures";
+            runtimeInputs = [
+              pkgs.ruff
+              pkgs.basedpyright
+              pkgs.git
+              (pkgs.python3.withPackages (p: [
+                p.scipy
+                p.numpy
+              ]))
+              (pkgs.rWrapper.override {
+                packages = with pkgs.rPackages; [
+                  pROC
+                  jsonlite
+                  lintr
+                ];
+              })
+            ];
+            text = ''
+              cd "$(git rev-parse --show-toplevel)"
+              ruff format tests/oracle/gen_stats_scipy.py
+              ruff check tests/oracle/gen_stats_scipy.py
+              basedpyright --pythonpath "$(command -v python3)" --project tests/oracle \
+                tests/oracle/gen_stats_scipy.py
+              Rscript -e 'lints <- lintr::lint("tests/oracle/gen_stats_r.R")
+                          print(lints)
+                          quit(status = as.integer(length(lints) > 0))'
+              python3 tests/oracle/gen_stats_scipy.py > tests/fixtures/stats_scipy.json
+              Rscript tests/oracle/gen_stats_r.R > tests/fixtures/stats_r.json
+              echo "stats fixtures regenerated under the flake-locked interpreters" >&2
+            '';
+          };
+
           koxi = pkgs.rustPlatform.buildRustPackage {
             pname = "koxi";
             version = "0.1.0";
@@ -171,7 +211,7 @@
         in
         {
           packages = {
-            inherit koxi;
+            inherit koxi gen-stats-fixtures;
             default = koxi;
           };
 
