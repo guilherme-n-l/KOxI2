@@ -570,9 +570,19 @@
    0.0,
    0.0
   ],
-  "two_sided_asymptotic": {
-   "u1": 50.0,
-   "p": null
+  "asymptotic": {
+   "two-sided": {
+    "u1": 50.0,
+    "p": null
+   },
+   "greater": {
+    "u1": 50.0,
+    "p": 1.0
+   },
+   "less": {
+    "u1": 50.0,
+    "p": 1.0
+   }
   }
  },
  "a12": [

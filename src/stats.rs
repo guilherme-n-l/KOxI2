@@ -122,7 +122,9 @@ pub fn mann_whitney(
 }
 
 /// Tie-corrected variance, 0.5 continuity correction toward each
-/// tail; NaN on zero variance (scipy behavior on all-tied input).
+/// tail. All-tied input leaves zero variance: scipy 1.18's signed
+/// correction makes the two-sided z 0/0 (NaN) while the one-sided
+/// tails evaluate the SF at an infinity (1.0).
 fn asymptotic_p(
     u1: f64,
     n1: f64,
@@ -134,7 +136,10 @@ fn asymptotic_p(
     let mean = n1 * n2 / 2.0;
     let variance = (n1 * n2 / 12.0) * ((total + 1.0) - tie_term / (total * (total - 1.0)));
     if variance <= 0.0 {
-        return Ok(f64::NAN);
+        return Ok(match alternative {
+            Alternative::TwoSided => f64::NAN,
+            _ => 1.0,
+        });
     }
     let sigma = variance.sqrt();
     let normal = Normal::new(0.0, 1.0).expect("standard normal");
@@ -415,19 +420,30 @@ mod tests {
     }
 
     #[test]
-    fn all_tied_input_yields_nan_like_scipy() {
+    fn all_tied_input_matches_scipy_per_alternative() {
         let fixture = fixture();
         let case = &fixture["mwu_all_tied"];
         let x = floats(&case["x"]);
         let y = floats(&case["y"]);
-        let result = mann_whitney(&x, &y, Alternative::TwoSided, Method::Asymptotic).unwrap();
-        assert_eq!(
-            result.u1,
-            case["two_sided_asymptotic"]["u1"].as_f64().unwrap()
-        );
-        assert!(result.p.is_nan(), "scipy returns NaN on all-tied input");
-        // NaN never counts as significant: p < alpha is false for NaN.
-        assert_eq!(result.p.partial_cmp(&ALPHA), None);
+        for (alt_name, alternative) in [
+            ("two-sided", Alternative::TwoSided),
+            ("greater", Alternative::Greater),
+            ("less", Alternative::Less),
+        ] {
+            let expected = &case["asymptotic"][alt_name];
+            let result = mann_whitney(&x, &y, alternative, Method::Asymptotic).unwrap();
+            assert_eq!(result.u1, expected["u1"].as_f64().unwrap());
+            match expected["p"].as_f64() {
+                // scipy's signed continuity correction: two-sided is
+                // 0/0 (fixture null = NaN), one-sided tails hit an
+                // infinity and give 1.0.
+                None => {
+                    assert!(result.p.is_nan(), "{alt_name}: scipy returns NaN");
+                    assert_eq!(result.p.partial_cmp(&ALPHA), None);
+                }
+                Some(expected) => assert_close(result.p, expected, alt_name),
+            }
+        }
     }
 
     #[test]
