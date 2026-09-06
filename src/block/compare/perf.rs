@@ -1,11 +1,16 @@
-//! The performance gate (v1 `compare/perf_compare`): per-workload
-//! Mann-Whitney U + Vargha-Delaney A12 + percentile bootstrap CI on
-//! the median IOPS delta, Holm-Bonferroni across workloads, and the
-//! do-no-harm criterion — every workload's CI lower bound must stay
-//! above -threshold%. Output mirrors v1's perf_stats.json/perf.csv
-//! shapes so downstream artifact tooling keeps working; the bootstrap
-//! is seeded from the campaign manifest, making the gate verdict
-//! reproducible (v1's was not).
+//! The performance gate. The gated quantity is equivalence-grade:
+//! per workload, a TOST non-inferiority test on the Hodges-Lehmann
+//! log-IOPS ratio — the (1 - 2*alpha) order-statistic CI lower bound
+//! must clear the margin ratio — combined across workloads as an
+//! intersection-union test (Berger: "all cells pass at level alpha"
+//! controls FWER at alpha with no multiplicity correction). The v1
+//! machinery (Mann-Whitney U + Holm-Bonferroni, percentile bootstrap
+//! CI on the median IOPS delta, A12 — now with a DeLong CI) is kept
+//! as descriptive evidence, plus a global Wilcoxon signed-rank over
+//! per-workload log-median IOPS. Output extends v1's
+//! perf_stats.json/perf.csv shapes so downstream artifact tooling
+//! keeps working; the bootstrap is seeded from the campaign
+//! manifest, making the verdict reproducible (v1's was not).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -69,6 +74,9 @@ pub fn compare_perf(
     let mut iops_indices = Vec::new();
     let mut all_deltas = Vec::new();
     let mut ci_lower_bounds = Vec::new();
+    let mut tost_passes = Vec::new();
+    let mut c_medians = Vec::new();
+    let mut rs_medians = Vec::new();
     let mut insufficient = 0usize;
 
     for (index, name) in common.iter().enumerate() {
@@ -93,7 +101,8 @@ pub fn compare_perf(
         ] {
             let c_values: Vec<f64> = c_bundle.runs.iter().map(extract).collect();
             let rs_values: Vec<f64> = rs_bundle.runs.iter().map(extract).collect();
-            let Some(comparison) = compare_metric(&c_values, &rs_values, alpha, resamples, seed)?
+            let Some(mut comparison) =
+                compare_metric(&c_values, &rs_values, alpha, resamples, seed)?
             else {
                 continue;
             };
@@ -103,6 +112,11 @@ pub fn compare_perf(
                 iops_indices.push(index);
                 all_deltas.push(comparison["delta_pct"].as_f64().unwrap_or(0.0));
                 ci_lower_bounds.push(comparison["ci_95"]["lo"].as_f64().unwrap_or(0.0));
+                let equivalence = equivalence_entry(&c_values, &rs_values, alpha, threshold);
+                tost_passes.push(equivalence["pass"].as_bool() == Some(true));
+                comparison["equivalence"] = equivalence;
+                c_medians.push(stats::descriptive(&c_values)?.median);
+                rs_medians.push(stats::descriptive(&rs_values)?.median);
             }
             entry[metric] = comparison;
         }
@@ -112,7 +126,8 @@ pub fn compare_perf(
         workload_results.push(entry);
     }
 
-    // Holm-Bonferroni across the IOPS p-values (v1 semantics).
+    // Holm-Bonferroni across the IOPS p-values (v1 semantics, kept
+    // as descriptive evidence — the gate is the IUT below).
     let (adjusted, significant) = stats::holm_bonferroni(&iops_p_values, alpha);
     for entry in workload_results.iter_mut() {
         entry["p_value_adjusted"] = serde_json::Value::Null;
@@ -174,12 +189,29 @@ pub fn compare_perf(
         "measured"
     };
 
+    // The gate: intersection-union over the per-workload TOSTs. A
+    // cell that never produced comparable evidence (missing on one
+    // side, too few samples) is an untested cell — the IUT cannot
+    // claim equivalence for it, so the gate fails.
+    let tost_passed = tost_passes.iter().filter(|&&pass| pass).count();
+    let tost_gate = !tost_passes.is_empty()
+        && tost_passed == tost_passes.len()
+        && insufficient == 0
+        && missing_on_one_side == 0;
+    let conf_level = 1.0 - 2.0 * alpha;
+    let margin_ratio = 1.0 - threshold / 100.0;
+    let global_descriptive = signed_rank_global(&c_medians, &rs_medians);
+
     let result = json!({
-        "methodology": "Independent-sample Mann-Whitney U per workload + bootstrap 95% CI \
-                        for median delta + Holm-Bonferroni correction across workloads",
+        "methodology": "Per-workload TOST non-inferiority on the Hodges-Lehmann log-IOPS \
+                        ratio, combined as an intersection-union test across workloads; \
+                        Mann-Whitney U + Holm-Bonferroni, bootstrap median-delta CI, A12 \
+                        with DeLong CI, and a global Wilcoxon signed-rank retained as \
+                        descriptive evidence",
         "threshold_pct": threshold,
         "thresholds": {
             "alpha": alpha,
+            "tost_conf_level": conf_level,
             "bootstrap_resamples": resamples,
             "bootstrap_seed": seed,
         },
@@ -198,25 +230,38 @@ pub fn compare_perf(
             },
         },
         "workloads": workload_results,
+        "global_descriptive": global_descriptive,
         "aggregate": {
             "median_delta_pct": median_delta,
             "worst_case_delta_pct": worst_delta,
             "workloads_significantly_slower": format!("{slower}/{}", common.len()),
             "workloads_significantly_faster": format!("{faster}/{}", common.len()),
+            "workloads_passing_tost": format!("{tost_passed}/{}", common.len()),
+            "tost_gate": tost_gate,
             "bootstrap_ci_gate": ci_gate,
         },
         "verdict": {
-            "pass": ci_gate,
+            "pass": tost_gate,
             "criterion": format!(
-                "all workload bootstrap CI lower bounds on median delta exceed -{threshold}%"
+                "intersection-union TOST: every workload's {:.0}% Hodges-Lehmann CI lower \
+                 bound on the IOPS ratio (rs/c) exceeds {margin_ratio} (margin {threshold}%); \
+                 FWER <= alpha={alpha} with no multiplicity correction (Berger IUT)",
+                conf_level * 100.0,
             ),
             "threshold": threshold,
             "actual_median_delta_pct": median_delta,
             "detail": format!(
-                "{} workloads, median delta {median_delta}%, worst case {worst_delta}%, {} \
-                 workload CIs remain within threshold",
+                "{} workloads, {tost_passed} pass TOST, median delta {median_delta}%, worst \
+                 case {worst_delta}%{}",
                 common.len(),
-                if ci_gate { "all" } else { "not all" }
+                if insufficient > 0 || missing_on_one_side > 0 {
+                    format!(
+                        ", {insufficient} with insufficient samples, {missing_on_one_side} \
+                         missing on one side"
+                    )
+                } else {
+                    String::new()
+                },
             ),
         },
     });
@@ -227,8 +272,10 @@ pub fn compare_perf(
     write_csv(&c_workloads, &rs_workloads, outdir)?;
 
     info!(
-        "perf gate: median_delta={median_delta}% worst={worst_delta}% threshold={threshold}% -> {}",
-        if ci_gate { "PASS" } else { "FAIL" }
+        "perf gate: tost {tost_passed}/{} median_delta={median_delta}% worst={worst_delta}% \
+         margin={threshold}% -> {}",
+        common.len(),
+        if tost_gate { "PASS" } else { "FAIL" }
     );
     let _ = c_stats.declared_workloads + rs_stats.declared_workloads;
     Ok(())
@@ -260,7 +307,7 @@ fn compare_metric(
         stats::Alternative::TwoSided,
         stats::Method::Auto,
     )?;
-    let a12 = stats::vargha_delaney_a12(rs_values, c_values);
+    let a12 = stats::a12_delong_ci(rs_values, c_values, 1.0 - alpha)?;
 
     Ok(Some(json!({
         "c": describe(&c_desc),
@@ -275,8 +322,14 @@ fn compare_metric(
         },
         "effect_size": {
             "name": "Vargha-Delaney A12",
-            "value": round(a12, 4),
-            "label": stats::a12_label(a12),
+            "value": round(a12.a12, 4),
+            "label": stats::a12_label(a12.a12),
+            "ci": {
+                "lo": round(a12.lo, 4),
+                "hi": round(a12.hi, 4),
+                "level": 1.0 - alpha,
+                "method": "DeLong",
+            },
         },
         "ci_95": {
             "lo": round(ci_lo, 2),
@@ -286,6 +339,82 @@ fn compare_metric(
             ),
         },
     })))
+}
+
+/// One TOST non-inferiority cell: the (1 - 2*alpha) Hodges-Lehmann
+/// CI on the log-IOPS shift, exponentiated back to a rs/c ratio;
+/// pass means the CI lower bound clears the margin ratio
+/// 1 - threshold/100. Sparse cells get infinite order-statistic
+/// bounds (ratio lower bound 0), so missing evidence fails the gate
+/// on its own.
+fn equivalence_entry(
+    c_values: &[f64],
+    rs_values: &[f64],
+    alpha: f64,
+    threshold: f64,
+) -> serde_json::Value {
+    let conf_level = 1.0 - 2.0 * alpha;
+    let margin_ratio = 1.0 - threshold / 100.0;
+    if c_values.iter().chain(rs_values).any(|&value| value <= 0.0) {
+        return json!({
+            "pass": false,
+            "reason": "non-positive IOPS values; log ratio undefined",
+        });
+    }
+    let rs_log: Vec<f64> = rs_values.iter().map(|value| value.ln()).collect();
+    let c_log: Vec<f64> = c_values.iter().map(|value| value.ln()).collect();
+    let hl = match stats::hodges_lehmann_ci(&rs_log, &c_log, conf_level) {
+        Ok(hl) => hl,
+        Err(err) => return json!({"pass": false, "reason": err.to_string()}),
+    };
+    let (ratio, lo, hi) = (hl.estimate.exp(), hl.lo.exp(), hl.hi.exp());
+    json!({
+        "name": "TOST non-inferiority on Hodges-Lehmann IOPS ratio",
+        "conf_level": conf_level,
+        "margin_ratio": round(margin_ratio, 4),
+        "hl_ratio": round(ratio, 4),
+        "hl_delta_pct": round((ratio - 1.0) * 100.0, 2),
+        // Infinite upper bounds serialize as null (unbounded).
+        "ci_ratio": {"lo": round(lo, 4), "hi": round(hi, 4)},
+        "ci_delta_pct": {
+            "lo": round((lo - 1.0) * 100.0, 2),
+            "hi": round((hi - 1.0) * 100.0, 2),
+        },
+        "pass": lo >= margin_ratio,
+    })
+}
+
+/// Descriptive global check: two-sided Wilcoxon signed-rank over the
+/// paired per-workload log-median IOPS. Not part of the gate — the
+/// IUT is the criterion; this summarizes whether the grid as a whole
+/// shifts one way.
+fn signed_rank_global(c_medians: &[f64], rs_medians: &[f64]) -> serde_json::Value {
+    let test_name = "Wilcoxon signed-rank on per-workload log-median IOPS";
+    if c_medians.is_empty()
+        || c_medians
+            .iter()
+            .chain(rs_medians)
+            .any(|&value| value <= 0.0)
+    {
+        return serde_json::Value::Null;
+    }
+    let rs_log: Vec<f64> = rs_medians.iter().map(|value| value.ln()).collect();
+    let c_log: Vec<f64> = c_medians.iter().map(|value| value.ln()).collect();
+    match stats::wilcoxon_signed_rank(
+        &rs_log,
+        &c_log,
+        stats::Alternative::TwoSided,
+        stats::Method::Auto,
+    ) {
+        Ok(result) => json!({
+            "test": test_name,
+            "n_workloads": c_medians.len(),
+            "statistic": result.statistic,
+            "p_value": round(result.p, 6),
+            "method": result.method,
+        }),
+        Err(err) => json!({"test": test_name, "error": err.to_string()}),
+    }
 }
 
 fn describe(desc: &stats::Descriptive) -> serde_json::Value {
@@ -484,7 +613,62 @@ mod tests {
         assert_eq!(value["test"]["name"], "Mann-Whitney U");
         assert!(value["test"]["significant"].as_bool().unwrap());
         assert_eq!(value["effect_size"]["label"], "large");
+        // Perfect separation collapses the DeLong interval onto A12.
+        assert_eq!(value["effect_size"]["ci"]["lo"], 0.0);
+        assert_eq!(value["effect_size"]["ci"]["hi"], 0.0);
+        assert_eq!(value["effect_size"]["ci"]["level"], 0.95);
         assert!(value["ci_95"]["lo"].as_f64().unwrap() <= value["ci_95"]["hi"].as_f64().unwrap());
         assert!(compare_metric(&[1.0], &rs, 0.05, 10, 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn equivalence_gates_on_the_ratio_ci_lower_bound() {
+        let c = [
+            100.0, 102.0, 98.0, 101.0, 99.0, 100.5, 97.5, 103.0, 100.2, 99.8,
+        ];
+
+        // Clear ~14% regression: the ratio CI lower bound sits far
+        // below the 5% margin.
+        let rs = [85.0, 88.0, 84.0, 86.0, 87.0, 85.5, 83.5, 88.5, 86.2, 85.8];
+        let entry = equivalence_entry(&c, &rs, 0.05, 5.0);
+        assert_eq!(entry["pass"], false);
+        assert_eq!(entry["conf_level"], 0.90);
+        assert_eq!(entry["margin_ratio"], 0.95);
+        assert!(entry["ci_ratio"]["lo"].as_f64().unwrap() < 0.95);
+
+        // A 0.1% shift is well inside the margin: equivalence holds.
+        let rs_flat: Vec<f64> = c.iter().map(|value| value * 0.999).collect();
+        let entry = equivalence_entry(&c, &rs_flat, 0.05, 5.0);
+        assert_eq!(entry["pass"], true);
+        assert!(entry["ci_ratio"]["lo"].as_f64().unwrap() >= 0.95);
+
+        // Two reps per side cannot reach 90% coverage: the
+        // order-statistic bounds go infinite and the cell fails.
+        let entry = equivalence_entry(&[100.0, 101.0], &[100.0, 101.0], 0.05, 5.0);
+        assert_eq!(entry["pass"], false);
+        assert_eq!(entry["ci_ratio"]["lo"], 0.0);
+
+        // Non-positive values are refused, not log'd.
+        let entry = equivalence_entry(&[0.0, 1.0], &[1.0, 2.0], 0.05, 5.0);
+        assert_eq!(entry["pass"], false);
+        assert!(entry["reason"].as_str().unwrap().contains("non-positive"));
+    }
+
+    #[test]
+    fn signed_rank_global_summarizes_direction() {
+        let c = [100.0, 105.0, 98.0, 102.0, 110.0, 95.0];
+        let rs: Vec<f64> = c.iter().map(|value| value * 0.9).collect();
+        let value = signed_rank_global(&c, &rs);
+        assert_eq!(value["n_workloads"], 6);
+        assert!(value["p_value"].as_f64().unwrap() < 0.05);
+
+        assert_eq!(signed_rank_global(&[], &[]), serde_json::Value::Null);
+
+        // Identical medians leave no non-zero differences: reported
+        // as an error field, never a panic.
+        let equal = [1.0, 2.0];
+        assert!(signed_rank_global(&equal, &equal)["error"]
+            .as_str()
+            .is_some());
     }
 }

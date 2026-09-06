@@ -3,15 +3,19 @@
 //! The surface is deliberately small and closed: Mann-Whitney U with
 //! scipy's `method="auto"` semantics (exact distribution for small
 //! untied samples, tie-corrected continuity-corrected normal
-//! approximation otherwise), Vargha-Delaney A12 with v1's effect
-//! labels, numpy-style descriptives, the scipy-percentile bootstrap
-//! CI for the independent-sample median delta, and v1's
-//! Holm-Bonferroni. Every deterministic procedure is validated
-//! against scipy/numpy golden fixtures
-//! (tests/fixtures/stats_scipy.json, regenerable under the pinned
-//! nixpkgs python) so `cargo test` re-checks parity on every run;
-//! the seeded bootstrap is checked for method properties instead,
-//! since RNG streams cannot match across implementations.
+//! approximation otherwise), the Hodges-Lehmann shift estimate with
+//! the Moses order-statistic CI (R `wilcox.test conf.int` exact
+//! branch), Wilcoxon signed-rank with scipy's auto semantics,
+//! Vargha-Delaney A12 with v1's effect labels and the DeLong CI
+//! (pROC `ci.auc` parity), numpy-style descriptives, the
+//! scipy-percentile bootstrap CI for the independent-sample median
+//! delta, and v1's Holm-Bonferroni. Every deterministic procedure is
+//! validated against golden fixtures (tests/fixtures/stats_scipy.json
+//! from scipy/numpy, tests/fixtures/stats_r.json from R wilcox.test +
+//! pROC, both regenerable under the pinned nixpkgs interpreters) so
+//! `cargo test` re-checks parity on every run; the seeded bootstrap
+//! is checked for method properties instead, since RNG streams cannot
+//! match across implementations.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -197,6 +201,337 @@ fn exact_p(u1: f64, m: usize, n: usize, alternative: Alternative) -> f64 {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct HodgesLehmann {
+    /// Median of the m*n pairwise differences x_i - y_j.
+    pub estimate: f64,
+    pub lo: f64,
+    pub hi: f64,
+}
+
+/// Hodges-Lehmann shift estimate for x - y with the Moses
+/// order-statistic confidence interval, matching R
+/// `wilcox.test(x, y, conf.int=TRUE, exact=TRUE)`
+/// (.wilcox_test_two_cint_exact, two-sided): both CI endpoints are
+/// order statistics of the pairwise differences, picked by the
+/// qwilcox(alpha/2) critical rank with R's boundary bump; when even
+/// the widest interval cannot reach the requested level the bounds
+/// are infinite, exactly as R reports. The critical rank comes from
+/// the untied null U distribution (R refuses exact CIs on tied data
+/// and inverts a normal approximation instead; the order-statistic
+/// construction is kept here — ties are measure-zero on continuous
+/// metrics). Past 5000 pairwise products the rank falls back to the
+/// normal approximation of U.
+pub fn hodges_lehmann_ci(x: &[f64], y: &[f64], conf_level: f64) -> Result<HodgesLehmann, Error> {
+    if x.is_empty() || y.is_empty() {
+        return Err(Error::EmptySample);
+    }
+    let mut diffs: Vec<f64> = x
+        .iter()
+        .flat_map(|&xi| y.iter().map(move |&yj| xi - yj))
+        .collect();
+    diffs.sort_by(|a, b| a.total_cmp(b));
+    let estimate = percentile(&diffs, 50.0);
+
+    let target = (1.0 - conf_level) / 2.0;
+    let (mut qu, cdf_at_qu) = qwilcox(target, x.len(), y.len());
+    if cdf_at_qu <= target + 10.0 * f64::EPSILON {
+        qu += 1;
+    }
+    if qu == 0 {
+        return Ok(HodgesLehmann {
+            estimate,
+            lo: f64::NEG_INFINITY,
+            hi: f64::INFINITY,
+        });
+    }
+    let ql = x.len() * y.len() - qu;
+    Ok(HodgesLehmann {
+        estimate,
+        lo: diffs[qu - 1],
+        hi: diffs[ql],
+    })
+}
+
+/// R qwilcox: smallest k with P(U <= k) >= p under the exact null,
+/// returned with the cdf at that k (for the boundary bump above).
+fn qwilcox(p: f64, m: usize, n: usize) -> (usize, f64) {
+    let products = m * n;
+    if products <= 5000 {
+        let mut memo = HashMap::new();
+        let counts = exact_counts(m, n, &mut memo);
+        let total: f64 = counts.iter().sum();
+        let mut acc = 0.0;
+        for (k, count) in counts.iter().enumerate() {
+            acc += count;
+            if acc / total >= p {
+                return (k, acc / total);
+            }
+        }
+        (products, 1.0)
+    } else {
+        let normal = Normal::new(0.0, 1.0).expect("standard normal");
+        let mu = products as f64 / 2.0;
+        let sigma = (products as f64 * (m + n + 1) as f64 / 12.0).sqrt();
+        let k = (mu - 0.5 + sigma * normal.inverse_cdf(p)).ceil().max(0.0) as usize;
+        (k, normal.cdf((k as f64 + 0.5 - mu) / sigma))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SignedRank {
+    /// scipy's convention: min(T+, T-) two-sided, T+ one-sided.
+    pub statistic: f64,
+    pub p: f64,
+    pub method: &'static str,
+}
+
+/// scipy.stats.wilcoxon parity under scipy's defaults
+/// (zero_method="wilcox": zero differences dropped;
+/// correction=False), validated by golden fixtures. `Method::Auto`
+/// follows scipy 1.18's resolution over the pre-drop length: above
+/// 50 pairs the normal approximation; untied zero-free samples the
+/// exact null; otherwise the sign-flip permutation, deterministic
+/// while 2^n fits scipy's 9999-resample budget (n <= 13). Beyond
+/// that scipy draws random permutations — we use the normal
+/// approximation there, the one branch where auto parity is
+/// statistical rather than exact.
+pub fn wilcoxon_signed_rank(
+    x: &[f64],
+    y: &[f64],
+    alternative: Alternative,
+    method: Method,
+) -> Result<SignedRank, Error> {
+    if x.len() != y.len() {
+        return Err(Error::UnpairedSamples);
+    }
+    if x.is_empty() {
+        return Err(Error::EmptySample);
+    }
+    let full_len = x.len();
+    let diffs: Vec<f64> = x
+        .iter()
+        .zip(y)
+        .map(|(a, b)| a - b)
+        .filter(|d| *d != 0.0)
+        .collect();
+    if diffs.is_empty() {
+        return Err(Error::AllZeroDifferences);
+    }
+    let zeros = full_len - diffs.len();
+    let n = diffs.len();
+
+    // Midranks of |d| and the tie term sum(t^3 - t).
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| diffs[a].abs().total_cmp(&diffs[b].abs()));
+    let mut ranks = vec![0.0; n];
+    let mut tie_term = 0.0;
+    let mut ties = false;
+    let mut index = 0;
+    while index < n {
+        let mut end = index;
+        while end + 1 < n && diffs[order[end + 1]].abs() == diffs[order[index]].abs() {
+            end += 1;
+        }
+        let count = (end - index + 1) as f64;
+        if end > index {
+            ties = true;
+            tie_term += count * count * count - count;
+        }
+        let rank = ((index + 1) + (end + 1)) as f64 / 2.0;
+        for &original in &order[index..=end] {
+            ranks[original] = rank;
+        }
+        index = end + 1;
+    }
+    let r_plus: f64 = diffs
+        .iter()
+        .zip(&ranks)
+        .filter(|(d, _)| **d > 0.0)
+        .map(|(_, rank)| rank)
+        .sum();
+    let r_minus = n as f64 * (n as f64 + 1.0) / 2.0 - r_plus;
+
+    enum Resolved {
+        Exact,
+        Approx,
+        Permutation,
+    }
+    let resolved = match method {
+        Method::Exact => Resolved::Exact,
+        Method::Asymptotic => Resolved::Approx,
+        Method::Auto => {
+            if full_len > 50 {
+                Resolved::Approx
+            } else if !ties && zeros == 0 {
+                Resolved::Exact
+            } else if full_len <= 13 {
+                Resolved::Permutation
+            } else {
+                Resolved::Approx
+            }
+        }
+    };
+
+    let (p, method_name) = match resolved {
+        Resolved::Exact => {
+            // Midranks can make T+ non-integral against the untied
+            // null; scipy rounds conservatively (gh-19872): less
+            // takes cdf(ceil), greater the inclusive sf(floor).
+            let counts = signed_rank_counts(n);
+            let total = counts.iter().sum::<f64>();
+            let cdf = |k: f64| -> f64 {
+                if k < 0.0 {
+                    return 0.0;
+                }
+                let k = (k as usize).min(counts.len() - 1);
+                counts[..=k].iter().sum::<f64>() / total
+            };
+            let p_less = cdf(r_plus.ceil());
+            let p_greater = 1.0 - cdf(r_plus.floor() - 1.0);
+            let p = match alternative {
+                Alternative::Less => p_less,
+                Alternative::Greater => p_greater,
+                Alternative::TwoSided => (2.0 * p_less.min(p_greater)).min(1.0),
+            };
+            (p, "exact")
+        }
+        Resolved::Approx => {
+            let count = n as f64;
+            let mean = count * (count + 1.0) / 4.0;
+            let sigma =
+                ((count * (count + 1.0) * (2.0 * count + 1.0) - tie_term / 2.0) / 24.0).sqrt();
+            let z = (r_plus - mean) / sigma;
+            let normal = Normal::new(0.0, 1.0).expect("standard normal");
+            let p = match alternative {
+                Alternative::Greater => 1.0 - normal.cdf(z),
+                Alternative::Less => normal.cdf(z),
+                Alternative::TwoSided => 2.0 * (1.0 - normal.cdf(z.abs())),
+            };
+            (p, "approx")
+        }
+        Resolved::Permutation => {
+            // Doubled ranks are exact integers, so the enumeration
+            // over the 2^n sign assignments needs no tolerance.
+            // Flipping a dropped zero never changes the statistic,
+            // so enumerating the non-zero part matches scipy's
+            // enumeration over the full vector.
+            let ranks2: Vec<u64> = ranks
+                .iter()
+                .map(|rank| (rank * 2.0).round() as u64)
+                .collect();
+            let observed2 = (r_plus * 2.0).round() as u64;
+            let total = 1u64 << n;
+            let mut greater_eq = 0u64;
+            let mut less_eq = 0u64;
+            for mask in 0..total {
+                let mut t2 = 0u64;
+                for (bit, rank2) in ranks2.iter().enumerate() {
+                    if mask >> bit & 1 == 1 {
+                        t2 += rank2;
+                    }
+                }
+                if t2 >= observed2 {
+                    greater_eq += 1;
+                }
+                if t2 <= observed2 {
+                    less_eq += 1;
+                }
+            }
+            let p_greater = greater_eq as f64 / total as f64;
+            let p_less = less_eq as f64 / total as f64;
+            let p = match alternative {
+                Alternative::Greater => p_greater,
+                Alternative::Less => p_less,
+                Alternative::TwoSided => (2.0 * p_less.min(p_greater)).min(1.0),
+            };
+            (p, "permutation")
+        }
+    };
+
+    Ok(SignedRank {
+        statistic: match alternative {
+            Alternative::TwoSided => r_plus.min(r_minus),
+            _ => r_plus,
+        },
+        p,
+        method: method_name,
+    })
+}
+
+/// Counts of subsets of {1..n} by rank sum (the exact null of T+).
+fn signed_rank_counts(n: usize) -> Vec<f64> {
+    let max = n * (n + 1) / 2;
+    let mut counts = vec![0.0; max + 1];
+    counts[0] = 1.0;
+    for rank in 1..=n {
+        for sum in (rank..=max).rev() {
+            counts[sum] += counts[sum - rank];
+        }
+    }
+    counts
+}
+
+#[derive(Debug, Clone)]
+pub struct A12Interval {
+    pub a12: f64,
+    pub lo: f64,
+    pub hi: f64,
+}
+
+/// DeLong CI for A12 (the AUC of x against y), matching pROC
+/// `ci.auc(..., method="delong")`: Wald interval on the placement
+/// variance, clipped to [0, 1]. Degenerate data (perfect separation,
+/// all tied) collapses the interval to the point. A singleton side
+/// contributes zero placement variance (pROC propagates NA there;
+/// callers with real samples never hit it).
+pub fn a12_delong_ci(x: &[f64], y: &[f64], conf_level: f64) -> Result<A12Interval, Error> {
+    if x.is_empty() || y.is_empty() {
+        return Err(Error::EmptySample);
+    }
+    let m = x.len() as f64;
+    let n = y.len() as f64;
+    let mut x_placements = vec![0.0; x.len()];
+    let mut y_placements = vec![0.0; y.len()];
+    for (i, &xi) in x.iter().enumerate() {
+        for (j, &yj) in y.iter().enumerate() {
+            let score = if xi > yj {
+                1.0
+            } else if xi == yj {
+                0.5
+            } else {
+                0.0
+            };
+            x_placements[i] += score;
+            y_placements[j] += score;
+        }
+    }
+    for placement in x_placements.iter_mut() {
+        *placement /= n;
+    }
+    for placement in y_placements.iter_mut() {
+        *placement /= m;
+    }
+    let a12 = x_placements.iter().sum::<f64>() / m;
+    let variance = sample_variance(&x_placements) / m + sample_variance(&y_placements) / n;
+    let normal = Normal::new(0.0, 1.0).expect("standard normal");
+    let half = normal.inverse_cdf(1.0 - (1.0 - conf_level) / 2.0) * variance.sqrt();
+    Ok(A12Interval {
+        a12,
+        lo: (a12 - half).max(0.0),
+        hi: (a12 + half).min(1.0),
+    })
+}
+
+/// ddof=1 variance; 0 below two values.
+fn sample_variance(values: &[f64]) -> f64 {
+    if values.len() < 2 {
+        return 0.0;
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (values.len() as f64 - 1.0)
+}
+
 /// Vargha-Delaney A12: P(X > Y) + 0.5 P(X = Y) by direct counting
 /// (v1 stats_common; 0.5 on an empty side).
 pub fn vargha_delaney_a12(x: &[f64], y: &[f64]) -> f64 {
@@ -349,12 +684,18 @@ pub fn bootstrap_median_delta_ci(
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     EmptySample,
+    UnpairedSamples,
+    AllZeroDifferences,
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::EmptySample => write!(f, "statistics need non-empty samples"),
+            Error::UnpairedSamples => write!(f, "paired statistics need equal-length samples"),
+            Error::AllZeroDifferences => {
+                write!(f, "signed-rank is undefined when every difference is zero")
+            }
         }
     }
 }
@@ -444,6 +785,127 @@ mod tests {
                 Some(expected) => assert_close(result.p, expected, alt_name),
             }
         }
+    }
+
+    fn r_fixture() -> serde_json::Value {
+        serde_json::from_str(include_str!("../tests/fixtures/stats_r.json"))
+            .expect("R fixture parses")
+    }
+
+    /// jsonlite writes R's infinities as strings.
+    fn r_f64(value: &serde_json::Value) -> f64 {
+        match value.as_str() {
+            Some("Inf") => f64::INFINITY,
+            Some("-Inf") => f64::NEG_INFINITY,
+            Some(other) => panic!("unexpected fixture string {other:?}"),
+            None => value.as_f64().unwrap(),
+        }
+    }
+
+    fn assert_close_or_inf(actual: f64, expected: f64, context: &str) {
+        if expected.is_infinite() {
+            assert_eq!(actual, expected, "{context}");
+        } else {
+            assert_close(actual, expected, context);
+        }
+    }
+
+    #[test]
+    fn hodges_lehmann_matches_r_wilcox_test() {
+        let fixture = r_fixture();
+        for case in fixture["hodges_lehmann"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let x = floats(&case["x"]);
+            let y = floats(&case["y"]);
+            for (level_name, conf_level) in [("0.90", 0.90), ("0.95", 0.95)] {
+                let expected = &case["levels"][level_name];
+                let context = format!("{name} @ {level_name}");
+                let hl = hodges_lehmann_ci(&x, &y, conf_level).unwrap();
+                assert_close(hl.estimate, r_f64(&expected["estimate"]), &context);
+                assert_close_or_inf(hl.lo, r_f64(&expected["lo"]), &context);
+                assert_close_or_inf(hl.hi, r_f64(&expected["hi"]), &context);
+            }
+        }
+        assert!(hodges_lehmann_ci(&[], &[1.0], 0.90).is_err());
+
+        // 1v1: one pairwise difference can never reach 90% coverage;
+        // R reports infinite bounds around the point estimate.
+        let hl = hodges_lehmann_ci(&[3.0], &[1.0], 0.90).unwrap();
+        assert_eq!(hl.estimate, 2.0);
+        assert_eq!((hl.lo, hl.hi), (f64::NEG_INFINITY, f64::INFINITY));
+    }
+
+    #[test]
+    fn signed_rank_matches_scipy_fixtures() {
+        let fixture = fixture();
+        for case in fixture["wilcoxon_signed_rank"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let x = floats(&case["x"]);
+            let y = floats(&case["y"]);
+            for (alt_name, alternative) in [
+                ("two-sided", Alternative::TwoSided),
+                ("greater", Alternative::Greater),
+                ("less", Alternative::Less),
+            ] {
+                for (method_name, method) in [
+                    ("auto", Method::Auto),
+                    ("exact", Method::Exact),
+                    ("approx", Method::Asymptotic),
+                ] {
+                    let expected = &case["alternatives"][alt_name][method_name];
+                    let context = format!("{name} / {alt_name} / {method_name}");
+                    let result = wilcoxon_signed_rank(&x, &y, alternative, method);
+                    if expected.get("error").is_some() {
+                        assert!(result.is_err(), "{context}: scipy errored, we did not");
+                        continue;
+                    }
+                    let result = result.unwrap_or_else(|err| panic!("{context}: {err}"));
+                    assert_close(result.statistic, expected["w"].as_f64().unwrap(), &context);
+                    assert_close(result.p, expected["p"].as_f64().unwrap(), &context);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn signed_rank_rejects_degenerate_input() {
+        assert_eq!(
+            wilcoxon_signed_rank(&[1.0], &[1.0, 2.0], Alternative::TwoSided, Method::Auto),
+            Err(Error::UnpairedSamples)
+        );
+        assert_eq!(
+            wilcoxon_signed_rank(&[], &[], Alternative::TwoSided, Method::Auto),
+            Err(Error::EmptySample)
+        );
+        assert_eq!(
+            wilcoxon_signed_rank(
+                &[1.0, 2.0],
+                &[1.0, 2.0],
+                Alternative::TwoSided,
+                Method::Auto
+            ),
+            Err(Error::AllZeroDifferences)
+        );
+    }
+
+    #[test]
+    fn delong_ci_matches_proc_fixtures() {
+        let fixture = r_fixture();
+        for case in fixture["delong_auc"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let x = floats(&case["x"]);
+            let y = floats(&case["y"]);
+            let interval = a12_delong_ci(&x, &y, 0.95).unwrap();
+            assert_close(interval.a12, case["auc"].as_f64().unwrap(), name);
+            assert_close(interval.lo, case["lo"].as_f64().unwrap(), name);
+            assert_close(interval.hi, case["hi"].as_f64().unwrap(), name);
+            // The point estimate is the same quantity A12 counts.
+            assert_close(interval.a12, vargha_delaney_a12(&x, &y), name);
+        }
+        // All-tied data: zero placement variance collapses the CI.
+        let interval = a12_delong_ci(&[2.0, 2.0], &[2.0, 2.0], 0.95).unwrap();
+        assert_eq!((interval.a12, interval.lo, interval.hi), (0.5, 0.5, 0.5));
+        assert!(a12_delong_ci(&[], &[1.0], 0.95).is_err());
     }
 
     #[test]
