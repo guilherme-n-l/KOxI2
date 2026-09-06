@@ -6,6 +6,7 @@
 //! refuses to pool results whose identities disagree on host/accel.
 //! Gate outputs land in `<campaign>/compare/` in v1's JSON shapes.
 
+pub mod fuzz;
 pub mod perf;
 
 use std::path::Path;
@@ -66,12 +67,27 @@ fn drive(opts: &Opts, _logs: &Path) -> Result<(), Box<dyn std::error::Error>> {
             None => info!("perf comparison: missing perf data; skipping"),
         }
 
-        // The fuzz and safety comparators land with their phases'
-        // analysis ports; compare currently gates on perf only.
-        for pending in ["fuzz", "static"] {
-            if campaign_root.join(pending).is_dir() {
-                info!("{pending} comparison not ported yet; skipping");
+        // Fuzzing gate.
+        match load_domain(&results_root, &campaign_root, c_name, "fuzz")? {
+            Some((p2_dir, p1_dir, manifest)) => {
+                info!("compare fuzz: {} vs {}", p1_dir.display(), p2_dir.display());
+                fuzz::compare_fuzz(
+                    &p1_dir,
+                    &p2_dir,
+                    &manifest,
+                    opts,
+                    &compare_dir,
+                    c_name,
+                    rs_name,
+                )?;
+                compared += 1;
             }
+            None => info!("fuzz comparison: missing fuzz data; skipping"),
+        }
+
+        // The safety comparator lands with the static analysis port.
+        if campaign_root.join("static").is_dir() {
+            info!("static comparison not ported yet; skipping");
         }
     }
     if compared == 0 {

@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use statrs::distribution::{ContinuousCDF, Normal};
+use statrs::distribution::{Beta, ContinuousCDF, Gamma, Normal};
 
 pub const ALPHA: f64 = 0.05;
 pub const A12_SMALL: f64 = 0.56;
@@ -608,6 +608,90 @@ fn percentile(sorted: &[f64], q: f64) -> f64 {
     sorted[low] + (sorted[high] - sorted[low]) * (position - low as f64)
 }
 
+/// Exact binomial upper tail P(X >= k) for X ~ Bin(n, p), matching
+/// scipy binomtest(alternative="greater").
+pub fn binomial_sf(k: u64, n: u64, p: f64) -> f64 {
+    if k == 0 {
+        return 1.0;
+    }
+    if k > n {
+        return 0.0;
+    }
+    // P(X >= k) = I_p(k, n - k + 1), the regularized incomplete beta.
+    Beta::new(k as f64, (n - k + 1) as f64)
+        .expect("valid beta parameters")
+        .cdf(p)
+}
+
+/// Clopper-Pearson (exact) two-sided binomial CI, matching scipy
+/// binomtest().proportion_ci(method="exact"). The one-sided
+/// 1 - alpha bound is the corresponding side of the 1 - 2*alpha
+/// interval.
+pub fn clopper_pearson(k: u64, n: u64, conf_level: f64) -> (f64, f64) {
+    let tail = (1.0 - conf_level) / 2.0;
+    let lo = if k == 0 {
+        0.0
+    } else {
+        Beta::new(k as f64, (n - k + 1) as f64)
+            .expect("valid beta parameters")
+            .inverse_cdf(tail)
+    };
+    let hi = if k >= n {
+        1.0
+    } else {
+        Beta::new((k + 1) as f64, (n - k) as f64)
+            .expect("valid beta parameters")
+            .inverse_cdf(1.0 - tail)
+    };
+    (lo, hi)
+}
+
+/// Exact Poisson upper confidence bound on the mean given an
+/// observed count (gamma quantile; k = 0 at 95% is the rule of
+/// three, 2.9957). Divide by the exposure for a rate bound.
+pub fn poisson_upper(k: u64, level: f64) -> f64 {
+    Gamma::new((k + 1) as f64, 1.0)
+        .expect("valid gamma parameters")
+        .inverse_cdf(level)
+}
+
+/// Analytic minimum detectable effect for the exact conditional
+/// rate-ratio test. Conditional on `total` events split between the
+/// rs side (exposure `t_rs`) and the c side (`t_c`), the rs count is
+/// Bin(total, p(rho)) with p(rho) = rho*t_rs / (rho*t_rs + t_c).
+/// Returns the smallest true ratio rho >= 1 the one-sided level-alpha
+/// test rejects with probability >= `power` — None when the test can
+/// never reject at this total (too few events).
+pub fn binomial_mde_ratio(total: u64, t_c: f64, t_rs: f64, alpha: f64, power: f64) -> Option<f64> {
+    if total == 0 || t_c <= 0.0 || t_rs <= 0.0 {
+        return None;
+    }
+    let p_of = |rho: f64| rho * t_rs / (rho * t_rs + t_c);
+    let p0 = p_of(1.0);
+    let critical = (0..=total).find(|&k| binomial_sf(k, total, p0) <= alpha)?;
+    let achieves = |rho: f64| binomial_sf(critical, total, p_of(rho)) >= power;
+    let mut hi = 1.0f64;
+    loop {
+        if achieves(hi) {
+            break;
+        }
+        hi *= 2.0;
+        if hi > 1e9 {
+            return None;
+        }
+    }
+    let mut lo = 1.0f64;
+    for _ in 0..200 {
+        let mid = (lo + hi) / 2.0;
+        if achieves(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    Some(hi)
+}
+
 /// v1 perf_compare's Holm-Bonferroni, ported verbatim: step-down
 /// adjusted p-values with a running max, and the significance chain
 /// that stops at the first failure. NaN p-values sort last and are
@@ -938,6 +1022,58 @@ mod tests {
             assert_close(desc.p75, case["p75"].as_f64().unwrap(), context);
         }
         assert!(descriptive(&[]).is_err());
+    }
+
+    #[test]
+    fn count_statistics_match_scipy_fixtures() {
+        let fixture = fixture();
+        let counts = &fixture["counts"];
+        for case in counts["binom_sf"].as_array().unwrap() {
+            let (k, n) = (case["k"].as_u64().unwrap(), case["n"].as_u64().unwrap());
+            let p = case["p"].as_f64().unwrap();
+            let context = format!("binom_sf k={k} n={n} p={p}");
+            assert_close(binomial_sf(k, n, p), case["sf"].as_f64().unwrap(), &context);
+        }
+        for case in counts["clopper_pearson"].as_array().unwrap() {
+            let (k, n) = (case["k"].as_u64().unwrap(), case["n"].as_u64().unwrap());
+            let level = case["level"].as_f64().unwrap();
+            let context = format!("clopper_pearson k={k} n={n} level={level}");
+            let (lo, hi) = clopper_pearson(k, n, level);
+            assert_close(lo, case["lo"].as_f64().unwrap(), &context);
+            assert_close(hi, case["hi"].as_f64().unwrap(), &context);
+        }
+        for case in counts["poisson_upper"].as_array().unwrap() {
+            let k = case["k"].as_u64().unwrap();
+            let level = case["level"].as_f64().unwrap();
+            let context = format!("poisson_upper k={k} level={level}");
+            assert_close(
+                poisson_upper(k, level),
+                case["upper"].as_f64().unwrap(),
+                &context,
+            );
+        }
+    }
+
+    #[test]
+    fn mde_ratio_is_analytic_and_monotone() {
+        // Too few events: the one-sided exact test can never reject.
+        assert_eq!(binomial_mde_ratio(0, 10.0, 10.0, 0.05, 0.8), None);
+        assert_eq!(binomial_mde_ratio(2, 10.0, 10.0, 0.05, 0.8), None);
+
+        // With enough events an MDE exists, shrinks as events grow,
+        // and self-verifies: power at the MDE clears 0.8, power just
+        // below it does not.
+        let mde_20 = binomial_mde_ratio(20, 10.0, 10.0, 0.05, 0.8).unwrap();
+        let mde_80 = binomial_mde_ratio(80, 10.0, 10.0, 0.05, 0.8).unwrap();
+        assert!(mde_20 > mde_80 && mde_80 > 1.0, "{mde_20} vs {mde_80}");
+        // Same arithmetic as the implementation — the bisection stops
+        // at the boundary, where an ulp of difference flips the tail.
+        let p_of = |rho: f64| rho * 10.0 / (rho * 10.0 + 10.0);
+        let critical = (0..=20)
+            .find(|&k| binomial_sf(k, 20, p_of(1.0)) <= 0.05)
+            .unwrap();
+        assert!(binomial_sf(critical, 20, p_of(mde_20)) >= 0.8);
+        assert!(binomial_sf(critical, 20, p_of(mde_20 * 0.98)) < 0.8);
     }
 
     #[test]

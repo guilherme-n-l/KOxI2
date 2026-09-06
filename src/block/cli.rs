@@ -320,6 +320,14 @@ pub fn command() -> Command {
                 .help("Max allowed overhead %"),
         )
         .arg(
+            opt("fuzz-rate-margin", "FUZZ_RATE_MARGIN")
+                .value_name("x")
+                .value_parser(value_parser!(f64))
+                .default_value("2")
+                .help_heading("Compare")
+                .help("Non-inferiority margin on the rs/c attributable crash rate ratio"),
+        )
+        .arg(
             opt("a12-large-threshold", "A12_LARGE_THRESHOLD")
                 .value_name("x")
                 .value_parser(value_parser!(f64))
@@ -408,6 +416,7 @@ pub struct Opts {
     pub syz_http_port: u16,
     pub safety_threshold: f64,
     pub perf_threshold: f64,
+    pub fuzz_rate_margin: f64,
     pub a12_large_threshold: f64,
     pub alpha: f64,
     pub bootstrap_resamples: u64,
@@ -499,6 +508,7 @@ impl Opts {
             syz_http_port: copied(matches, "syz-http-port"),
             safety_threshold: copied(matches, "safety-threshold"),
             perf_threshold: copied(matches, "perf-threshold"),
+            fuzz_rate_margin: copied(matches, "fuzz-rate-margin"),
             a12_large_threshold: copied(matches, "a12-large-threshold"),
             alpha: copied(matches, "alpha"),
             bootstrap_resamples: copied(matches, "bootstrap-resamples"),
