@@ -12,6 +12,7 @@
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::thread;
@@ -19,7 +20,9 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
+use crate::assets;
 use crate::cmd;
+use crate::config::{Driver, Project, Role};
 
 /// Launch parameters; `port` forwards to the guest's dropbear.
 pub struct Options {
@@ -51,6 +54,94 @@ pub fn overlay_initrd(base: &Path, staging: &Path, out: &Path, logs: &Path) -> R
         io::copy(&mut fs::File::open(part)?, &mut dest)?;
     }
     Ok(())
+}
+
+/// Stage the per-run `/koxi` overlay tree: the driver module (from
+/// the requested flavor's artifact dir), the vm-driver-setup asset,
+/// and the generated spec/prep contract.
+pub fn stage_overlay(
+    staging: &Path,
+    name: &str,
+    driver: &Driver,
+    module_dir: &Path,
+    project: &Project,
+) -> Result<(), Error> {
+    let ko = module_dir.join(&driver.ko);
+    if !ko.is_file() {
+        return Err(Error::MissingInput(ko));
+    }
+    for dir in ["koxi/modules", "koxi/scripts", "koxi/driver_setup"] {
+        fs::create_dir_all(staging.join(dir))?;
+    }
+    fs::copy(&ko, staging.join("koxi/modules").join(&driver.ko))?;
+    let script = assets::load(&project.root, &project.config, "virt/vm-driver-setup")
+        .map_err(|err| Error::Overlay(err.to_string()))?;
+    let script_path = staging.join("koxi/scripts/vm_driver_setup");
+    fs::write(&script_path, script.as_bytes())?;
+    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))?;
+    fs::write(
+        staging.join("koxi/driver_setup/spec"),
+        driver_spec(name, driver) + "\n",
+    )?;
+    if let Some(prep) = &driver.prep {
+        fs::write(staging.join("koxi/driver_setup/prep"), format!("{prep}\n"))?;
+    }
+    Ok(())
+}
+
+/// Stage a driver overlay in `scratch` and concatenate it onto the
+/// base initramfs; returns the per-run initrd path.
+pub fn driver_initrd(
+    scratch: &Path,
+    base_initrd: &Path,
+    name: &str,
+    driver: &Driver,
+    module_dir: &Path,
+    project: &Project,
+    logs: &Path,
+) -> Result<PathBuf, Error> {
+    let staging = scratch.join("overlay");
+    stage_overlay(&staging, name, driver, module_dir, project)?;
+    let initrd = scratch.join("initrd.cpio.gz");
+    overlay_initrd(base_initrd, &staging, &initrd, logs)?;
+    Ok(initrd)
+}
+
+/// v1 spec line: role:name:ko:device:insmod_params:configfs_dir:configfs_params.
+pub fn driver_spec(name: &str, driver: &Driver) -> String {
+    let role = match driver.role {
+        Role::C => "c",
+        Role::Rs => "rs",
+    };
+    format!(
+        "{role}:{name}:{ko}:{device}:{insmod}:{configfs}:{configfs_params}",
+        ko = driver.ko,
+        device = driver.device.display(),
+        insmod = driver.insmod.as_deref().unwrap_or(""),
+        configfs = driver.configfs.as_deref().unwrap_or(""),
+        configfs_params = driver.configfs_params.as_deref().unwrap_or(""),
+    )
+}
+
+/// Single-quote a word for the guest's /bin/sh unless it is plainly
+/// safe (v1 used printf %q).
+pub fn shell_quote(word: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "-_./=:@,+".contains(c);
+    if !word.is_empty() && word.chars().all(safe) {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
+/// The acceleration this host will boot with — part of a perf
+/// result's identity (KVM and TCG numbers must never be pooled).
+pub fn accel() -> &'static str {
+    if kvm_available() {
+        "kvm"
+    } else {
+        "tcg"
+    }
 }
 
 /// A launched qemu guest; killed on drop (the guest is stateless).
@@ -210,6 +301,7 @@ fn kvm_available() -> bool {
 pub enum Error {
     Io(io::Error),
     MissingInput(PathBuf),
+    Overlay(String),
     Spawn(io::Error),
     Ssh(io::Error),
     Cmd(cmd::Error),
@@ -246,6 +338,7 @@ impl fmt::Display for Error {
                     path.display()
                 )
             }
+            Error::Overlay(err) => write!(f, "staging overlay: {err}"),
             Error::Spawn(err) => write!(f, "launching qemu-system-x86_64: {err}"),
             Error::Ssh(err) => write!(f, "running ssh: {err}"),
             Error::Cmd(err) => write!(f, "{err}"),
@@ -268,3 +361,30 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    #[test]
+    fn spec_matches_v1_shape() {
+        let config = Config::parse(include_str!("../../koxi.toml")).unwrap();
+        let driver = &config.block.drivers["null_blk"];
+        let spec = driver_spec("null_blk", driver);
+        let fields: Vec<&str> = spec.split(':').collect();
+        assert_eq!(fields.len(), 7, "spec is 7 colon-separated fields: {spec}");
+        assert_eq!(fields[0], "c");
+        assert_eq!(fields[1], "null_blk");
+        assert_eq!(fields[2], driver.ko);
+    }
+
+    #[test]
+    fn shell_quoting() {
+        assert_eq!(shell_quote("uname"), "uname");
+        assert_eq!(shell_quote("-r"), "-r");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("it's"), r#"'it'\''s'"#);
+        assert_eq!(shell_quote(""), "''");
+    }
+}

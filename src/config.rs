@@ -169,6 +169,16 @@ impl Config {
     }
 }
 
+/// Resolve a CLI-relative default path under the project root;
+/// explicit absolute paths pass through.
+pub fn anchored(root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_owned()
+    } else {
+        root.join(path)
+    }
+}
+
 /// A located project: the directory holding `koxi.toml`, which anchors
 /// `koxi.lock` and the `out/` cache regardless of the working directory.
 #[derive(Debug)]

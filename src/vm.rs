@@ -7,7 +7,6 @@
 
 use std::fs;
 use std::io::IsTerminal;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -16,10 +15,10 @@ use clap::parser::ValueSource;
 use clap::{value_parser, Arg, ArgAction, ArgMatches};
 use tracing::{error, info};
 
-use crate::config::{Driver, Project, Role};
+use crate::config::{anchored, Project};
 use crate::kernel::build::{Flavor, ARTIFACTS_DIR, BZIMAGE};
 use crate::virt::runner;
-use crate::{assets, fetch, logging};
+use crate::{fetch, logging};
 
 pub fn command() -> clap::Command {
     clap::Command::new("vm")
@@ -175,13 +174,15 @@ fn drive(matches: &ArgMatches, logs: &Path) -> Result<ExitCode, Box<dyn std::err
         .tempdir_in(&tmp_root)?;
 
     let initrd = match driver {
-        Some((name, driver)) => {
-            let staging = scratch.path().join("overlay");
-            stage_overlay(&staging, name, driver, &module_dir, &project)?;
-            let initrd = scratch.path().join("initrd.cpio.gz");
-            runner::overlay_initrd(&base_initrd, &staging, &initrd, logs)?;
-            initrd
-        }
+        Some((name, driver)) => runner::driver_initrd(
+            scratch.path(),
+            &base_initrd,
+            name,
+            driver,
+            &module_dir,
+            &project,
+            logs,
+        )?,
         None => base_initrd,
     };
 
@@ -225,7 +226,7 @@ fn drive(matches: &ArgMatches, logs: &Path) -> Result<ExitCode, Box<dyn std::err
     } else {
         let joined = command
             .iter()
-            .map(|word| shell_quote(word))
+            .map(|word| runner::shell_quote(word))
             .collect::<Vec<_>>()
             .join(" ");
         vm.run(&joined)?
@@ -237,79 +238,9 @@ fn drive(matches: &ArgMatches, logs: &Path) -> Result<ExitCode, Box<dyn std::err
     })
 }
 
-/// Resolve the CLI's relative default artifact paths under the
-/// project root; explicit absolute paths pass through.
-fn anchored(root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_owned()
-    } else {
-        root.join(path)
-    }
-}
-
-/// Stage the per-run `/koxi` overlay tree: the driver module (from
-/// the requested flavor's artifact dir), the vm-driver-setup asset,
-/// and the generated spec/prep contract.
-fn stage_overlay(
-    staging: &Path,
-    name: &str,
-    driver: &Driver,
-    module_dir: &Path,
-    project: &Project,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let ko = module_dir.join(&driver.ko);
-    if !ko.is_file() {
-        return Err(format!("{} missing — run `koxi block setup` first", ko.display()).into());
-    }
-    for dir in ["koxi/modules", "koxi/scripts", "koxi/driver_setup"] {
-        fs::create_dir_all(staging.join(dir))?;
-    }
-    fs::copy(&ko, staging.join("koxi/modules").join(&driver.ko))?;
-    let script = assets::load(&project.root, &project.config, "virt/vm-driver-setup")?;
-    let script_path = staging.join("koxi/scripts/vm_driver_setup");
-    fs::write(&script_path, script.as_bytes())?;
-    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))?;
-    fs::write(
-        staging.join("koxi/driver_setup/spec"),
-        driver_spec(name, driver) + "\n",
-    )?;
-    if let Some(prep) = &driver.prep {
-        fs::write(staging.join("koxi/driver_setup/prep"), format!("{prep}\n"))?;
-    }
-    Ok(())
-}
-
-/// v1 spec line: role:name:ko:device:insmod_params:configfs_dir:configfs_params.
-fn driver_spec(name: &str, driver: &Driver) -> String {
-    let role = match driver.role {
-        Role::C => "c",
-        Role::Rs => "rs",
-    };
-    format!(
-        "{role}:{name}:{ko}:{device}:{insmod}:{configfs}:{configfs_params}",
-        ko = driver.ko,
-        device = driver.device.display(),
-        insmod = driver.insmod.as_deref().unwrap_or(""),
-        configfs = driver.configfs.as_deref().unwrap_or(""),
-        configfs_params = driver.configfs_params.as_deref().unwrap_or(""),
-    )
-}
-
-/// Single-quote a word for the guest's /bin/sh unless it is plainly
-/// safe (v1 used printf %q).
-fn shell_quote(word: &str) -> String {
-    let safe = |c: char| c.is_ascii_alphanumeric() || "-_./=:@,+".contains(c);
-    if !word.is_empty() && word.chars().all(safe) {
-        word.to_owned()
-    } else {
-        format!("'{}'", word.replace('\'', "'\\''"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
 
     #[test]
     fn takes_driver_flavor_and_trailing_command() {
@@ -322,26 +253,5 @@ mod tests {
         );
         let cmd: Vec<&String> = matches.get_many::<String>("cmd").unwrap().collect();
         assert_eq!(cmd, ["uname", "-r"]);
-    }
-
-    #[test]
-    fn spec_matches_v1_shape() {
-        let config = Config::parse(include_str!("../koxi.toml")).unwrap();
-        let driver = &config.block.drivers["null_blk"];
-        let spec = driver_spec("null_blk", driver);
-        let fields: Vec<&str> = spec.split(':').collect();
-        assert_eq!(fields.len(), 7, "spec is 7 colon-separated fields: {spec}");
-        assert_eq!(fields[0], "c");
-        assert_eq!(fields[1], "null_blk");
-        assert_eq!(fields[2], driver.ko);
-    }
-
-    #[test]
-    fn shell_quoting() {
-        assert_eq!(shell_quote("uname"), "uname");
-        assert_eq!(shell_quote("-r"), "-r");
-        assert_eq!(shell_quote("a b"), "'a b'");
-        assert_eq!(shell_quote("it's"), r#"'it'\''s'"#);
-        assert_eq!(shell_quote(""), "''");
     }
 }
