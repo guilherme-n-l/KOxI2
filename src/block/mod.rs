@@ -1,6 +1,7 @@
 //! Block-device-driver instantiation of KOxI, mirroring v1 `block/`.
 
 pub mod cli;
+pub mod compare;
 pub mod fio;
 pub mod fuzz;
 pub mod perf;
@@ -51,8 +52,8 @@ pub fn run(matches: &ArgMatches) -> ExitCode {
         "perf" => perf::perf(&opts, &logs),
         "fuzz" => fuzz::fuzz(&opts, &logs),
         "static" => static_analysis::static_phase(&opts, &logs),
+        "compare" => compare::compare(&opts, &logs),
         "screen" => screen(&opts),
-        "compare" => compare(&opts),
         "debug" => debug(&opts),
         "all" => all(&opts),
         other => unreachable!("unknown block subcommand {other}"),
@@ -110,10 +111,6 @@ pub(crate) fn driver_pairs<'c>(
 
 fn screen(_opts: &Opts) -> ExitCode {
     not_implemented("screen")
-}
-
-fn compare(_opts: &Opts) -> ExitCode {
-    not_implemented("compare")
 }
 
 fn debug(_opts: &Opts) -> ExitCode {

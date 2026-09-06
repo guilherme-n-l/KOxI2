@@ -33,6 +33,10 @@ koxi block perf --quick --campaign trial
 # host-side static analysis: tree-sitter LOC/unsafe metrics over the
 # pinned tree, commit mining over the locked linux-meta mirror
 koxi block static --campaign trial
+
+# gate the campaign against its recorded baselines (results are
+# rsync-safe: compare runs anywhere the results/ tree lives)
+koxi block compare --campaign trial
 ```
 
 Real campaigns need an x86_64 Linux host (ideally with /dev/kvm).
