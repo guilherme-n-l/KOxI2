@@ -37,6 +37,7 @@ commit = "4f7b22a0cea479ab522e99815d78a4ad5784b1da"
 "busybox/config" = "5ff2a6ecd6469fb2057953c2b5fdc7e3f3631c27d918e935197a01fed75244e3"
 "linux/config" = "576ac1c90eb3a16331d5a59ee1e10b8f866c6a180337daa9b101d94ae0cdd69b"
 "linux/fuzz.config" = "e8ad847a13555e47b22d2eb865604b8465e79de37c7aac8e4093c18bf8ff4980"
+"static/classify.toml" = "d8784fc670fa1f4bf518695f1cc3ffb7233ceeabbd4bdbc58d3d41df627aa7e9"
 "virt/init" = "523cf2a1097f25d21174bca1dfed0d32650a04066091ad77b40ac191bd33572b"
 "virt/udhcpc-script" = "96338680591f47c8faf5e65902639c061af7d56f261a9ee56e1cac40284dc701"
 
