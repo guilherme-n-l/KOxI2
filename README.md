@@ -64,7 +64,7 @@ adds the rust toolchain, LSPs, and git hooks.
   under the lock's `[artifacts]` table. The kernel is built in two
   flavors: the clean kernel (`bzImage`, modules alongside) for
   perf/vm/metal, and the fuzz kernel under `fuzz/` (`koxi vm
-  --fuzz` boots it) whose instrumentation set — KASAN, KCOV, DWARF5,
+--fuzz` boots it) whose instrumentation set — KASAN, KCOV, DWARF5,
   fault injection — lives in the `linux/fuzz.config` fragment asset,
   merged with the kernel's own `merge_config.sh` and asserted in the
   final `.config`; the effective config is harvested per flavor.

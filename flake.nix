@@ -154,6 +154,12 @@
               };
               shellcheck.enable = true;
               shfmt.enable = true;
+              prettier-md = {
+                enable = true;
+                name = "prettier (markdown, json)";
+                entry = "${lib.getExe pkgs.prettier} --write";
+                files = "\\.(md|json)$";
+              };
             };
           };
 
@@ -169,6 +175,7 @@
             runtimeInputs = [
               pkgs.ruff
               pkgs.basedpyright
+              pkgs.prettier
               pkgs.git
               (pkgs.python3.withPackages (p: [
                 p.scipy
@@ -193,6 +200,10 @@
                           quit(status = as.integer(length(lints) > 0))'
               python3 tests/oracle/gen_stats_scipy.py > tests/fixtures/stats_scipy.json
               Rscript tests/oracle/gen_stats_r.R > tests/fixtures/stats_r.json
+              # Same formatting the pre-commit prettier hook enforces,
+              # so regeneration never fights it.
+              prettier --log-level warn --write tests/fixtures/stats_scipy.json \
+                tests/fixtures/stats_r.json
               echo "stats fixtures regenerated under the flake-locked interpreters" >&2
             '';
           };

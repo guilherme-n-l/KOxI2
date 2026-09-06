@@ -6,10 +6,10 @@ from the Rust code itself. Every expected number in
 `tests/fixtures/stats_scipy.json` and `tests/fixtures/stats_r.json`
 traces to one of the scripts here.
 
-| Script | Oracle | Covers |
-| --- | --- | --- |
-| `gen_stats_scipy.py` | scipy + numpy | Mann-Whitney U (all alternatives × methods, tie/zero-variance edge cases), Wilcoxon signed-rank (exact / permutation / approx auto resolution), descriptives, A12 counting, Holm-Bonferroni (v1 port as its own oracle), exact binomial tail, Clopper-Pearson, Poisson upper bounds |
-| `gen_stats_r.R` | R `wilcox.test` + pROC | Hodges-Lehmann shift estimate with the exact Moses order-statistic CI (including unachievable-level infinite bounds), DeLong A12 confidence intervals |
+| Script               | Oracle                 | Covers                                                                                                                                                                                                                                                                              |
+| -------------------- | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gen_stats_scipy.py` | scipy + numpy          | Mann-Whitney U (all alternatives × methods, tie/zero-variance edge cases), Wilcoxon signed-rank (exact / permutation / approx auto resolution), descriptives, A12 counting, Holm-Bonferroni (v1 port as its own oracle), exact binomial tail, Clopper-Pearson, Poisson upper bounds |
+| `gen_stats_r.R`      | R `wilcox.test` + pROC | Hodges-Lehmann shift estimate with the exact Moses order-statistic CI (including unachievable-level infinite bounds), DeLong A12 confidence intervals                                                                                                                               |
 
 ## Regenerating
 
@@ -26,7 +26,7 @@ tolerance.
 
 ## Rules
 
-- New stats functions get an oracle case *first*; if scipy lacks the
+- New stats functions get an oracle case _first_; if scipy lacks the
   procedure (as with the Hodges-Lehmann CI), find the canonical
   reference implementation elsewhere (R) rather than self-certifying.
 - Behavioral quirks of the oracles are preserved deliberately
