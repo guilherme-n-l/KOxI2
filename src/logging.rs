@@ -5,14 +5,37 @@
 
 use std::fs::{self, OpenOptions};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
+
+/// `log/<project-label>/<run-id>` under the koxi home, with the
+/// project label derived from the project root path (or "global"
+/// outside a project). Falls back to a relative `log/` dir when the
+/// home cannot be determined.
+pub fn run_log_dir() -> PathBuf {
+    let label = match crate::config::Project::locate() {
+        Ok(project) => project
+            .root
+            .display()
+            .to_string()
+            .replace(['/', '\\'], "-")
+            .trim_start_matches('-')
+            .to_owned(),
+        Err(_) => "global".to_owned(),
+    };
+    let run_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let base = crate::fetch::koxi_home().unwrap_or_else(|_| PathBuf::from("."));
+    base.join("log").join(label).join(run_id.to_string())
+}
 
 /// Install the global subscriber. `logfile: None` means console only
 /// (`--nologfile`); a file that cannot be opened degrades to console

@@ -24,7 +24,7 @@ koxi block setup   # fetch + verify all sources, build everything
 
 # boot the built kernel in qemu with a registry driver loaded and
 # run a command (or omit it for an interactive shell)
-koxi block vm --driver rnull ls -l /dev/rnullb0
+koxi vm --driver rnull ls -l /dev/rnullb0
 ```
 
 Real campaigns need an x86_64 Linux host (ideally with /dev/kvm).
@@ -51,7 +51,7 @@ adds the rust toolchain, LSPs, and git hooks.
   (e.g. `vmlinux` for syzkaller symbolization), each sha256-locked
   under the lock's `[artifacts]` table. The kernel is built in two
   flavors: the clean kernel (`bzImage`, modules alongside) for
-  perf/vm/metal, and the fuzz kernel under `fuzz/` (`koxi block vm
+  perf/vm/metal, and the fuzz kernel under `fuzz/` (`koxi vm
   --fuzz` boots it) whose instrumentation set — KASAN, KCOV, DWARF5,
   fault injection — lives in the `linux/fuzz.config` fragment asset,
   merged with the kernel's own `merge_config.sh` and asserted in the

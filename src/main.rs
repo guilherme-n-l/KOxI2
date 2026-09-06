@@ -11,6 +11,7 @@ mod logging;
 mod metal;
 mod nix;
 mod virt;
+mod vm;
 
 use std::process::ExitCode;
 
@@ -27,6 +28,7 @@ fn command() -> Command {
         .subcommand(clean::command())
         .subcommand(metal::command())
         .subcommand(nix::command())
+        .subcommand(vm::command())
 }
 
 fn main() -> ExitCode {
@@ -37,6 +39,7 @@ fn main() -> ExitCode {
         Some(("clean", _)) => clean::run(),
         Some(("metal", sub)) => metal::run(sub),
         Some(("nix", sub)) => nix::run(sub),
+        Some(("vm", sub)) => vm::run(sub),
         _ => unreachable!("subcommand is required"),
     }
 }

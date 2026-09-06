@@ -38,31 +38,6 @@ pub fn command() -> Command {
                 .arg(Arg::new("suite").num_args(0..).help("Test suites to run")),
         )
         .subcommand(
-            Command::new("vm")
-                .about("Boot the test VM and run a command or interactive shell")
-                .arg(
-                    Arg::new("driver")
-                        .long("driver")
-                        .value_name("name")
-                        .help("Registry driver to load at boot (module rides an overlay initrd)"),
-                )
-                .arg(
-                    Arg::new("fuzz")
-                        .long("fuzz")
-                        .action(ArgAction::SetTrue)
-                        .help(
-                        "Boot the fuzz flavor (instrumented kernel + modules from artifacts/fuzz)",
-                    ),
-                )
-                .arg(
-                    Arg::new("cmd")
-                        .num_args(0..)
-                        .allow_hyphen_values(true)
-                        .trailing_var_arg(true)
-                        .help("Command to run in the guest (default: interactive shell)"),
-                ),
-        )
-        .subcommand(
             Command::new("clean").about("Remove built artifacts (artifacts/; results preserved)"),
         )
         .subcommand(Command::new("perf").about("Run performance benchmarks"))
@@ -580,21 +555,6 @@ mod tests {
         let opts = super::Opts::from_matches(sub);
         assert_eq!(opts.fuzz_hours, 24.0);
         assert_eq!(opts.fio_reps, 50);
-    }
-
-    #[test]
-    fn vm_takes_driver_flavor_and_trailing_command() {
-        let matches = super::command()
-            .get_matches_from(["block", "vm", "--fuzz", "--driver", "rnull", "uname", "-r"]);
-        let (name, sub) = matches.subcommand().unwrap();
-        assert_eq!(name, "vm");
-        assert!(sub.get_flag("fuzz"));
-        assert_eq!(
-            sub.get_one::<String>("driver").map(String::as_str),
-            Some("rnull")
-        );
-        let cmd: Vec<&String> = sub.get_many::<String>("cmd").unwrap().collect();
-        assert_eq!(cmd, ["uname", "-r"]);
     }
 
     #[test]

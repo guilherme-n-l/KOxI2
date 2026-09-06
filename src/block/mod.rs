@@ -4,12 +4,8 @@ pub mod cli;
 pub mod fio;
 pub mod setup;
 pub mod test;
-pub mod vm;
 
 use std::process::ExitCode;
-
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::parser::ValueSource;
 use clap::ArgMatches;
@@ -17,6 +13,7 @@ use clap::ArgMatches;
 use cli::Opts;
 
 use crate::config::Project;
+use crate::logging::run_log_dir;
 
 /// Dispatch a parsed `koxi block <command>` invocation.
 pub fn run(matches: &ArgMatches) -> ExitCode {
@@ -46,7 +43,6 @@ pub fn run(matches: &ArgMatches) -> ExitCode {
     match name {
         "setup" => setup::setup(&opts, &logs),
         "test" => test::test(&opts, &logs),
-        "vm" => vm::vm(&opts, sub, &logs),
         "clean" => clean(&opts),
         "perf" => perf(&opts),
         "fuzz" => fuzz(&opts),
@@ -109,28 +105,6 @@ fn debug(_opts: &Opts) -> ExitCode {
 
 fn all(_opts: &Opts) -> ExitCode {
     not_implemented("all")
-}
-
-/// `log/<project-label>/<run-id>` under the koxi home, with the
-/// project label derived from the project root path (or "global"
-/// outside a project). Falls back to a relative `log/` dir when the
-/// home cannot be determined.
-fn run_log_dir() -> PathBuf {
-    let label = match Project::locate() {
-        Ok(project) => project
-            .root
-            .display()
-            .to_string()
-            .replace(['/', '\\'], "-")
-            .trim_start_matches('-')
-            .to_owned(),
-        Err(_) => "global".to_owned(),
-    };
-    let run_id = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
-    let base = crate::fetch::koxi_home().unwrap_or_else(|_| PathBuf::from("."));
-    base.join("log").join(label).join(run_id.to_string())
 }
 
 fn not_implemented(name: &str) -> ExitCode {
