@@ -89,6 +89,9 @@ pub struct FioKnobs {
     pub size: Vec<String>,
     pub reps: u32,
     pub runtime: u64,
+    /// fio ioengine. Identity-bearing: with a synchronous engine fio
+    /// silently caps iodepth at 1, so engine changes re-baseline.
+    pub engine: String,
 }
 
 /// v1 _domain_hash fuzz inputs: campaign count, duration, VM count.
@@ -252,6 +255,7 @@ mod tests {
                 size: vec!["512M".to_owned()],
                 reps: 3,
                 runtime: 5,
+                engine: "io_uring".to_owned(),
             }),
             fuzz: None,
         }

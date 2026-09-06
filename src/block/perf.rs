@@ -79,6 +79,7 @@ fn drive(opts: &Opts, logs: &Path) -> Result<(), Box<dyn std::error::Error>> {
         size: opts.fio_sz.clone(),
         reps: opts.fio_reps,
         runtime: opts.fio_runtime,
+        engine: opts.fio_engine.clone(),
     };
     if fio.bs.is_empty() || fio.rw.is_empty() || fio.qd.is_empty() || fio.size.is_empty() {
         return Err("empty fio matrix (check --fio-bs/--fio-rw/--fio-qd/--fio-sz)".into());
@@ -266,7 +267,7 @@ fn run_matrix(
             if out.is_file() {
                 continue;
             }
-            let output = vm.exec(&workload.fio_command(&device, runtime))?;
+            let output = vm.exec(&workload.fio_command(&device, runtime, &fio.engine))?;
             let annotated = if output.status.success() {
                 annotate(&output.stdout, rep == 1, index + 1, seed, name, rep)
             } else {
@@ -333,13 +334,15 @@ impl Workload {
         format!("{} {} qd={} sz={}", self.bs, self.rw, self.qd, self.size)
     }
 
-    /// v1 perf/vm_init fio invocation, verbatim (psync default engine).
-    fn fio_command(&self, device: &str, runtime: u64) -> String {
+    /// v1 perf/vm_init fio invocation plus an explicit ioengine —
+    /// v1's implicit psync silently capped iodepth at 1.
+    fn fio_command(&self, device: &str, runtime: u64, engine: &str) -> String {
         format!(
-            "fio --name=bench --filename={device} --bs={bs} --iodepth={qd} --rw={rw} \
-             --size={size} --direct=1 --runtime={runtime} --time_based \
-             --group_reporting=1 --output-format=json --allow_file_create=0",
+            "fio --name=bench --filename={device} --ioengine={engine} --bs={bs} \
+             --iodepth={qd} --rw={rw} --size={size} --direct=1 --runtime={runtime} \
+             --time_based --group_reporting=1 --output-format=json --allow_file_create=0",
             device = runner::shell_quote(device),
+            engine = runner::shell_quote(engine),
             bs = runner::shell_quote(&self.bs),
             qd = self.qd,
             rw = runner::shell_quote(&self.rw),
@@ -387,7 +390,10 @@ fn shuffled<T>(mut items: Vec<T>, seed: u64) -> Vec<T> {
 }
 
 /// Inject run metadata into the fio JSON (v1 sed-appended
-/// "nullb_metadata"; this is the structured version).
+/// "nullb_metadata"; this is the structured version). fio prefixes
+/// advisory notes to stdout (e.g. "queue depth will be capped at 1"
+/// for sync engines) — they are preserved as evidence in the
+/// metadata rather than breaking the parse.
 fn annotate(
     stdout: &[u8],
     warmup: bool,
@@ -396,8 +402,21 @@ fn annotate(
     driver: &str,
     rep: u32,
 ) -> Result<String, String> {
-    let mut value: serde_json::Value =
-        serde_json::from_slice(stdout).map_err(|err| format!("fio output is not JSON: {err}"))?;
+    let text = String::from_utf8_lossy(stdout);
+    let start = text
+        .find('{')
+        .ok_or_else(|| format!("fio produced no JSON: {}", text.trim()))?;
+    let notes: Vec<String> = text[..start]
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    for note in &notes {
+        warn!("fio: {note}");
+    }
+    let mut value: serde_json::Value = serde_json::from_str(&text[start..])
+        .map_err(|err| format!("fio output is not JSON: {err}"))?;
     let object = value
         .as_object_mut()
         .ok_or("fio output is not a JSON object")?;
@@ -409,6 +428,7 @@ fn annotate(
             "workload_seed": seed.to_string(),
             "driver": driver,
             "rep": rep,
+            "fio_notes": notes,
         }),
     );
     serde_json::to_string_pretty(&value).map_err(|err| err.to_string())
@@ -426,6 +446,7 @@ mod tests {
             size: vec!["512M".to_owned()],
             reps: 3,
             runtime: 5,
+            engine: "io_uring".to_owned(),
         }
     }
 
@@ -479,6 +500,17 @@ mod tests {
     }
 
     #[test]
+    fn annotate_preserves_fio_notes_before_the_json() {
+        let stdout = b"note: both iodepth >= 1 and synchronous I/O engine are selected, \
+                       queue depth will be capped at 1\n{\"jobs\": []}";
+        let json = annotate(stdout, false, 1, 7, "null_blk", 2).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let notes = value["koxi_metadata"]["fio_notes"].as_array().unwrap();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].as_str().unwrap().contains("capped at 1"));
+    }
+
+    #[test]
     fn fio_command_matches_v1_flags() {
         let workload = Workload {
             bs: "4k".to_owned(),
@@ -486,10 +518,11 @@ mod tests {
             qd: 1,
             size: "512M".to_owned(),
         };
-        let command = workload.fio_command("/dev/nullb0", 30);
+        let command = workload.fio_command("/dev/nullb0", 30, "io_uring");
         for flag in [
             "--name=bench",
             "--filename=/dev/nullb0",
+            "--ioengine=io_uring",
             "--bs=4k",
             "--iodepth=1",
             "--rw=randread",

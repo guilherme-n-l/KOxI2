@@ -233,6 +233,13 @@ pub fn command() -> Command {
                 .help_heading("Fio knobs")
                 .help("Deterministic workload shuffle seed (default: unix time)"),
         )
+        .arg(
+            opt("fio-engine", "FIO_ENGINE")
+                .value_name("engine")
+                .default_value("io_uring")
+                .help_heading("Fio knobs")
+                .help("fio ioengine (io_uring makes the qd axis real; psync = v1 parity)"),
+        )
         // Fuzzing
         .arg(
             opt("fuzz-campaigns", "FUZZ_CAMPAIGNS")
@@ -389,6 +396,7 @@ pub struct Opts {
     pub fio_sz: Vec<String>,
     pub fio_reps: u32,
     pub fio_runtime: u64,
+    pub fio_engine: String,
     pub seed: Option<u64>,
     pub fuzz_campaigns: u32,
     pub fuzz_hours: f64,
@@ -476,6 +484,10 @@ impl Opts {
             fio_sz: strings(matches, "fio-sz"),
             fio_reps: copied(matches, "fio-reps"),
             fio_runtime: copied(matches, "fio-runtime"),
+            fio_engine: matches
+                .get_one::<String>("fio-engine")
+                .cloned()
+                .expect("defaulted"),
             seed: matches.get_one::<u64>("seed").copied(),
             fuzz_campaigns: copied(matches, "fuzz-campaigns"),
             fuzz_hours: copied(matches, "fuzz-hours"),
