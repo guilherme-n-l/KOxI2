@@ -20,7 +20,11 @@ with `null_blk` (C) vs `rnull` (Rust) as the Phase-2 pair.
 nix develop .#koxi
 
 koxi block test    # preflight: tools, toolchain sanity, headers
-koxi block setup   # fetch + verify all sources, build the kernel
+koxi block setup   # fetch + verify all sources, build everything
+
+# boot the built kernel in qemu with a registry driver loaded and
+# run a command (or omit it for an interactive shell)
+koxi block vm --driver rnull ls -l /dev/rnullb0
 ```
 
 Real campaigns need an x86_64 Linux host (ideally with /dev/kvm).
@@ -45,8 +49,18 @@ adds the rust toolchain, LSPs, and git hooks.
 - **`artifacts/`** — per-project build outputs: `bzImage` plus the
   registry drivers' kernel modules and any `[build].extra-artifacts`
   (e.g. `vmlinux` for syzkaller symbolization), each sha256-locked
-  under the lock's `[artifacts]` table. `koxi block clean` removes
-  them.
+  under the lock's `[artifacts]` table. The kernel is built in two
+  flavors: the clean kernel (`bzImage`, modules alongside) for
+  perf/vm/metal, and the fuzz kernel under `fuzz/` (`koxi block vm
+  --fuzz` boots it) whose instrumentation set — KASAN, KCOV, DWARF5,
+  fault injection — lives in the `linux/fuzz.config` fragment asset,
+  merged with the kernel's own `merge_config.sh` and asserted in the
+  final `.config`; the effective config is harvested per flavor.
+  `koxi block clean` removes everything here.
+- **Guest runs** — the locked initramfs stays generic; each run
+  packs its driver module + setup spec into a small overlay cpio
+  concatenated onto it (works for qemu and kexec alike), boots, and
+  talks to the guest over its baked-key dropbear.
 - **`$KOXI_HOME`** (default `~/.koxi`) — shared across projects:
   `cache/` (tarballs, source trees, git mirrors; `--nocache` clears
   it), `tmp/` (mktemp-style build scratch, kept on failure for
@@ -83,7 +97,7 @@ bootloader. Fuzzing stays qemu-only by design.
   `koxi clean` (or `--nocache`) sweeps them. Don't run either
   concurrently with a build — scratch dirs carry no liveness marker.
 - The cache never garbage-collects superseded versions.
-- The lock format is strict (`deny_unknown_fields`, `version = 1`):
+- The lock format is strict (`deny_unknown_fields`, `version = 2`):
   older binaries hard-fail on newer locks. Bump the version whenever a
   lock table changes shape.
 - Env-set flags count as "present" for clap conflict checks

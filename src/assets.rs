@@ -30,6 +30,10 @@ pub const ASSETS: &[Asset] = &[
         contents: include_str!("../assets/linux/config"),
     },
     Asset {
+        name: "linux/fuzz.config",
+        contents: include_str!("../assets/linux/fuzz.config"),
+    },
+    Asset {
         name: "busybox/config",
         contents: include_str!("../assets/busybox/config"),
     },

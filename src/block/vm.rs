@@ -15,7 +15,7 @@ use tracing::{error, info};
 
 use crate::block::cli::Opts;
 use crate::config::{Driver, Project, Role};
-use crate::kernel::build::ARTIFACTS_DIR;
+use crate::kernel::build::{Flavor, ARTIFACTS_DIR, BZIMAGE};
 use crate::virt::runner;
 use crate::{assets, fetch};
 
@@ -41,7 +41,21 @@ fn run(opts: &Opts, sub: &ArgMatches, logs: &Path) -> Result<ExitCode, Box<dyn s
 
     let project = Project::locate()?;
     let artifacts = project.root.join(ARTIFACTS_DIR);
-    let kernel = anchored(&project.root, &opts.kernel);
+    // --fuzz flips the kernel default and the module source to the
+    // fuzz flavor's namespace; an explicit --kernel still wins.
+    let flavor = if sub.get_flag("fuzz") {
+        Flavor::Fuzz
+    } else {
+        Flavor::Clean
+    };
+    let kernel = if flavor == Flavor::Fuzz
+        && sub.value_source("kernel") == Some(clap::parser::ValueSource::DefaultValue)
+    {
+        flavor.dir(&artifacts).join(BZIMAGE)
+    } else {
+        anchored(&project.root, &opts.kernel)
+    };
+    let module_dir = flavor.dir(&artifacts);
     let base_initrd = anchored(&project.root, &opts.initrd);
 
     let driver = match sub.get_one::<String>("driver") {
@@ -66,7 +80,7 @@ fn run(opts: &Opts, sub: &ArgMatches, logs: &Path) -> Result<ExitCode, Box<dyn s
     let initrd = match driver {
         Some((name, driver)) => {
             let staging = scratch.path().join("overlay");
-            stage_overlay(&staging, name, driver, &artifacts, &project)?;
+            stage_overlay(&staging, name, driver, &module_dir, &project)?;
             let initrd = scratch.path().join("initrd.cpio.gz");
             runner::overlay_initrd(&base_initrd, &staging, &initrd, logs)?;
             initrd
@@ -130,16 +144,17 @@ fn anchored(root: &Path, path: &Path) -> PathBuf {
     }
 }
 
-/// Stage the per-run `/koxi` overlay tree: the driver module, the
-/// vm-driver-setup asset, and the generated spec/prep contract.
+/// Stage the per-run `/koxi` overlay tree: the driver module (from
+/// the requested flavor's artifact dir), the vm-driver-setup asset,
+/// and the generated spec/prep contract.
 fn stage_overlay(
     staging: &Path,
     name: &str,
     driver: &Driver,
-    artifacts: &Path,
+    module_dir: &Path,
     project: &Project,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let ko = artifacts.join(&driver.ko);
+    let ko = module_dir.join(&driver.ko);
     if !ko.is_file() {
         return Err(format!("{} missing — run `koxi block setup` first", ko.display()).into());
     }

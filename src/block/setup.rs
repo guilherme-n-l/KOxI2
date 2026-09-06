@@ -114,18 +114,36 @@ fn drive(ctx: &mut Ctx, opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
             required: true,
         });
     }
+    // Both flavors from the same base config: clean (production-like)
+    // for perf/vm/metal, fuzz (KASAN/KCOV/... fragment) for fuzzing.
+    // menuconfig runs on the clean build, whose .config is the pure
+    // base — the persisted override never absorbs fragment symbols.
     let image = kernel::build::build(
         ctx,
         &kernel::build::Options {
             force: opts.force_build,
             menuconfig: opts.menuconfig,
             skip_build: opts.skip_build,
-            cc,
-            target,
-            modules,
+            cc: cc.clone(),
+            target: target.clone(),
+            modules: modules.clone(),
+            flavor: kernel::build::Flavor::Clean,
         },
     )?;
     info!("kernel image ready at {}", image.display());
+    let fuzz_image = kernel::build::build(
+        ctx,
+        &kernel::build::Options {
+            force: opts.force_build,
+            menuconfig: false,
+            skip_build: opts.skip_build,
+            cc,
+            target,
+            modules,
+            flavor: kernel::build::Flavor::Fuzz,
+        },
+    )?;
+    info!("fuzz kernel image ready at {}", fuzz_image.display());
     let (busybox, dropbear) = virt::setup::setup(ctx)?;
     info!("busybox source ready at {}", busybox.display());
     info!("dropbear source ready at {}", dropbear.display());

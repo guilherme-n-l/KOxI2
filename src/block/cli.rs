@@ -47,6 +47,14 @@ pub fn command() -> Command {
                         .help("Registry driver to load at boot (module rides an overlay initrd)"),
                 )
                 .arg(
+                    Arg::new("fuzz")
+                        .long("fuzz")
+                        .action(ArgAction::SetTrue)
+                        .help(
+                        "Boot the fuzz flavor (instrumented kernel + modules from artifacts/fuzz)",
+                    ),
+                )
+                .arg(
                     Arg::new("cmd")
                         .num_args(0..)
                         .allow_hyphen_values(true)
@@ -575,11 +583,12 @@ mod tests {
     }
 
     #[test]
-    fn vm_takes_driver_and_trailing_command() {
-        let matches =
-            super::command().get_matches_from(["block", "vm", "--driver", "rnull", "uname", "-r"]);
+    fn vm_takes_driver_flavor_and_trailing_command() {
+        let matches = super::command()
+            .get_matches_from(["block", "vm", "--fuzz", "--driver", "rnull", "uname", "-r"]);
         let (name, sub) = matches.subcommand().unwrap();
         assert_eq!(name, "vm");
+        assert!(sub.get_flag("fuzz"));
         assert_eq!(
             sub.get_one::<String>("driver").map(String::as_str),
             Some("rnull")
