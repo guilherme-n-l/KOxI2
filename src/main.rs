@@ -10,6 +10,7 @@ mod lock;
 mod logging;
 mod metal;
 mod nix;
+mod stats;
 mod virt;
 mod vm;
 
