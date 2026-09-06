@@ -35,7 +35,7 @@ const INFRA: &str = "infrastructure_noise";
 const UNKNOWN: &str = "unknown";
 const CLASSES: [&str; 3] = [TARGET, INFRA, UNKNOWN];
 
-struct Classifier {
+pub(super) struct Classifier {
     target: Regex,
     infra: Regex,
     modules: Regex,
@@ -44,7 +44,7 @@ struct Classifier {
 }
 
 impl Classifier {
-    fn new(c_name: &str, rs_name: &str) -> Result<Self, regex::Error> {
+    pub(super) fn new(c_name: &str, rs_name: &str) -> Result<Self, regex::Error> {
         Ok(Self {
             target: RegexBuilder::new(&format!(
                 "{}|{}",
@@ -88,7 +88,7 @@ impl Classifier {
 }
 
 #[derive(Clone)]
-struct OverrideRow {
+pub(super) struct OverrideRow {
     classification: String,
     validator: String,
     date: String,
@@ -96,7 +96,7 @@ struct OverrideRow {
 }
 
 /// Sidecar override CSV: campaign,crash_id,classification,validator,date,notes.
-fn load_validated_crashes(
+pub(super) fn load_validated_crashes(
     path: &Path,
 ) -> Result<HashMap<(String, String), OverrideRow>, Box<dyn std::error::Error>> {
     let mut overrides = HashMap::new();
@@ -129,17 +129,17 @@ fn load_validated_crashes(
 }
 
 #[derive(Default)]
-struct Counts {
-    target: u64,
-    infra: u64,
-    unknown: u64,
+pub(super) struct Counts {
+    pub(super) target: u64,
+    pub(super) infra: u64,
+    pub(super) unknown: u64,
 }
 
-struct CampaignSummary {
+pub(super) struct CampaignSummary {
     id: String,
     unique_crashes: u64,
-    counts: Counts,
-    quality: &'static str,
+    pub(super) counts: Counts,
+    pub(super) quality: &'static str,
 }
 
 impl CampaignSummary {
@@ -155,7 +155,7 @@ impl CampaignSummary {
 /// Classify one campaign's syzkaller crash buckets and persist the
 /// v1-shape crash_classification.json beside them (idempotent; the
 /// screen verb and the paper appendix read it too).
-fn classify_campaign(
+pub(super) fn classify_campaign(
     classifier: &Classifier,
     campaign_dir: &Path,
     overrides: &HashMap<(String, String), OverrideRow>,

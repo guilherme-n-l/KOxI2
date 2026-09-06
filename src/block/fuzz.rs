@@ -40,7 +40,7 @@ pub fn fuzz(opts: &Opts, logs: &Path) -> ExitCode {
     }
 }
 
-fn drive(opts: &Opts, logs: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn drive(opts: &Opts, logs: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let project = Project::locate()?;
     let artifacts = project.root.join(ARTIFACTS_DIR);
     let fuzz_dir = Flavor::Fuzz.dir(&artifacts);

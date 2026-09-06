@@ -32,7 +32,7 @@ pub fn perf(opts: &Opts, logs: &Path) -> ExitCode {
     }
 }
 
-fn drive(opts: &Opts, logs: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn drive(opts: &Opts, logs: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if opts.p1 {
         info!("phase 1 only: perf is a phase-2 gate; skipping");
         return Ok(());

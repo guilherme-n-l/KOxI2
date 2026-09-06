@@ -8,6 +8,9 @@
 
 pub mod fuzz;
 pub mod perf;
+pub mod safety;
+pub mod screen;
+pub mod verdict;
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -28,7 +31,7 @@ pub fn compare(opts: &Opts, logs: &Path) -> ExitCode {
     }
 }
 
-fn drive(opts: &Opts, _logs: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn drive(opts: &Opts, _logs: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let campaign = opts
         .campaign
         .as_deref()
@@ -56,12 +59,22 @@ fn drive(opts: &Opts, _logs: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
         let compare_dir = campaign_root.join("compare");
         std::fs::create_dir_all(&compare_dir)?;
+        let mut baselines = std::collections::BTreeMap::new();
+        let mut record =
+            |domain: &str,
+             manifest: &Manifest,
+             baselines: &mut std::collections::BTreeMap<_, _>| {
+                if let Some(p2) = &manifest.p2 {
+                    baselines.insert(domain.to_string(), p2.baseline.clone());
+                }
+            };
 
         // Performance gate.
         match load_domain(&results_root, &campaign_root, c_name, "perf")? {
             Some((p2_dir, p1_dir, manifest)) => {
                 info!("compare perf: {} vs {}", p1_dir.display(), p2_dir.display());
                 perf::compare_perf(&p1_dir, &p2_dir, &manifest, opts, &compare_dir)?;
+                record("perf", &manifest, &mut baselines);
                 compared += 1;
             }
             None => info!("perf comparison: missing perf data; skipping"),
@@ -80,15 +93,40 @@ fn drive(opts: &Opts, _logs: &Path) -> Result<(), Box<dyn std::error::Error>> {
                     c_name,
                     rs_name,
                 )?;
+                record("fuzz", &manifest, &mut baselines);
                 compared += 1;
             }
             None => info!("fuzz comparison: missing fuzz data; skipping"),
         }
 
-        // The safety comparator lands with the static analysis port.
-        if campaign_root.join("static").is_dir() {
-            info!("static comparison not ported yet; skipping");
+        // Safety gate over the static analysis outputs.
+        match load_domain(&results_root, &campaign_root, c_name, "static")? {
+            Some((p2_dir, p1_dir, manifest)) => {
+                info!(
+                    "compare safety: {} vs {}",
+                    p1_dir.display(),
+                    p2_dir.display()
+                );
+                safety::compare_safety(&p1_dir, &p2_dir, opts, &compare_dir)?;
+                record("static", &manifest, &mut baselines);
+                compared += 1;
+            }
+            None => info!("safety comparison: missing static data; skipping"),
         }
+
+        // Fold whatever landed into the overall verdict.
+        let screening =
+            std::fs::read_to_string(results_root.join("p1").join(c_name).join("screening.json"))
+                .ok()
+                .and_then(|content| serde_json::from_str(&content).ok());
+        verdict::write_verdict(
+            &compare_dir,
+            campaign,
+            &baselines,
+            c_name,
+            rs_name,
+            screening,
+        )?;
     }
     if compared == 0 {
         return Err("no domains available for comparison".into());

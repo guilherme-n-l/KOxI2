@@ -57,7 +57,9 @@ pub fn command() -> Command {
                         .help("Arguments forwarded to the function"),
                 ),
         )
-        .subcommand(Command::new("all").about("static + perf + fuzz + compare (phase-aware)"))
+        .subcommand(
+            Command::new("all").about("static + perf + fuzz + screen + compare (phase-aware)"),
+        )
         // Global
         .arg(
             flag("p1", "PHASE1_ONLY")

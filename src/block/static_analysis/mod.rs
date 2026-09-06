@@ -41,7 +41,7 @@ pub fn static_phase(opts: &Opts, logs: &Path) -> ExitCode {
     }
 }
 
-fn drive(opts: &Opts, logs: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn drive(opts: &Opts, logs: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let project = Project::locate()?;
     let home = fetch::koxi_home()?;
     let lock_path = project.root.join(LOCK_PATH);

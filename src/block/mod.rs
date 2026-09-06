@@ -53,9 +53,9 @@ pub fn run(matches: &ArgMatches) -> ExitCode {
         "fuzz" => fuzz::fuzz(&opts, &logs),
         "static" => static_analysis::static_phase(&opts, &logs),
         "compare" => compare::compare(&opts, &logs),
-        "screen" => screen(&opts),
+        "screen" => compare::screen::screen(&opts),
         "debug" => debug(&opts),
-        "all" => all(&opts),
+        "all" => all(&opts, &logs),
         other => unreachable!("unknown block subcommand {other}"),
     }
 }
@@ -109,16 +109,30 @@ pub(crate) fn driver_pairs<'c>(
         .collect()
 }
 
-fn screen(_opts: &Opts) -> ExitCode {
-    not_implemented("screen")
-}
-
 fn debug(_opts: &Opts) -> ExitCode {
     not_implemented("debug")
 }
 
-fn all(_opts: &Opts) -> ExitCode {
-    not_implemented("all")
+/// The whole pipeline in phase order; each phase already handles
+/// p1 baselines and the p2 campaign itself (phase-aware), screening
+/// lands before compare so the verdict can fold it in.
+fn all(opts: &Opts, logs: &std::path::Path) -> ExitCode {
+    type Phase = fn(&Opts, &std::path::Path) -> Result<(), Box<dyn std::error::Error>>;
+    let phases: [(&str, Phase); 5] = [
+        ("static", static_analysis::drive),
+        ("perf", perf::drive),
+        ("fuzz", fuzz::drive),
+        ("screen", |opts, _logs| compare::screen::drive(opts)),
+        ("compare", compare::drive),
+    ];
+    for (name, phase) in phases {
+        tracing::info!("=== koxi block {name} ===");
+        if let Err(err) = phase(opts, logs) {
+            tracing::error!("koxi block {name}: {err}");
+            return ExitCode::FAILURE;
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 fn not_implemented(name: &str) -> ExitCode {
