@@ -68,12 +68,25 @@ pub struct BuildConfig {
     pub extra_artifacts: Vec<PathBuf>,
 }
 
-/// Everything block-specific: the driver registry (v1 `drivers.cfg`).
+/// Everything block-specific: the driver registry (v1 `drivers.cfg`)
+/// and the static-analysis window.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlockConfig {
     #[serde(default)]
     pub drivers: BTreeMap<String, Driver>,
+    #[serde(default, rename = "static")]
+    pub static_: StaticConfig,
+}
+
+/// `[block.static]` — commit-mining bounds. The since date is
+/// absolute so the mined window is reproducible (v1 used a floating
+/// "4 years ago" against GitHub's moving HEAD).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaticConfig {
+    #[serde(default)]
+    pub since: Option<String>,
 }
 
 /// Where a third-party component comes from.
@@ -120,6 +133,12 @@ pub struct Driver {
     /// C driver this Rust driver replaces (v1 `[pairs]`).
     #[serde(default)]
     pub pair: Option<String>,
+    /// Kernel-tree-relative paths of the shared abstraction layer
+    /// this driver leans on (files or directories); the static phase
+    /// counts their unsafe surface separately so a "0 unsafe" driver
+    /// body cannot hide unsafe pushed one layer down.
+    #[serde(default)]
+    pub abstractions: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

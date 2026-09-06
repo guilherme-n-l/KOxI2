@@ -29,6 +29,10 @@ koxi vm --driver rnull ls -l /dev/rnullb0
 # the fio benchmark matrix: C baseline (cached by content hash) then
 # the Rust pair under a named campaign; see results/*/manifest.toml
 koxi block perf --quick --campaign trial
+
+# host-side static analysis: tree-sitter LOC/unsafe metrics over the
+# pinned tree, commit mining over the locked linux-meta mirror
+koxi block static --campaign trial
 ```
 
 Real campaigns need an x86_64 Linux host (ideally with /dev/kvm).

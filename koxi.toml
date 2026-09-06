@@ -73,6 +73,7 @@ gitpath = "drivers/block/rnull/"
 configfs = "rnull/rnullb0"
 configfs-params = "power=1"
 pair = "null_blk"
+abstractions = ["rust/kernel/block.rs", "rust/kernel/block/"]
 
 [block.drivers.loop]
 role = "c"

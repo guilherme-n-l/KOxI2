@@ -91,19 +91,21 @@ fn drive(opts: &Opts, logs: &Path) -> Result<(), Box<dyn std::error::Error>> {
             spec: runner::driver_spec(name, driver),
             prep: driver.prep.clone().unwrap_or_default(),
             host: host.clone(),
-            accel: accel.to_owned(),
-            smp: opts.smp,
-            memory: opts.memory.clone(),
-            artifacts: ArtifactShas {
+            accel: Some(accel.to_owned()),
+            smp: Some(opts.smp),
+            memory: Some(opts.memory.clone()),
+            artifacts: Some(ArtifactShas {
                 kernel: kernel_sha.clone(),
                 initrd: initrd_sha.clone(),
                 module: fetch::sha256(&artifacts.join(&driver.ko), logs)?,
                 kconfig: kconfig_sha.clone(),
                 syzkaller: None,
                 syz_template: None,
-            },
+            }),
+            source: None,
             fio: Some(fio.clone()),
             fuzz: None,
+            static_: None,
         })
     };
 

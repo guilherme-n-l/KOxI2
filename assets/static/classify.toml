@@ -1,0 +1,53 @@
+# Commit-classification rules for the static phase (v1
+# block/static/commit_analysis constants, promoted to a versioned,
+# overridable input: this file's sha is part of every static
+# result's identity, so a rule change re-runs the analysis instead
+# of silently shifting the safety-gate denominator).
+#
+# safety-signal marks a commit as safety-related (the historical-risk
+# lens and the safety gate's denominator). cwe rules run first-match-
+# wins over safety-related subjects only. All patterns are
+# case-insensitive regexes.
+
+# v1's tokens were unanchored and inflated the safety count: bare
+# "null" matched the driver's own name in every "null_blk:" subject,
+# "bug" matched debug/debugfs, "race" matched tracepoints. Word
+# boundaries fix the false positives while keeping the intended
+# morphology (fix/fixes/fixed, bug/buggy, leak/leaks, warn/warning).
+safety-signal = "\\bfix|\\bbug|\\bnull\\b|\\buaf\\b|use.after.free|overflow|\\boob\\b|\\bbounds|\\bleak|\\brace\\b|deadlock|double.free|uninit|\\bCVE\\b|KASAN|UBSAN|panic|\\boops\\b|crash|\\bwarn|error.handling|missing.check"
+
+[[cwe]]
+pattern = "use.after.free|uaf"
+cwe = "CWE-416"
+
+[[cwe]]
+pattern = "null.pointer|null.deref|null ptr|nullptr"
+cwe = "CWE-476"
+
+[[cwe]]
+pattern = "buffer.overflow|out.of.bound|\\boob\\b|overrun"
+cwe = "CWE-787"
+
+[[cwe]]
+pattern = "double.free"
+cwe = "CWE-415"
+
+[[cwe]]
+pattern = "uninit|uninitialized"
+cwe = "CWE-457"
+
+[[cwe]]
+pattern = "\\brace\\b|deadlock|toctou|concurren"
+cwe = "CWE-362"
+
+[[cwe]]
+pattern = "integer.overflow|int.overflow|truncat"
+cwe = "CWE-190"
+
+[[cwe]]
+pattern = "memory.leak|memleak|\\bleak"
+cwe = "CWE-401"
+
+[[cwe]]
+pattern = "missing.check|error.handl|missing.return"
+cwe = "CWE-252"

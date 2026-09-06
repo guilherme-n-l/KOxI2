@@ -119,19 +119,21 @@ fn drive(opts: &Opts, logs: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 spec: runner::driver_spec(name, driver),
                 prep: driver.prep.clone().unwrap_or_default(),
                 host: host.clone(),
-                accel: accel.to_owned(),
-                smp: opts.smp,
-                memory: opts.memory.clone(),
-                artifacts: ArtifactShas {
+                accel: Some(accel.to_owned()),
+                smp: Some(opts.smp),
+                memory: Some(opts.memory.clone()),
+                artifacts: Some(ArtifactShas {
                     kernel: kernel_sha.clone(),
                     initrd: initrd_sha.clone(),
                     module: fetch::sha256(&fuzz_dir.join(&driver.ko), logs)?,
                     kconfig: kconfig_sha.clone(),
                     syzkaller: Some(syz_sha.clone()),
                     syz_template: Some(base_cfg.sha256.clone()),
-                },
+                }),
+                source: None,
                 fio: None,
                 fuzz: Some(knobs.clone()),
+                static_: None,
             })
         };
         let shared = SharedCfg {

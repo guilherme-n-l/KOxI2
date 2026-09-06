@@ -53,16 +53,50 @@ pub struct Identity {
     #[serde(default)]
     pub prep: String,
     /// Host identity + acceleration: laptop/KVM and nixbox/TCG
-    /// numbers must never be compared or pooled.
+    /// numbers must never be compared or pooled. VM-shaped fields
+    /// are absent for host-side domains (static).
     pub host: String,
-    pub accel: String,
-    pub smp: u32,
-    pub memory: String,
-    pub artifacts: ArtifactShas,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smp: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<ArtifactShas>,
+    /// Source pins for host-side analysis (static domain).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourceIds>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fio: Option<FioKnobs>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fuzz: Option<FuzzKnobs>,
+    #[serde(default, rename = "static", skip_serializing_if = "Option::is_none")]
+    pub static_: Option<StaticKnobs>,
+}
+
+/// What the static domain analyzed: the pinned bits, not built ones.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceIds {
+    /// Kernel source tarball sha (the tree being parsed).
+    pub linux: String,
+    /// linux-meta mirror commit (the history being mined).
+    pub meta_commit: String,
+    /// static/classify.toml asset sha (regexes are inputs too).
+    pub classify: String,
+}
+
+/// Static-analysis scope knobs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StaticKnobs {
+    /// Kernel-tree-relative driver source path.
+    pub gitpath: String,
+    /// Abstraction-layer paths counted separately.
+    pub abstractions: Vec<String>,
+    /// Absolute lower bound for mined commits ("" = unbounded).
+    pub since: String,
+    /// Version of the AST queries / mining logic.
+    pub ast_recipe: u32,
 }
 
 /// The exact bits measured, straight from the built artifacts.
@@ -237,17 +271,18 @@ mod tests {
             spec: "c:null_blk:null_blk.ko:/dev/nullb0:nr_devices=0:nullb/nullb0:power=1".to_owned(),
             prep: String::new(),
             host: "nixbox".to_owned(),
-            accel: "tcg".to_owned(),
-            smp: 4,
-            memory: "4G".to_owned(),
-            artifacts: ArtifactShas {
+            accel: Some("tcg".to_owned()),
+            smp: Some(4),
+            memory: Some("4G".to_owned()),
+            artifacts: Some(ArtifactShas {
                 kernel: "k".repeat(64),
                 initrd: "i".repeat(64),
                 module: "m".repeat(64),
                 kconfig: "c".repeat(64),
                 syzkaller: None,
                 syz_template: None,
-            },
+            }),
+            source: None,
             fio: Some(FioKnobs {
                 bs: vec!["4k".to_owned()],
                 rw: vec!["randread".to_owned()],
@@ -258,6 +293,7 @@ mod tests {
                 engine: "io_uring".to_owned(),
             }),
             fuzz: None,
+            static_: None,
         }
     }
 
@@ -269,7 +305,7 @@ mod tests {
         assert_eq!(hash, identity_hash(&base).unwrap(), "hash is deterministic");
 
         let mut kvm = identity();
-        kvm.accel = "kvm".to_owned();
+        kvm.accel = Some("kvm".to_owned());
         assert_ne!(hash, identity_hash(&kvm).unwrap(), "accel is identity");
 
         let mut knobs = identity();

@@ -6,6 +6,7 @@ pub mod fuzz;
 pub mod perf;
 pub mod results;
 pub mod setup;
+pub mod static_analysis;
 pub mod test;
 
 use std::process::ExitCode;
@@ -49,7 +50,7 @@ pub fn run(matches: &ArgMatches) -> ExitCode {
         "clean" => clean(&opts),
         "perf" => perf::perf(&opts, &logs),
         "fuzz" => fuzz::fuzz(&opts, &logs),
-        "static" => static_analysis(&opts),
+        "static" => static_analysis::static_phase(&opts, &logs),
         "screen" => screen(&opts),
         "compare" => compare(&opts),
         "debug" => debug(&opts),
@@ -105,10 +106,6 @@ pub(crate) fn driver_pairs<'c>(
         })
         .filter(|(_, _, c_name, _)| only.is_empty() || only.contains(c_name))
         .collect()
-}
-
-fn static_analysis(_opts: &Opts) -> ExitCode {
-    not_implemented("static")
 }
 
 fn screen(_opts: &Opts) -> ExitCode {

@@ -42,6 +42,10 @@ pub const ASSETS: &[Asset] = &[
         contents: include_str!("../assets/syzkaller/generic.cfg"),
     },
     Asset {
+        name: "static/classify.toml",
+        contents: include_str!("../assets/static/classify.toml"),
+    },
+    Asset {
         name: "virt/init",
         contents: include_str!("../assets/virt/init"),
     },
