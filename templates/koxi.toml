@@ -135,15 +135,37 @@ rev = "4f7b22a0cea479ab522e99815d78a4ad5784b1da"
 #
 # The pair below is a working example: replace it, or add yours
 # alongside it.
+# The two devices are configured identically, not left at their
+# defaults. null_blk defaults to softirq completion, 512-byte blocks,
+# 250 GiB and a hardware queue depth of 64; rnull to inline
+# completion, 4 KiB blocks, 4 GiB and a depth of 256. Left alone, the
+# performance gate compares two device configurations as much as two
+# implementations. Softirq completion (irqmode=1) is what real
+# hardware drivers take and both implement it; the rest is pinned to
+# rnull's fixed geometry. Attributes apply in order, power last.
 [block.drivers.null_blk]
 role = "c"
 ko = "null_blk.ko"
 ko-dir = "drivers/block/null_blk/"
 device = "/dev/nullb0"
 gitpath = "drivers/block/null_blk/"
+# The driver was a single file under drivers/block/ from 2013 until
+# the 2020 move into its own directory; git log on the directory alone
+# sees 139 of its 364 commits.
+history-paths = [
+  "drivers/block/null_blk.c",
+  "drivers/block/null_blk.h",
+  "drivers/block/null_blk_main.c",
+  "drivers/block/null_blk_zoned.c",
+  "drivers/block/null_blk_trace.c",
+  "drivers/block/null_blk_trace.h",
+]
 insmod = "nr_devices=0"
 configfs = "nullb/nullb0"
-configfs-params = "power=1"
+configfs-params = "blocksize=4096,size=4096,irqmode=1,hw_queue_depth=256,submit_queues=1,power=1"
+# The I/O scheduler is part of the data path too: left alone, null_blk
+# comes up with none and rnull with mq-deadline.
+prep = "echo none > /sys/block/nullb0/queue/scheduler"
 
 [block.drivers.rnull]
 role = "rs"
@@ -152,7 +174,8 @@ ko-dir = "drivers/block/rnull/"
 device = "/dev/rnullb0"
 gitpath = "drivers/block/rnull/"
 configfs = "rnull/rnullb0"
-configfs-params = "power=1"
+configfs-params = "blocksize=4096,size=4096,irqmode=1,power=1"
+prep = "echo none > /sys/block/rnullb0/queue/scheduler"
 pair = "null_blk"
 abstractions = ["rust/kernel/block.rs", "rust/kernel/block/"]
 

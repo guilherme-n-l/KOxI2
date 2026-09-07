@@ -142,6 +142,13 @@ pub struct Driver {
     /// body cannot hide unsafe pushed one layer down.
     #[serde(default)]
     pub abstractions: Vec<PathBuf>,
+    /// Paths the driver lived at before `gitpath`, so commit mining
+    /// sees its whole history. `git log -- <dir>` stops at a rename
+    /// or a move into a directory: null_blk was a single file under
+    /// drivers/block/ from 2013 until 2020, and mining only the
+    /// directory silently drops those seven years and 225 commits.
+    #[serde(default)]
+    pub history_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
