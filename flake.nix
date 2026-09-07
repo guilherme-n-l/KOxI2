@@ -140,6 +140,14 @@
             taplo
           ];
 
+          # Source-based coverage. rustc writes .profraw with
+          # `-C instrument-coverage`, and that format is version-tagged:
+          # only an llvm-profdata from the SAME LLVM as rustc can read
+          # it. rustc 1.97 is LLVM 21, so pin llvmPackages_21 rather
+          # than llvmPackages_latest, which drifts ahead of the
+          # toolchain and fails with "unsupported profile version".
+          coverageLlvm = pkgs.llvmPackages_21.llvm;
+
           # Git pre-commit hooks; also run repo-wide by `nix flake check`.
           pre-commit = git-hooks.lib.${system}.run {
             src = ./.;
@@ -254,6 +262,25 @@
             koxi = pkgs.mkShell {
               packages = extraPackages ++ [ koxi ];
               env = runtimeEnv;
+            };
+
+            # Coverage runs. Carries the full runtime toolchain, not
+            # just the crate's, because the numbers that matter come
+            # from driving the real pipeline (kernel build, qemu, fio)
+            # under an instrumented binary -- unit tests alone never
+            # reach the code that shells out. Usage:
+            #   nix develop .#coverage --command cargo llvm-cov --html
+            coverage = pkgs.mkShell {
+              inherit nativeBuildInputs buildInputs;
+              packages = extraPackages ++ [
+                pkgs.cargo-llvm-cov
+                coverageLlvm
+              ];
+              env = {
+                LLVM_COV = "${coverageLlvm}/bin/llvm-cov";
+                LLVM_PROFDATA = "${coverageLlvm}/bin/llvm-profdata";
+              }
+              // runtimeEnv;
             };
           };
 
