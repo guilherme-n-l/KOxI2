@@ -9,12 +9,12 @@
 //! Validated CWEs (manual_cwe) win over automatic ones, mirroring
 //! the static phase.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::block::cli::CompareOpts;
 use crate::util::{csv_text, round};
@@ -199,13 +199,28 @@ fn analyze_c_baseline(static_dir: &Path) -> CBaseline {
     let mut acsac_counts: BTreeMap<&'static str, u64> =
         ACSAC_CLASSES.iter().map(|class| (*class, 0)).collect();
     let mut classified_cwes: BTreeMap<String, u64> = BTreeMap::new();
+    // A CWE the taxonomy does not know falls to "unaffected", which is
+    // also a legitimate verdict -- so the two are indistinguishable in
+    // the counts. manual_cwe is hand-authored, so say something: a
+    // typo there quietly deflates the elimination rate.
+    let mut unknown: BTreeSet<&str> = BTreeSet::new();
     for commit in &commits {
         let cwe = effective_cwe(commit);
         if cwe.is_empty() {
             continue;
         }
+        if !ACSAC_TAXONOMY.iter().any(|(known, _)| *known == cwe) {
+            unknown.insert(cwe);
+        }
         *acsac_counts.get_mut(acsac_class(cwe)).unwrap() += 1;
         *classified_cwes.entry(cwe.to_string()).or_insert(0) += 1;
+    }
+    if !unknown.is_empty() {
+        warn!(
+            "{} CWE label(s) outside the ACSAC taxonomy counted as unaffected: {}",
+            unknown.len(),
+            unknown.into_iter().collect::<Vec<_>>().join(", ")
+        );
     }
 
     let implicit_unsafe_ops: u64 = densities
