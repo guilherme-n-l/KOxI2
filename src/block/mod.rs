@@ -13,7 +13,7 @@ pub mod test;
 use std::path::Path;
 use std::process::ExitCode;
 
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, bail, Context};
 use clap::ArgMatches;
 use tracing::{info, warn};
 
@@ -113,6 +113,37 @@ fn all(matches: &ArgMatches, globals: &Globals, logs: &Path) -> anyhow::Result<(
     compare::screen::drive(&run.scope, &compare_opts.screen).context("screen phase")?;
     phase("compare");
     compare::drive(&run.scope, &campaign, &compare_opts).context("compare phase")
+}
+
+/// Refuse to measure on artifacts the lock does not vouch for. The
+/// identity hashes the files it boots, so a swapped bzImage would
+/// mint a fresh baseline rather than pool, but nothing said that the
+/// lock -- the record a reader trusts -- no longer described the
+/// artifacts; a run on a tampered lock completed without a word.
+pub(crate) fn check_locked_artifacts(
+    lock: &crate::lock::Lock,
+    artifacts_dir: &Path,
+    names: &[&str],
+) -> anyhow::Result<()> {
+    for name in names {
+        let Some(locked) = lock.artifacts.get(*name) else {
+            bail!("{name} is not in koxi.lock; run `koxi block setup` first");
+        };
+        let path = artifacts_dir.join(name);
+        let actual = crate::util::sha256_file(&path)
+            .with_context(|| format!("hashing {}", path.display()))?;
+        if actual != *locked {
+            bail!(
+                "{} does not match koxi.lock ({} on disk, {} locked); the artifacts and the \
+                 lock disagree, so run `koxi block setup` (or --force-build) before measuring \
+                 on them",
+                path.display(),
+                &actual[..12],
+                &locked[..12]
+            );
+        }
+    }
+    Ok(())
 }
 
 /// A C driver to study, with its Rust counterpart when one is

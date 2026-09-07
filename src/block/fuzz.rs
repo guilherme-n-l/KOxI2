@@ -77,6 +77,11 @@ pub(crate) fn drive(
         lock.artifacts.get("fuzz/config").cloned().ok_or_else(|| {
             anyhow!("fuzz kernel config not locked — run `koxi block setup` first")
         })?;
+    super::check_locked_artifacts(
+        &lock,
+        &artifacts,
+        &["fuzz/bzImage", "fuzz/vmlinux", "initramfs.cpio.gz"],
+    )?;
 
     // syz-manager drives --fuzz-parallel guests at once, all of them
     // this size.

@@ -54,6 +54,7 @@ pub(crate) fn drive(
     let kconfig_sha = lock.artifacts.get("config").cloned().ok_or_else(|| {
         anyhow!("effective kernel config not locked — run `koxi block setup` first")
     })?;
+    super::check_locked_artifacts(&lock, &artifacts, &["bzImage", "initramfs.cpio.gz"])?;
 
     // One guest at a time: perf is sequential by design.
     super::check_host(profile, &vm.guest.memory, vm.guest.smp, 1)?;
