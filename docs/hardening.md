@@ -74,6 +74,9 @@ Each has a commit and a regression test.
 | 6   | A corrupt `screening.json` was read as an absent one                                | low-medium |
 | 7   | `--fio-reps 1` benchmarks the whole matrix and compares nothing                     | low-medium |
 | 8   | `koxi block test` carried a dead positional argument                                | low        |
+| 9   | `--toolchain llvm` produced the right make line but no kernel                       | high       |
+| 10  | `linux-meta` pulled 3.8 GB because the mirror ignores the clone filter              | medium     |
+| 11  | Screening's bottom surface band ignored the unsafe-operation census                 | low-medium |
 
 Number 2 is the one that mattered most. `make olddefconfig` drops a
 symbol whose dependencies stopped holding, says nothing, and exits 0:
@@ -89,6 +92,25 @@ which was never asserted, and the clean/perf flavor has no fragment at
 all. Registry modules are harvested as optional, so a missing
 `rnull_mod.ko` only warned, and the run failed two builds later with
 nothing pointing at the config.
+
+Number 9 took four attempts and is the clearest case of the pass paying for
+itself: `--toolchain llvm` emitted a correct `make ... LLVM=1` line and built
+nothing, because nixpkgs' clang wrapper injects `-nostdlibinc` and the kernel's
+`-Werror` makes clang's "unused argument" complaint fatal. Most of the tree is
+reachable through kbuild's five user-append variables; `arch/x86/realmode` and
+the EFI stub rebuild `KBUILD_CFLAGS` from scratch and are reachable through
+none of them, so they need a compiler that was never handed the flag. It now
+builds and boots:
+
+```
+Linux version 6.19.0 (clang version 21.1.7, LLD 21.1.7) #1 SMP PREEMPT_DYNAMIC
+brw-------  1 root  0  259, 0  /dev/rnullb0
+1048576 bytes (1.0MB) copied, 0.000367 seconds, 2.7GB/s
+```
+
+That is a clang-and-LLD kernel running the _Rust_ driver, which is the pairing
+most at risk: bindgen resolves libclang, and the kernel checks it against the C
+compiler, so the two are pinned to one package set.
 
 Number 1 is worth recording carefully because the obvious culprit was
 wrong. syzkaller's build died in Makefile parsing with `relocation
@@ -126,31 +148,19 @@ nixpkgs' cc-wrapper export `CC=clang`, which turned the _default gnu_
 build into clang driving GNU binutils — silently, which is the exact
 failure the toolchain selection exists to prevent.
 
-## Open, needing a decision
+## Open
 
-- **Screening's bottom band ignores the unsafe-operation census.** The
-  top two `static_surface` bands read lines _or_ unsafe operations; the
-  bottom band reads lines alone, so a driver whose function table came
-  back empty scores 0 despite a measured census — below a one-line
-  driver. Pinned by a test rather than changed, because these bands
-  reproduce v1's rubric and moving one re-rates every published
-  candidate.
-- **`git-meta` does not stay small.** `--filter=blob:none` is a request,
-  not a guarantee: git.kernel.org answers `warning: filtering not
-recognized by server, ignoring` and serves the full history — 3.8 GB
-  and roughly 40 minutes on first setup, against a code comment and a
-  `templates/koxi.toml` note that both promise otherwise.
-- **Upstream availability is a single point of failure.** busybox.net
-  was unreachable mid-run (TLS reset) and setup failed 44 minutes in.
-  Nothing was lost — the kernels were already cached and the re-run
-  resumed — but there is no mirror or fallback for any source.
-- **`driver_spec` colon-joins unescaped fields.** It is the identity
-  that content-addresses the results cache, so two registry entries
-  differing only in where a `:` falls would share a baseline directory
-  and pool their measurements. No real trigger known.
-- **`koxi metal reset` reboots without confirming**, while
-  `koxi metal boot` asks. Defensible — reset is the recovery path — but
-  undocumented.
+- **`driver_spec` colon-joins unescaped fields.** It is the identity that
+  content-addresses the results cache, so two registry entries differing only in
+  where a `:` falls would share a baseline directory and pool their
+  measurements. No real trigger known.
+- **`koxi metal reset` reboots without confirming**, while `koxi metal boot`
+  asks. Defensible -- reset is the recovery path -- but undocumented.
+- **Upstream availability is a single point of failure.** busybox.net was
+  unreachable mid-run (TLS reset) and setup failed 44 minutes in. Nothing was
+  lost, since the kernels were already cached and the re-run resumed, but no
+  source has a mirror or fallback. Moving `linux-meta` to a mirror that honours
+  the clone filter fixed the size problem, not this one.
 
 ## Backlog
 
@@ -171,16 +181,12 @@ or quietly pinned to 6.19:
 A methodology claiming to apply across driver classes should survive one
 kernel bump; if it does not, that belongs in the limitations.
 
-### A full LLVM-built kernel
+### A clang-built comparison
 
-The toolchain selection above is implemented and its _configure_ step is
-verified, but no clang kernel has been built end to end. What remains:
-
-- build both flavors under `--toolchain llvm` and boot them;
-- confirm rnull still builds — Rust-for-Linux and clang interact through
-  bindgen's libclang, which is why the dev shell pins clang and bindgen
-  to one package set;
-- if perf numbers move between the gcc and clang kernels, the toolchain
-  belongs in the _results_ identity, not only in the build fingerprint.
-  It is currently recorded as provenance, which does not prevent pooling
-  two toolchains' measurements in one baseline.
+The clang kernel now builds and boots, so what is left is the measurement, not
+the plumbing. If perf numbers move between the gcc and clang kernels, the
+toolchain belongs in the _results_ identity rather than only in the build
+fingerprint: today it is recorded as provenance in `artifacts/toolchain`, which
+documents a baseline but does not by itself stop two toolchains' measurements
+landing in one. In practice the artifact shas differ and separate them; the
+point is that nothing states the rule.
