@@ -143,6 +143,10 @@ pub(super) struct CampaignSummary {
     unique_crashes: u64,
     pub(super) counts: Counts,
     pub(super) quality: &'static str,
+    /// Hours syz-manager actually ran, read from the completion
+    /// marker. None for a campaign that died before writing one, or
+    /// for v1 data whose marker is empty.
+    pub(super) hours: Option<f64>,
 }
 
 impl CampaignSummary {
@@ -249,7 +253,17 @@ pub(super) fn classify_campaign(
         unique_crashes: groups.len() as u64,
         counts,
         quality,
+        hours: measured_hours(campaign_dir),
     })
+}
+
+/// The exposure a campaign actually bought, from the seconds its
+/// completion marker records. An empty marker (v1, and koxi before
+/// the marker carried a number) reads as unknown rather than zero.
+fn measured_hours(campaign_dir: &Path) -> Option<f64> {
+    let text = fs::read_to_string(campaign_dir.join(CAMPAIGN_DONE)).ok()?;
+    let seconds: f64 = text.trim().parse().ok()?;
+    (seconds > 0.0).then_some(seconds / 3600.0)
 }
 
 /// syzkaller's crashes/ dir: one bucket per unique crash, either a
@@ -556,7 +570,8 @@ pub fn compare_fuzz(
         "missing fuzz campaign data for one or both drivers"
     );
 
-    let (t_c, t_rs) = exposure_hours(p1_dir, manifest, c_campaigns.len(), rs_campaigns.len())?;
+    let (c_exposure, rs_exposure) = exposure_hours(p1_dir, manifest, &c_campaigns, &rs_campaigns)?;
+    let (t_c, t_rs) = (c_exposure.hours, rs_exposure.hours);
     let evidence = Evidence::gather(&c_campaigns, &rs_campaigns, alpha)?;
 
     let c_total: u64 = c_campaigns.iter().map(|c| c.counts.target).sum();
@@ -584,6 +599,14 @@ pub fn compare_fuzz(
         },
         "sample_size": {"c": c_campaigns.len(), "rs": rs_campaigns.len()},
         "exposure_hours": {"c": round(t_c, 3), "rs": round(t_rs, 3)},
+        // Whether the denominator is what the campaigns ran or what
+        // they were budgeted: a fallback means some campaign left no
+        // duration behind, so the rates below are upper-bounded.
+        "exposure_basis": if c_exposure.measured && rs_exposure.measured {
+            "measured"
+        } else {
+            "nominal_fallback"
+        },
         "metrics": evidence.metrics,
         "rate_ratio": rate_ratio,
         "verdict": verdict,
@@ -606,15 +629,47 @@ pub fn compare_fuzz(
 
 /// Exposure comes from the identity knobs (hours per campaign),
 /// scaled by the campaigns actually present on disk.
+/// One side's exposure: the hours its campaigns actually ran,
+/// falling back to the manifest's per-campaign budget for any
+/// campaign that did not record its own. A campaign killed partway
+/// through bought less exposure than its budget, and charging it the
+/// budget would divide the crash count by too many hours — which
+/// understates the rate, and on the Rust side flatters the gate.
+struct Exposure {
+    hours: f64,
+    /// True when every campaign contributed a measured duration.
+    measured: bool,
+}
+
+fn side_exposure(campaigns: &[CampaignSummary], nominal: f64) -> Exposure {
+    let mut exposure = Exposure {
+        hours: 0.0,
+        measured: true,
+    };
+    for campaign in campaigns {
+        if let Some(hours) = campaign.hours {
+            exposure.hours += hours;
+        } else {
+            warn!(
+                "campaign {} recorded no duration; charging the {nominal}h budget",
+                campaign.id
+            );
+            exposure.hours += nominal;
+            exposure.measured = false;
+        }
+    }
+    exposure
+}
+
 fn exposure_hours(
     p1_dir: &Path,
     manifest: &Manifest,
-    c_campaigns: usize,
-    rs_campaigns: usize,
-) -> anyhow::Result<(f64, f64)> {
+    c_campaigns: &[CampaignSummary],
+    rs_campaigns: &[CampaignSummary],
+) -> anyhow::Result<(Exposure, Exposure)> {
     let baseline = Manifest::load(p1_dir)?
         .with_context(|| format!("{} lost its manifest", p1_dir.display()))?;
-    let hours = |manifest: &Manifest, side: &str| -> anyhow::Result<f64> {
+    let nominal = |manifest: &Manifest, side: &str| -> anyhow::Result<f64> {
         manifest
             .identity
             .fuzz
@@ -623,8 +678,8 @@ fn exposure_hours(
             .with_context(|| format!("{side} manifest has no fuzz knobs in its identity"))
     };
     Ok((
-        hours(&baseline, "baseline")? * c_campaigns as f64,
-        hours(manifest, "campaign")? * rs_campaigns as f64,
+        side_exposure(c_campaigns, nominal(&baseline, "baseline")?),
+        side_exposure(rs_campaigns, nominal(manifest, "campaign")?),
     ))
 }
 
@@ -919,6 +974,9 @@ mod tests {
             stats["metrics"]["crash_attribution"]["c"]["counts"][TARGET],
             1
         );
+        // These markers are empty, so exposure falls back to the
+        // manifest budget and says so.
+        assert_eq!(stats["exposure_basis"], "nominal_fallback");
         // Every campaign here ran its budget, so a side that crashed
         // nothing is still measured evidence: zero is a result.
         assert_eq!(stats["data_quality"]["status"], "measured");
@@ -955,6 +1013,41 @@ mod tests {
         fs::remove_dir_all(&base).unwrap();
     }
 
+    #[test]
+    fn exposure_counts_hours_run_not_hours_budgeted() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, marker: &str| {
+            let campaign = dir.path().join(name);
+            fs::create_dir_all(&campaign).unwrap();
+            fs::write(campaign.join(CAMPAIGN_DONE), marker).unwrap();
+            campaign
+        };
+        // A campaign killed at six minutes of a one-hour budget.
+        assert_eq!(measured_hours(&write("short", "360.000\n")), Some(0.1));
+        // v1 and pre-marker koxi wrote an empty marker: unknown, not zero.
+        assert_eq!(measured_hours(&write("legacy", "")), None);
+        assert_eq!(measured_hours(&write("odd", "not a number")), None);
+        assert_eq!(measured_hours(&dir.path().join("absent")), None);
+
+        let campaign = |hours: Option<f64>| CampaignSummary {
+            id: "c".to_owned(),
+            unique_crashes: 0,
+            counts: Counts::default(),
+            quality: "measured",
+            hours,
+        };
+        // Two campaigns that ran six minutes each bought 0.2h, not
+        // the 2h their budget would have charged them.
+        let exposure = side_exposure(&[campaign(Some(0.1)), campaign(Some(0.1))], 1.0);
+        assert!((exposure.hours - 0.2).abs() < 1e-9);
+        assert!(exposure.measured);
+        // One campaign with no record falls back to its budget, and
+        // the whole side stops claiming a measured denominator.
+        let exposure = side_exposure(&[campaign(Some(0.1)), campaign(None)], 1.0);
+        assert!((exposure.hours - 1.1).abs() < 1e-9);
+        assert!(!exposure.measured);
+    }
+
     /// fuzz.csv is a v1 artifact shape: the header and the empty
     /// coverage/ttfc columns are read by downstream tooling.
     #[test]
@@ -968,6 +1061,7 @@ mod tests {
                 unknown,
             },
             quality: "measured",
+            hours: Some(1.0),
         };
         let csv = fuzz_csv(
             &[summary("campaign_01", 3, 1, 1, 1)],

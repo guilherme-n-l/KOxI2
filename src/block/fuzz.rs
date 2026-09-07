@@ -308,9 +308,13 @@ struct SharedCfg<'a> {
     knobs: &'a FuzzKnobs,
 }
 
-/// Written when a campaign has run its whole budget (v1
-/// `.campaign_done`). Its absence means the process died mid-campaign,
-/// which is what separates "found nothing" from "we do not know".
+/// Written when a campaign stops (v1 `.campaign_done`), holding the
+/// seconds syz-manager actually ran. Its absence means the process
+/// died mid-campaign, which is what separates "found nothing" from
+/// "we do not know"; its contents are the exposure the crash rate is
+/// divided by, which is not the budget whenever a campaign ends
+/// early. v1 markers were empty, so a missing number falls back to
+/// the manifest's nominal hours.
 pub const CAMPAIGN_DONE: &str = ".campaign_done";
 
 /// One driver's campaigns: the overlay initrd is staged once and
@@ -438,7 +442,8 @@ fn run_campaign(
         .process_group(0);
     let mut child = manager.spawn()?;
 
-    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(seconds);
     let exit = loop {
         if let Some(status) = child.try_wait()? {
             break Some(status);
@@ -468,9 +473,16 @@ fn run_campaign(
     }
     let _ = fs::remove_file(&image);
 
+    // The exposure this campaign actually bought. A manager that
+    // exits early buys less than its budget, and dividing crashes by
+    // the budget instead would understate the rate.
+    let elapsed = started.elapsed().as_secs_f64();
     let crashes = crash_buckets(workdir);
-    info!("campaign {index}: {crashes} distinct crash buckets");
-    fs::write(done, "")?;
+    info!(
+        "campaign {index}: {crashes} distinct crash buckets over {:.2}h",
+        elapsed / 3600.0
+    );
+    fs::write(done, format!("{elapsed:.3}\n"))?;
     Ok(())
 }
 
