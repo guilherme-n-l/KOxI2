@@ -155,6 +155,34 @@ manifest on the reference host said `host = "unknown"`, and the
 same-substrate guard could not have told two such machines apart.
 **Fixed:** the kernel's own record is read first.
 
+### 11. Two of the published Rust campaigns never ran, and one ran 9.5 hours
+
+The published dataset says ten 24-hour campaigns per driver. The
+syz-manager logs under `KOxI-Results/p2/null_blk::rnull/paper-v2-null_blk/fuzz/`
+say otherwise for the Rust side: campaigns 1 to 7 ran their 24 hours,
+campaign 8 ran from 23:56 on 17 May 2026 to 09:24 on 18 May and died,
+and campaigns 9 and 10 are one line each:
+
+```
+[FATAL] stat .../out/rootmnt/.ssh/nullb_id_rsa: permission denied
+```
+
+The harness lost read access to its own ssh key and the last three
+campaigns went with it. The C side ran all ten. So the published Rust
+exposure is about 177 hours, not 240, and v1's per-campaign vector
+(`[12, 0, 10, 12, 8, 13, 8, 9, 9, 0]`, in lexical order, so the zeros
+are campaigns 10 and 9) counted two campaigns that never started as two
+campaigns with no crashes. The rank test was computed on that vector.
+
+**Fixed in the instrument, disclosed for the paper.** v2 records the
+hours a campaign ran in its completion marker, a campaign that died
+before writing one is `unavailable` rather than a zero, and the rate
+ratio divides by measured hours. For the talk: the Rust side is seven
+full campaigns and part of an eighth, the exposure bound is 0.017
+crashes per hour (one per 59 hours) rather than 0.0125, and the limits
+slide says N = 10 planned. The reader's discrepancy 9 named campaigns
+2 and 10 from the vector; the logs name 8, 9 and 10.
+
 ## Disclosed
 
 These are stated in the README's "Known seams" and on the limits
@@ -211,12 +239,12 @@ slide. None is fixed in code.
 
 Under the instrument as it stands now, with the same data:
 
-| gate        | published (v1) | re-read under v2                                                   |
-| ----------- | -------------- | ------------------------------------------------------------------ |
-| safety      | fail, 18.2%    | fail, 18.2% with 95% CI 2.3% to 51.8% on n=11; window 2020 to 2026 |
-| fuzzing     | pass           | inconclusive: 1 event in 480 h bounds the ratio at 19, not 2       |
-| performance | fail, all 18   | fail; measured on unmatched device configurations                  |
-| overall     | fail           | fail ("performance and safety fail; fuzzing undecided")            |
+| gate        | published (v1) | re-read under v2                                                               |
+| ----------- | -------------- | ------------------------------------------------------------------------------ |
+| safety      | fail, 18.2%    | fail, 18.2% with 95% CI 2.3% to 51.8% on n=11; window 2020 to 2026             |
+| fuzzing     | pass           | inconclusive: 1 event in 417 h (240 C, 177 Rust) bounds the ratio at 19, not 2 |
+| performance | fail, all 18   | fail; measured on unmatched device configurations                              |
+| overall     | fail           | fail ("performance and safety fail; fuzzing undecided")                        |
 
 The verdict does not move. What moves is what the fuzzing gate is
 allowed to say, and what the performance number is a measurement of.
