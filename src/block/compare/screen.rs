@@ -401,4 +401,147 @@ mod tests {
             .unwrap()
             .is_none());
     }
+
+    /// Writes the two CSVs `static_surface` reads.
+    fn surface_dir(functions: &str, densities: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("functions.csv"), functions).unwrap();
+        fs::write(dir.path().join("unsafe_density.csv"), densities).unwrap();
+        dir
+    }
+
+    fn commits_dir(summary: &str, commits: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("commits_summary.csv"), summary).unwrap();
+        fs::write(dir.path().join("commits.csv"), commits).unwrap();
+        dir
+    }
+
+    /// The v1 screening bands. These numbers are the Phase-1 rubric:
+    /// moving one re-rates every candidate, so they are pinned here
+    /// rather than left to the next reader to infer.
+    #[test]
+    fn historical_risk_follows_the_v1_bands() {
+        let commits = "sha,subject,manual_cwe\nabc,fix,\n";
+        let band = |total: u32, safety: u32, pct: &str| -> u64 {
+            let summary = format!(
+                "metric,value\ntotal_commits,{total}\nsafety_related,{safety}\nsafety_pct,{pct}\n"
+            );
+            let dir = commits_dir(&summary, commits);
+            historical_risk(dir.path())["score"].as_u64().unwrap()
+        };
+        assert_eq!(band(100, 40, "40.0"), 3, "40% is the top band");
+        assert_eq!(
+            band(100, 25, "25.0"),
+            3,
+            "25 safety commits also reaches it"
+        );
+        assert_eq!(band(100, 20, "20.0"), 2, "20% is the middle band");
+        assert_eq!(band(100, 10, "10.0"), 2, "10 commits also reaches it");
+        assert_eq!(band(100, 1, "1.0"), 1, "any safety commit scores");
+        assert_eq!(band(100, 0, "0.0"), 0, "none does not");
+    }
+
+    #[test]
+    fn static_surface_follows_the_v1_bands() {
+        let ops = |n: u64| {
+            format!(
+                "language,ptr_derefs,alloc_calls,free_calls,memop_calls,cast_exprs\n\
+                 C,{n},0,0,0,0\n"
+            )
+        };
+        let lines = |n: u64| format!("name,line_count\nf,{n}\n");
+        let score = |f: &str, d: &str| {
+            let dir = surface_dir(f, d);
+            static_surface(dir.path())["score"].as_u64().unwrap()
+        };
+        assert_eq!(
+            score(&lines(2000), &ops(0)),
+            3,
+            "2000 lines is the top band"
+        );
+        assert_eq!(
+            score(&lines(0), &ops(500)),
+            3,
+            "500 unsafe ops also reaches it"
+        );
+        assert_eq!(
+            score(&lines(800), &ops(0)),
+            2,
+            "800 lines is the middle band"
+        );
+        assert_eq!(
+            score(&lines(0), &ops(150)),
+            2,
+            "150 unsafe ops also reaches it"
+        );
+        assert_eq!(score(&lines(1), &ops(0)), 1, "any measured line scores");
+        assert_eq!(score(&lines(0), &ops(0)), 0, "an empty surface does not");
+    }
+
+    /// KNOWN ASYMMETRY, pinned deliberately. The top two bands read
+    /// either lines *or* unsafe operations, but the bottom band keys on
+    /// lines alone. A driver whose function table came back empty while
+    /// its unsafe-operation census did not therefore scores 0 -- below
+    /// a one-line driver -- despite carrying 140 measured operations.
+    /// Left as-is because these bands reproduce v1's rubric and moving
+    /// one re-rates every published candidate; see the findings note.
+    #[test]
+    fn static_surface_bottom_band_ignores_unsafe_ops() {
+        let dir = surface_dir(
+            "name,line_count\n",
+            "language,ptr_derefs,alloc_calls,free_calls,memop_calls,cast_exprs\nC,140,0,0,0,0\n",
+        );
+        assert_eq!(
+            static_surface(dir.path())["score"].as_u64().unwrap(),
+            0,
+            "current v1-faithful behaviour: the bottom band sees lines only"
+        );
+    }
+
+    #[test]
+    fn tractability_needs_both_domains_and_ten_campaigns() {
+        assert_eq!(tractability(true, true, 10)["score"], 3);
+        assert_eq!(tractability(true, true, 9)["score"], 2);
+        assert_eq!(tractability(true, false, 0)["score"], 1);
+        assert_eq!(tractability(false, true, 99)["score"], 1);
+        assert!(tractability(false, false, 0)["score"].is_null());
+    }
+
+    /// Fewer than two scored dimensions is not a weak candidate, it is
+    /// no candidate assessment at all.
+    #[test]
+    fn rating_refuses_to_average_a_single_dimension() {
+        let one = json!({
+            "a": {"score": 3, "data_quality": "measured"},
+            "b": missing("nothing"),
+            "c": missing("nothing"),
+            "d": missing("nothing"),
+        });
+        assert_eq!(rate(&one).0, "inconclusive");
+        // Quality describes the dimensions that produced data, so a
+        // single measured dimension still reports "measured" even when
+        // the rating itself refuses to conclude.
+        assert_eq!(rate(&one).1, "measured");
+
+        let two = json!({
+            "a": {"score": 3, "data_quality": "measured"},
+            "b": {"score": 2, "data_quality": "inferred"},
+            "c": missing("nothing"),
+            "d": missing("nothing"),
+        });
+        assert_eq!(
+            rate(&two),
+            ("strong_candidate", "inferred"),
+            "2.5 rounds up"
+        );
+
+        let weak = json!({
+            "a": {"score": 1, "data_quality": "measured"},
+            "b": {"score": 1, "data_quality": "measured"},
+            "c": {"score": 2, "data_quality": "measured"},
+            "d": {"score": 2, "data_quality": "measured"},
+        });
+        assert_eq!(rate(&weak), ("moderate", "measured"));
+    }
 }
