@@ -6,54 +6,46 @@
 //! works straight off a phase-1 run without a compare pass first.
 //! Output: results/p1/<driver>/screening.json.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
 
+use anyhow::bail;
 use serde_json::json;
-use tracing::{error, info};
+use tracing::info;
 
 use super::fuzz::{classify_campaign, load_validated_crashes, Classifier};
 use super::safety::{get, number, read_csv};
 use super::verdict::worst_quality;
-use crate::block::cli::Opts;
+use crate::block::cli::{Scope, ScreenOpts};
 use crate::block::results::Manifest;
 use crate::config::{anchored, Project};
 
-pub fn screen(opts: &Opts) -> ExitCode {
-    match drive(opts) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            error!("koxi block screen: {err}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-pub(crate) fn drive(opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn drive(scope: &Scope, opts: &ScreenOpts) -> anyhow::Result<()> {
     let project = Project::locate()?;
-    let results_root = anchored(&project.root, &opts.output);
-    let pairs = crate::block::driver_pairs(&project.config, &opts.only);
+    let results_root = anchored(&project.root, &scope.output);
+    let pairs = crate::block::driver_pairs(&project.config, &scope.only);
     if pairs.is_empty() {
-        return Err("no matching driver pairs in the [block.drivers] registry".into());
+        bail!("no matching driver pairs in the [block.drivers] registry");
     }
     let overrides = match &opts.validated_crashes {
         Some(path) => load_validated_crashes(path)?,
-        None => Default::default(),
+        None => HashMap::new(),
     };
 
-    for (rs_name, _, c_name, _) in pairs {
+    for pair in pairs {
+        let c_name = pair.c_name;
         let driver_root = results_root.join("p1").join(c_name);
         let static_pick = latest_complete(&driver_root.join("static"))?;
         let fuzz_pick = latest_complete(&driver_root.join("fuzz"))?;
-        let classifier = Classifier::new(c_name, rs_name)?;
+        let classifier = Classifier::new(c_name, pair.rs_name)?;
 
         let historical = match &static_pick {
-            Some((dir, _)) => historical_risk(dir)?,
+            Some((dir, _)) => historical_risk(dir),
             None => missing("missing commit-history artifacts"),
         };
         let surface = match &static_pick {
-            Some((dir, _)) => static_surface(dir)?,
+            Some((dir, _)) => static_surface(dir),
             None => missing("missing static surface artifacts"),
         };
         let (dynamic, campaign_count) = match &fuzz_pick {
@@ -68,33 +60,7 @@ pub(crate) fn drive(opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
             "dynamic_robustness": dynamic,
             "tractability": tract,
         });
-        let scores: Vec<f64> = dimensions
-            .as_object()
-            .unwrap()
-            .values()
-            .filter_map(|dimension| dimension["score"].as_f64())
-            .collect();
-        let overall = if scores.len() < 2 {
-            "inconclusive"
-        } else {
-            let average = scores.iter().sum::<f64>() / scores.len() as f64;
-            if average >= 2.5 {
-                "strong_candidate"
-            } else if average >= 1.5 {
-                "moderate"
-            } else {
-                "weak"
-            }
-        };
-        let status = worst_quality(
-            dimensions
-                .as_object()
-                .unwrap()
-                .values()
-                .filter_map(|dimension| dimension["data_quality"].as_str())
-                .filter(|status| *status != "unavailable"),
-        )
-        .to_string();
+        let (overall, status) = rate(&dimensions);
 
         let result = json!({
             "driver": c_name,
@@ -118,16 +84,54 @@ fn missing(evidence: &str) -> serde_json::Value {
     json!({"score": null, "evidence": evidence, "data_quality": "unavailable"})
 }
 
+/// v1's screening rating: the mean of the scored dimensions, with
+/// fewer than two scores refusing to rate at all, and the worst
+/// data quality of the dimensions that produced any.
+fn rate(dimensions: &serde_json::Value) -> (&'static str, &str) {
+    let blocks = || {
+        dimensions
+            .as_object()
+            .expect("screening dimensions are an object")
+            .values()
+    };
+    let scores: Vec<f64> = blocks()
+        .filter_map(|dimension| dimension["score"].as_f64())
+        .collect();
+    let overall = if scores.len() < 2 {
+        "inconclusive"
+    } else {
+        let average = scores.iter().sum::<f64>() / scores.len() as f64;
+        if average >= 2.5 {
+            "strong_candidate"
+        } else if average >= 1.5 {
+            "moderate"
+        } else {
+            "weak"
+        }
+    };
+    let status = worst_quality(
+        blocks()
+            .filter_map(|dimension| dimension["data_quality"].as_str())
+            .filter(|status| *status != "unavailable"),
+    );
+    (overall, status)
+}
+
 /// Newest complete manifest under results/p1/<driver>/<domain>/.
-fn latest_complete(
-    domain_root: &Path,
-) -> Result<Option<(PathBuf, String)>, Box<dyn std::error::Error>> {
+fn latest_complete(domain_root: &Path) -> anyhow::Result<Option<(PathBuf, String)>> {
     if !domain_root.is_dir() {
         return Ok(None);
     }
+    // Sorted, so two baselines minted in the same second resolve by
+    // hash rather than by directory order: the pick is recorded in
+    // screening.json, and a run has to re-derive it.
+    let mut entries: Vec<PathBuf> = fs::read_dir(domain_root)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect();
+    entries.sort();
     let mut best: Option<(u64, PathBuf, String)> = None;
-    for entry in fs::read_dir(domain_root)?.filter_map(Result::ok) {
-        let path = entry.path();
+    for path in entries {
         if !path.is_dir() {
             continue;
         }
@@ -151,11 +155,11 @@ fn latest_complete(
     Ok(best.map(|(_, path, hash)| (path, hash)))
 }
 
-fn historical_risk(static_dir: &Path) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let commits = read_csv(&static_dir.join("commits.csv"))?;
-    let summary = read_csv(&static_dir.join("commits_summary.csv"))?;
+fn historical_risk(static_dir: &Path) -> serde_json::Value {
+    let commits = read_csv(&static_dir.join("commits.csv"));
+    let summary = read_csv(&static_dir.join("commits_summary.csv"));
     if commits.is_empty() && summary.is_empty() {
-        return Ok(missing("missing commit-history artifacts"));
+        return missing("missing commit-history artifacts");
     }
     let metric = |name: &str| -> f64 {
         summary
@@ -179,10 +183,8 @@ fn historical_risk(static_dir: &Path) -> Result<serde_json::Value, Box<dyn std::
         3
     } else if safety_pct >= 20.0 || safety_related >= 10 {
         2
-    } else if safety_related > 0 {
-        1
     } else {
-        0
+        u8::from(safety_related > 0)
     };
     let quality = if commits
         .iter()
@@ -192,21 +194,21 @@ fn historical_risk(static_dir: &Path) -> Result<serde_json::Value, Box<dyn std::
     } else {
         "inferred"
     };
-    Ok(json!({
+    json!({
         "score": score,
         "evidence": format!(
             "{safety_related}/{total_commits} safety-related commits \
              ({safety_pct:.1}% of observed history)"
         ),
         "data_quality": quality,
-    }))
+    })
 }
 
-fn static_surface(static_dir: &Path) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let functions = read_csv(&static_dir.join("functions.csv"))?;
-    let densities = read_csv(&static_dir.join("unsafe_density.csv"))?;
+fn static_surface(static_dir: &Path) -> serde_json::Value {
+    let functions = read_csv(&static_dir.join("functions.csv"));
+    let densities = read_csv(&static_dir.join("unsafe_density.csv"));
     if functions.is_empty() && densities.is_empty() {
-        return Ok(missing("missing static surface artifacts"));
+        return missing("missing static surface artifacts");
     }
     let total_lines: u64 = functions.iter().map(|row| number(row, "line_count")).sum();
     let unsafe_ops: u64 = densities
@@ -230,26 +232,24 @@ fn static_surface(static_dir: &Path) -> Result<serde_json::Value, Box<dyn std::e
         3
     } else if total_lines >= 800 || unsafe_ops >= 150 {
         2
-    } else if total_lines > 0 {
-        1
     } else {
-        0
+        u8::from(total_lines > 0)
     };
-    Ok(json!({
+    json!({
         "score": score,
         "evidence": format!(
             "{} functions, {total_lines} lines, {unsafe_ops} implicit unsafe operations",
             functions.len()
         ),
         "data_quality": "measured",
-    }))
+    })
 }
 
 fn dynamic_robustness(
     fuzz_dir: &Path,
     classifier: &Classifier,
-    overrides: &std::collections::HashMap<(String, String), super::fuzz::OverrideRow>,
-) -> Result<(serde_json::Value, usize), Box<dyn std::error::Error>> {
+    overrides: &HashMap<(String, String), super::fuzz::OverrideRow>,
+) -> anyhow::Result<(serde_json::Value, usize)> {
     let campaigns_dir = fuzz_dir.join("campaigns");
     if !campaigns_dir.is_dir() {
         return Ok((missing("missing fuzz campaign artifacts"), 0));
@@ -275,19 +275,14 @@ fn dynamic_robustness(
         3
     } else if unknown > 0 {
         2
-    } else if infra > 0 {
-        1
     } else {
-        0
+        u8::from(infra > 0)
     };
     let quality = if qualities.is_empty() {
         "unavailable"
-    } else if qualities
-        .iter()
-        .any(|quality| *quality == "manually_validated")
-    {
+    } else if qualities.contains(&"manually_validated") {
         "manually_validated"
-    } else if qualities.iter().any(|quality| *quality == "unavailable") {
+    } else if qualities.contains(&"unavailable") {
         "inferred"
     } else {
         "measured"
@@ -325,4 +320,80 @@ fn tractability(static_present: bool, fuzz_present: bool, campaigns: usize) -> s
         ),
         "data_quality": "measured",
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::results::Identity;
+
+    /// A minimal static-domain identity; only completeness and
+    /// `created` matter to the pick.
+    fn manifest(created: u64) -> Manifest {
+        Manifest {
+            complete: true,
+            created,
+            seed: 1,
+            koxi: "test".to_owned(),
+            identity: Identity {
+                domain: "static".to_owned(),
+                driver: "null_blk".to_owned(),
+                spec: "c:null_blk:null_blk.ko:/dev/nullb0:::".to_owned(),
+                prep: String::new(),
+                host: "test".to_owned(),
+                accel: None,
+                smp: None,
+                memory: None,
+                artifacts: None,
+                source: None,
+                fio: None,
+                fuzz: None,
+                static_: None,
+            },
+            p2: None,
+        }
+    }
+
+    #[test]
+    fn baseline_pick_is_deterministic_when_baselines_share_a_second() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain = dir.path().join("static");
+        // Two complete baselines minted in the same second: the pick
+        // is recorded in screening.json, so it must not depend on the
+        // order the filesystem hands the directories back.
+        for hash in ["ffff11112222", "0000aaaabbbb"] {
+            manifest(1_700_000_000).save(&domain.join(hash)).unwrap();
+        }
+        let picked = latest_complete(&domain).unwrap().unwrap().1;
+        assert_eq!(picked, "ffff11112222", "ties resolve by sorted name");
+        for _ in 0..8 {
+            assert_eq!(latest_complete(&domain).unwrap().unwrap().1, picked);
+        }
+    }
+
+    #[test]
+    fn newer_baselines_still_win_over_older_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain = dir.path().join("static");
+        manifest(10).save(&domain.join("ffff11112222")).unwrap();
+        manifest(20).save(&domain.join("0000aaaabbbb")).unwrap();
+        assert_eq!(
+            latest_complete(&domain).unwrap().unwrap().1,
+            "0000aaaabbbb",
+            "recency beats the tie-break"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_baseline_is_never_picked() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain = dir.path().join("static");
+        let mut partial = manifest(99);
+        partial.complete = false;
+        partial.save(&domain.join("ffff11112222")).unwrap();
+        assert!(latest_complete(&domain).unwrap().is_none());
+        assert!(latest_complete(&dir.path().join("absent"))
+            .unwrap()
+            .is_none());
+    }
 }

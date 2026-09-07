@@ -7,9 +7,10 @@
 
 use std::fs;
 use std::path::Path;
-use std::process::{Command, ExitCode};
+use std::process::Command;
 
-use crate::block::cli::Opts;
+use anyhow::bail;
+
 use crate::{cmd, fetch};
 
 /// Tools the kernel/userland build chain shells out to (Linux only).
@@ -29,12 +30,13 @@ const PHASE_TOOLS: &[&str] = &[
     "bindgen",
 ];
 
-pub fn test(opts: &Opts, logs: &Path) -> ExitCode {
+pub fn drive(cc: &str, logs: &Path) -> anyhow::Result<()> {
     let mut missing = false;
 
-    let mut require = |tool: &str| match fetch::find_tool(tool) {
-        Some(path) => println!("ok       {tool} ({})", path.display()),
-        None => {
+    let mut require = |tool: &str| {
+        if let Some(path) = fetch::find_tool(tool) {
+            println!("ok       {tool} ({})", path.display());
+        } else {
             missing = true;
             println!("MISSING  {tool} (required)");
         }
@@ -43,7 +45,7 @@ pub fn test(opts: &Opts, logs: &Path) -> ExitCode {
         require(tool);
     }
     if cfg!(target_os = "linux") {
-        require(&opts.cc);
+        require(cc);
         for tool in KERNEL_TOOLS {
             require(tool);
         }
@@ -57,7 +59,7 @@ pub fn test(opts: &Opts, logs: &Path) -> ExitCode {
     }
 
     if cfg!(target_os = "linux") && !missing {
-        match compile_checks(&opts.cc, logs) {
+        match compile_checks(cc, logs) {
             Ok(()) => {}
             Err(err) => {
                 missing = true;
@@ -67,13 +69,10 @@ pub fn test(opts: &Opts, logs: &Path) -> ExitCode {
     }
 
     if missing {
-        eprintln!(
-            "koxi block test: preflight failed; enter the dev shell (nix develop) or install/fix the toolchain"
-        );
-        return ExitCode::FAILURE;
+        bail!("preflight failed; enter the dev shell (nix develop) or install/fix the toolchain");
     }
     println!("preflight ok");
-    ExitCode::SUCCESS
+    Ok(())
 }
 
 /// Compile and run a hello-world (a binary that segfaults here means

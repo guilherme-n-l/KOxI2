@@ -13,19 +13,19 @@
 //! perf, the instrumented fuzz kernel for fuzzing — one base config
 //! asset plus a merged, asserted fragment.
 
-use std::fmt;
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread;
 
 use tracing::{debug, info, warn};
 
-use crate::assets;
+use crate::assets::{self, Loaded};
 use crate::cmd;
 use crate::fetch::{self, Ctx};
-use crate::lock::LockedSource;
+use crate::lock::{Lock, LockedSource};
+use crate::scratch::Scratch;
+use crate::util;
 
 /// Project-relative directory for build outputs. Artifacts are
 /// project-scoped (unlike sources) because they derive from
@@ -68,6 +68,12 @@ impl Flavor {
             Flavor::Clean => "",
             Flavor::Fuzz => "fuzz/",
         }
+    }
+
+    /// Lock artifact key for a harvested file: the flavor prefix
+    /// matches the artifacts/ layout (bzImage vs fuzz/bzImage).
+    fn key(self, file: &str) -> String {
+        format!("{}{file}", self.prefix())
     }
 
     /// Kconfig fragment asset merged onto the base config.
@@ -128,7 +134,7 @@ pub struct Options {
 #[derive(Clone)]
 pub struct Module {
     pub file: String,
-    pub tree_path: std::path::PathBuf,
+    pub tree_path: PathBuf,
     /// Required files fail the build when missing (explicit user
     /// requests like [build].extra-artifacts); optional ones warn —
     /// a registry driver may be built-in (=y) or absent from the
@@ -144,222 +150,255 @@ pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
         return Err(Error::NotLinux);
     }
 
-    let (arch, image_path) =
-        kbuild_arch(&opts.target).ok_or_else(|| Error::UnsupportedTarget(opts.target.clone()))?;
-    let build_key = match opts.flavor {
-        Flavor::Clean => format!("linux-{}", opts.target),
-        Flavor::Fuzz => format!("linux-{}-fuzz", opts.target),
-    };
-    // Lock artifact keys carry the flavor prefix, matching the
-    // artifacts/ layout (bzImage vs fuzz/bzImage).
-    let key = |file: &str| format!("{}{file}", opts.flavor.prefix());
-
-    let logs = ctx.logs;
-    let artifacts = ctx.root.join(ARTIFACTS_DIR);
-    let outdir = opts.flavor.dir(&artifacts);
-    let artifact = outdir.join(BZIMAGE);
-
-    let kconfig = assets::load_locked(ctx.root, ctx.config, "linux/config", ctx.lock)?;
-    let fragment = match opts.flavor.fragment() {
-        Some(name) => Some(assets::load_locked(ctx.root, ctx.config, name, ctx.lock)?),
-        None => None,
-    };
-    let (tarball, stem) = fetch::tarball_path(SOURCE, ctx)?;
-    let Some(LockedSource::Tarball {
-        sha256: source_sha, ..
-    }) = ctx.lock.sources.get(SOURCE)
-    else {
-        return Err(Error::NotFetched);
-    };
-    let toolchain = toolchain_id(&opts.cc, logs);
-    let expected = fingerprint(
-        source_sha,
-        &kconfig.sha256,
-        fragment.as_ref().map(|frag| frag.sha256.as_str()),
-        &toolchain,
-    );
-
-    let harvested_missing = |file: &str| !outdir.join(file).is_file();
-    // A required file (extra-artifact) that the lock has never seen
-    // busts the cache too — it only exists inside the build scratch,
-    // so a fresh request needs a fresh build.
-    let module_missing = |module: &Module| {
-        let known = ctx.lock.artifacts.contains_key(&key(&module.file));
-        (known && harvested_missing(&module.file))
-            || (module.required && (!known || harvested_missing(&module.file)))
-    };
-    if artifact.is_file()
-        && !opts.force
-        && !opts.menuconfig
-        && ctx.lock.builds.get(&build_key) == Some(&expected)
-        && !harvested_missing(EFFECTIVE_CONFIG)
-        && !opts.modules.iter().any(module_missing)
-    {
+    let inputs = Inputs::resolve(ctx, opts)?;
+    if inputs.cached(ctx, opts) {
         debug!(
             "{} kernel image cached at {}",
             opts.flavor.name(),
-            artifact.display()
+            inputs.artifact.display()
         );
-        return Ok(artifact);
+        return Ok(inputs.artifact);
     }
 
     // Pristine tree in a mktemp-style scratch dir: unique per build,
     // auto-deleted on success, kept on failure for debugging. Never
     // build in the shared source extraction.
-    let tmp_root = ctx.home.join("tmp");
-    fs::create_dir_all(&tmp_root)?;
-    let scratch = tempfile::Builder::new()
-        .prefix(&format!("{stem}-"))
-        .tempdir_in(&tmp_root)?;
-    let tree = scratch.path().join(&stem);
-
-    let result = (|| -> Result<(), Error> {
-        info!("extracting pristine {} for build", stem);
-        let mut tar = Command::new("tar");
-        tar.arg("-xf").arg(&tarball).arg("-C").arg(scratch.path());
-        cmd::status(tar, "tar-build", logs)?;
-        if !tree.is_dir() {
-            return Err(Error::UnexpectedLayout(tree.clone()));
-        }
-
-        fs::write(tree.join(".config"), kconfig.contents.as_bytes())?;
-
-        if let Some(fragment) = &fragment {
-            info!("merging the {} flavor fragment", opts.flavor.name());
-            fs::write(
-                tree.join("koxi.flavor.config"),
-                fragment.contents.as_bytes(),
-            )?;
-            let mut merge = Command::new("sh");
-            merge
-                .current_dir(&tree)
-                .arg("scripts/kconfig/merge_config.sh")
-                .arg("-m")
-                .arg(".config")
-                .arg("koxi.flavor.config");
-            cmd::status(merge, "kconfig-merge", logs)?;
-        }
-
-        if opts.menuconfig {
-            menuconfig(&tree, arch, &opts.cc)?;
-        }
-
-        info!("configuring kernel (olddefconfig)");
-        cmd::status(
-            make(&tree, arch, &opts.cc, &["olddefconfig"]),
-            "make-olddefconfig",
-            logs,
-        )?;
-
-        if let Some(fragment) = &fragment {
-            verify_fragment(
-                &fragment.contents,
-                &fs::read_to_string(tree.join(".config"))?,
-            )?;
-        }
-
-        if opts.menuconfig {
-            // Persist the tuned config as the project override so
-            // future runs use it (v1 copied it back into the repo).
-            let dest = assets::default_override_path(ctx.root, "linux/config");
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(tree.join(".config"), &dest)?;
-            info!("persisted menuconfig result to {}", dest.display());
-        }
-
+    let logs = ctx.logs;
+    Scratch::new(ctx.home, &format!("{}-", inputs.stem))?.run(|dir| {
+        let tree = fetch::extract_pristine(&inputs.tarball, dir, &inputs.stem, logs)?;
+        configure(ctx, opts, &inputs, &tree)?;
         if opts.skip_build {
             warn!("kernel build skipped (--skip-build); image may be stale or missing");
             return Ok(());
         }
+        compile(opts, &inputs, &tree, logs)?;
+        harvest(ctx, opts, &inputs, &tree)
+    })?;
 
-        let jobs = thread::available_parallelism().map_or(1, |n| n.get());
-        info!(
-            "building the {} kernel with {jobs} jobs (log: {})",
-            opts.flavor.name(),
-            logs.join("make-kernel.log").display()
-        );
-        cmd::status(
-            make(&tree, arch, &opts.cc, &["-j", &jobs.to_string()]),
-            "make-kernel",
-            logs,
-        )?;
+    info!("kernel image at {}", inputs.artifact.display());
+    Ok(inputs.artifact)
+}
 
-        let bzimage = tree.join(image_path);
-        if !bzimage.is_file() {
-            return Err(Error::MissingImage(bzimage));
-        }
-        fs::create_dir_all(&outdir)?;
-        fs::copy(&bzimage, &artifact)?;
-        ctx.lock
-            .artifacts
-            .insert(key(BZIMAGE), fetch::sha256(&artifact, logs)?);
+/// Everything a build derives from its inputs before touching a
+/// scratch tree: where the image lands, the locked config assets,
+/// and the fingerprint the lock must match to skip the build.
+struct Inputs {
+    arch: &'static str,
+    image_path: &'static str,
+    build_key: String,
+    outdir: PathBuf,
+    artifact: PathBuf,
+    kconfig: Loaded,
+    fragment: Option<Loaded>,
+    tarball: PathBuf,
+    stem: String,
+    toolchain: String,
+    expected: String,
+}
 
-        // The effective config is the audit trail for what the image
-        // actually contains (and syzkaller's input later).
-        let config_artifact = outdir.join(EFFECTIVE_CONFIG);
-        fs::copy(tree.join(".config"), &config_artifact)?;
-        ctx.lock.artifacts.insert(
-            key(EFFECTIVE_CONFIG),
-            fetch::sha256(&config_artifact, logs)?,
-        );
-
-        // Harvest the requested modules and lock their hashes; the
-        // scratch (and the .kos in it) is gone after this function.
-        for module in &opts.modules {
-            let built = tree.join(&module.tree_path);
-            if !built.is_file() {
-                if module.required {
-                    return Err(Error::MissingArtifact(module.tree_path.clone()));
-                }
-                warn!(
-                    "module {} not produced by this config (built-in or disabled); skipping",
-                    module.file
-                );
-                ctx.lock.artifacts.remove(&key(&module.file));
-                continue;
-            }
-            let dest = outdir.join(&module.file);
-            fs::copy(&built, &dest)?;
-            ctx.lock
-                .artifacts
-                .insert(key(&module.file), fetch::sha256(&dest, logs)?);
-            info!("harvested {}", dest.display());
-        }
-
-        // Re-hash the config assets actually used (menuconfig may
-        // have changed the base) so the recorded fingerprint matches
-        // the image.
-        let built_with = assets::load_locked(ctx.root, ctx.config, "linux/config", ctx.lock)?;
-        let built_frag = match opts.flavor.fragment() {
-            Some(name) => Some(assets::load_locked(ctx.root, ctx.config, name, ctx.lock)?),
-            None => None,
+impl Inputs {
+    fn resolve(ctx: &mut Ctx, opts: &Options) -> Result<Self, Error> {
+        let (arch, image_path) = kbuild_arch(&opts.target)
+            .ok_or_else(|| Error::UnsupportedTarget(opts.target.clone()))?;
+        let build_key = match opts.flavor {
+            Flavor::Clean => format!("linux-{}", opts.target),
+            Flavor::Fuzz => format!("linux-{}-fuzz", opts.target),
         };
-        let source_sha = match ctx.lock.sources.get(SOURCE) {
-            Some(LockedSource::Tarball { sha256, .. }) => sha256.clone(),
-            _ => return Err(Error::NotFetched),
-        };
-        ctx.lock.builds.insert(
+        let outdir = opts.flavor.dir(&ctx.root.join(ARTIFACTS_DIR));
+        let artifact = outdir.join(BZIMAGE);
+
+        let (kconfig, fragment) = load_configs(ctx, opts.flavor)?;
+        let (tarball, stem) = fetch::tarball_path(SOURCE, ctx)?;
+        let toolchain = toolchain_id(&opts.cc);
+        let expected = fingerprint(
+            &locked_source_sha(ctx.lock)?,
+            &kconfig.sha256,
+            fragment.as_ref().map(|frag| frag.sha256.as_str()),
+            &toolchain,
+        );
+        Ok(Self {
+            arch,
+            image_path,
             build_key,
-            fingerprint(
-                &source_sha,
-                &built_with.sha256,
-                built_frag.as_ref().map(|frag| frag.sha256.as_str()),
-                &toolchain,
-            ),
-        );
-        Ok(())
-    })();
-
-    if let Err(err) = result {
-        let kept = scratch.keep();
-        warn!("build scratch kept for debugging at {}", kept.display());
-        return Err(err);
+            outdir,
+            artifact,
+            kconfig,
+            fragment,
+            tarball,
+            stem,
+            toolchain,
+            expected,
+        })
     }
 
-    info!("kernel image at {}", artifact.display());
-    Ok(artifact)
+    /// Whether the lock and artifacts/ already hold this exact build.
+    fn cached(&self, ctx: &Ctx, opts: &Options) -> bool {
+        let harvested_missing = |file: &str| !self.outdir.join(file).is_file();
+        // A required file (extra-artifact) that the lock has never seen
+        // busts the cache too — it only exists inside the build scratch,
+        // so a fresh request needs a fresh build.
+        let module_missing = |module: &Module| {
+            let known = ctx
+                .lock
+                .artifacts
+                .contains_key(&opts.flavor.key(&module.file));
+            (known && harvested_missing(&module.file))
+                || (module.required && (!known || harvested_missing(&module.file)))
+        };
+        self.artifact.is_file()
+            && !opts.force
+            && !opts.menuconfig
+            && ctx.lock.builds.get(&self.build_key) == Some(&self.expected)
+            && !harvested_missing(EFFECTIVE_CONFIG)
+            && !opts.modules.iter().any(module_missing)
+    }
+}
+
+/// The base config asset and the flavor's fragment, both locked.
+fn load_configs(ctx: &mut Ctx, flavor: Flavor) -> Result<(Loaded, Option<Loaded>), Error> {
+    let kconfig = assets::load_locked(ctx.root, ctx.config, "linux/config", ctx.lock)?;
+    let fragment = flavor
+        .fragment()
+        .map(|name| assets::load_locked(ctx.root, ctx.config, name, ctx.lock))
+        .transpose()?;
+    Ok((kconfig, fragment))
+}
+
+fn locked_source_sha(lock: &Lock) -> Result<String, Error> {
+    match lock.sources.get(SOURCE) {
+        Some(LockedSource::Tarball { sha256, .. }) => Ok(sha256.clone()),
+        _ => Err(Error::NotFetched),
+    }
+}
+
+/// Apply the base config (+ the merged flavor fragment), run
+/// menuconfig on request, settle with olddefconfig, and assert the
+/// fragment survived. A menuconfig result persists as the project
+/// override.
+fn configure(ctx: &Ctx, opts: &Options, inputs: &Inputs, tree: &Path) -> Result<(), Error> {
+    let logs = ctx.logs;
+    fs::write(tree.join(".config"), inputs.kconfig.contents.as_bytes())?;
+
+    if let Some(fragment) = &inputs.fragment {
+        info!("merging the {} flavor fragment", opts.flavor.name());
+        fs::write(
+            tree.join("koxi.flavor.config"),
+            fragment.contents.as_bytes(),
+        )?;
+        let mut merge = Command::new("sh");
+        merge
+            .current_dir(tree)
+            .arg("scripts/kconfig/merge_config.sh")
+            .arg("-m")
+            .arg(".config")
+            .arg("koxi.flavor.config");
+        cmd::status(merge, "kconfig-merge", logs)?;
+    }
+
+    if opts.menuconfig {
+        menuconfig(tree, inputs.arch, &opts.cc)?;
+    }
+
+    info!("configuring kernel (olddefconfig)");
+    cmd::status(
+        make(tree, inputs.arch, &opts.cc, &["olddefconfig"]),
+        "make-olddefconfig",
+        logs,
+    )?;
+
+    if let Some(fragment) = &inputs.fragment {
+        verify_fragment(
+            &fragment.contents,
+            &fs::read_to_string(tree.join(".config"))?,
+        )?;
+    }
+
+    if opts.menuconfig {
+        // Persist the tuned config as the project override so
+        // future runs use it (v1 copied it back into the repo).
+        let dest = assets::default_override_path(ctx.root, "linux/config");
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(tree.join(".config"), &dest)?;
+        info!("persisted menuconfig result to {}", dest.display());
+    }
+    Ok(())
+}
+
+fn compile(opts: &Options, inputs: &Inputs, tree: &Path, logs: &Path) -> Result<(), Error> {
+    let jobs = util::jobs();
+    info!(
+        "building the {} kernel with {jobs} jobs (log: {})",
+        opts.flavor.name(),
+        logs.join("make-kernel.log").display()
+    );
+    Ok(cmd::status(
+        make(tree, inputs.arch, &opts.cc, &["-j", &jobs.to_string()]),
+        "make-kernel",
+        logs,
+    )?)
+}
+
+/// Copy the image, the effective config, and the requested modules
+/// into artifacts/, locking their hashes and the build fingerprint.
+fn harvest(ctx: &mut Ctx, opts: &Options, inputs: &Inputs, tree: &Path) -> Result<(), Error> {
+    let key = |file: &str| opts.flavor.key(file);
+    let bzimage = tree.join(inputs.image_path);
+    if !bzimage.is_file() {
+        return Err(Error::MissingImage(bzimage));
+    }
+    fs::create_dir_all(&inputs.outdir)?;
+    fs::copy(&bzimage, &inputs.artifact)?;
+    ctx.lock
+        .artifacts
+        .insert(key(BZIMAGE), util::sha256_file(&inputs.artifact)?);
+
+    // The effective config is the audit trail for what the image
+    // actually contains (and syzkaller's input later).
+    let config_artifact = inputs.outdir.join(EFFECTIVE_CONFIG);
+    fs::copy(tree.join(".config"), &config_artifact)?;
+    ctx.lock
+        .artifacts
+        .insert(key(EFFECTIVE_CONFIG), util::sha256_file(&config_artifact)?);
+
+    // Harvest the requested modules and lock their hashes; the
+    // scratch (and the .kos in it) is gone after this function.
+    for module in &opts.modules {
+        let built = tree.join(&module.tree_path);
+        if !built.is_file() {
+            if module.required {
+                return Err(Error::MissingArtifact(module.tree_path.clone()));
+            }
+            warn!(
+                "module {} not produced by this config (built-in or disabled); skipping",
+                module.file
+            );
+            ctx.lock.artifacts.remove(&key(&module.file));
+            continue;
+        }
+        let dest = inputs.outdir.join(&module.file);
+        fs::copy(&built, &dest)?;
+        ctx.lock
+            .artifacts
+            .insert(key(&module.file), util::sha256_file(&dest)?);
+        info!("harvested {}", dest.display());
+    }
+
+    // Re-hash the config assets actually used (menuconfig may
+    // have changed the base) so the recorded fingerprint matches
+    // the image.
+    let (built_with, built_frag) = load_configs(ctx, opts.flavor)?;
+    ctx.lock.builds.insert(
+        inputs.build_key.clone(),
+        fingerprint(
+            &locked_source_sha(ctx.lock)?,
+            &built_with.sha256,
+            built_frag.as_ref().map(|frag| frag.sha256.as_str()),
+            &inputs.toolchain,
+        ),
+    );
+    Ok(())
 }
 
 /// Everything that determines the image bytes: recipe version,
@@ -405,18 +444,11 @@ fn verify_fragment(fragment: &str, config: &str) -> Result<(), Error> {
 
 /// Compiler identity (the configured CC + rustc when present); a
 /// toolchain bump must rebuild even with identical source and config.
-fn toolchain_id(cc: &str, logs: &Path) -> String {
-    let probe = |program: &str, label: &'static str| {
-        let mut cmd = Command::new(program);
-        cmd.arg("--version");
-        crate::cmd::stdout(cmd, label, logs)
-            .map(|out| out.lines().next().unwrap_or_default().to_owned())
-            .unwrap_or_else(|_| "none".to_owned())
-    };
+fn toolchain_id(cc: &str) -> String {
     format!(
         "{}|{}",
-        probe(cc, "cc-version"),
-        probe("rustc", "rustc-version")
+        util::probe_version(cc, &["--version"], "none"),
+        util::probe_version("rustc", &["--version"], "none")
     )
 }
 
@@ -440,105 +472,44 @@ fn menuconfig(tree: &Path, arch: &str, cc: &str) -> Result<(), Error> {
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .status()
-        .map_err(Error::Io)?;
+        .status()?;
     if !status.success() {
         return Err(Error::Menuconfig(status));
     }
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("the kernel build requires a Linux host")]
     NotLinux,
+    #[error("the linux source is not locked yet (fetch step missing)")]
     NotFetched,
+    #[error("unsupported build target {0} (supported: x86_64)")]
     UnsupportedTarget(String),
-    UnexpectedLayout(PathBuf),
+    #[error("kernel build finished without producing {}", .0.display())]
     MissingImage(PathBuf),
+    #[error("requested extra artifact {} was not produced by the build", .0.display())]
     MissingArtifact(PathBuf),
+    #[error(
+        "flavor fragment directives vetoed by kconfig (missing dependency? see the \
+         kconfig-merge log): {}",
+        .0.join(", ")
+    )]
     FragmentDropped(Vec<String>),
+    #[error("--menuconfig needs an interactive terminal")]
     MenuconfigNeedsTty,
+    #[error("menuconfig failed: {0}")]
     Menuconfig(std::process::ExitStatus),
-    Io(std::io::Error),
-    Asset(assets::Error),
-    Fetch(fetch::Error),
-    Cmd(cmd::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Asset(#[from] assets::Error),
+    #[error(transparent)]
+    Fetch(#[from] fetch::Error),
+    #[error(transparent)]
+    Cmd(#[from] cmd::Error),
 }
-
-impl From<std::io::Error> for Error {
-    fn from(err: std::io::Error) -> Self {
-        Error::Io(err)
-    }
-}
-
-impl From<assets::Error> for Error {
-    fn from(err: assets::Error) -> Self {
-        Error::Asset(err)
-    }
-}
-
-impl From<fetch::Error> for Error {
-    fn from(err: fetch::Error) -> Self {
-        Error::Fetch(err)
-    }
-}
-
-impl From<cmd::Error> for Error {
-    fn from(err: cmd::Error) -> Self {
-        Error::Cmd(err)
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::NotLinux => write!(f, "the kernel build requires a Linux host"),
-            Error::UnsupportedTarget(target) => {
-                write!(f, "unsupported build target {target} (supported: x86_64)")
-            }
-            Error::NotFetched => {
-                write!(f, "the linux source is not locked yet (fetch step missing)")
-            }
-            Error::UnexpectedLayout(tree) => write!(
-                f,
-                "extracting the kernel tarball did not produce {}",
-                tree.display()
-            ),
-            Error::MissingArtifact(path) => {
-                write!(
-                    f,
-                    "requested extra artifact {} was not produced by the build",
-                    path.display()
-                )
-            }
-            Error::MissingImage(path) => {
-                write!(
-                    f,
-                    "kernel build finished without producing {}",
-                    path.display()
-                )
-            }
-            Error::FragmentDropped(lines) => {
-                write!(
-                    f,
-                    "flavor fragment directives vetoed by kconfig (missing \
-                     dependency? see the kconfig-merge log): {}",
-                    lines.join(", ")
-                )
-            }
-            Error::MenuconfigNeedsTty => {
-                write!(f, "--menuconfig needs an interactive terminal")
-            }
-            Error::Menuconfig(status) => write!(f, "menuconfig failed: {status}"),
-            Error::Io(err) => write!(f, "{err}"),
-            Error::Asset(err) => write!(f, "{err}"),
-            Error::Fetch(err) => write!(f, "{err}"),
-            Error::Cmd(err) => write!(f, "{err}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {

@@ -9,173 +9,222 @@
 
 use std::fs;
 use std::path::Path;
-use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use tracing::{error, info, warn};
+use anyhow::{anyhow, bail};
+use tracing::{info, warn};
 
-use crate::block::cli::Opts;
+use crate::block::cli::{FioOpts, Profile, RunOpts};
 use crate::block::results::{self, ArtifactShas, Campaign, FioKnobs, Identity, Manifest};
+use crate::block::DriverPair;
+use crate::cli::VmOpts;
 use crate::config::{anchored, Driver, Project};
-use crate::fetch;
+use crate::home;
+use crate::host;
 use crate::kernel::build::ARTIFACTS_DIR;
 use crate::lock::{Lock, LOCK_PATH};
+use crate::scratch::Scratch;
+use crate::util;
 use crate::virt::runner::{self, Vm};
 
-pub fn perf(opts: &Opts, logs: &Path) -> ExitCode {
-    match drive(opts, logs) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            error!("koxi block perf: {err}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-pub(crate) fn drive(opts: &Opts, logs: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    if opts.p1 {
+pub(crate) fn drive(
+    run: &RunOpts,
+    profile: Profile,
+    vm: &VmOpts,
+    fio: &FioOpts,
+    yes: bool,
+    logs: &Path,
+) -> anyhow::Result<()> {
+    if run.p1 {
         info!("phase 1 only: perf is a phase-2 gate; skipping");
         return Ok(());
     }
 
     let project = Project::locate()?;
     let artifacts = project.root.join(ARTIFACTS_DIR);
-    let kernel = anchored(&project.root, &opts.kernel);
-    let initrd = anchored(&project.root, &opts.initrd);
+    let kernel = anchored(&project.root, &vm.kernel);
+    let initrd = anchored(&project.root, &vm.guest.initrd);
     for input in [&kernel, &initrd] {
         if !input.is_file() {
-            return Err(
-                format!("{} missing — run `koxi block setup` first", input.display()).into(),
-            );
+            bail!("{} missing — run `koxi block setup` first", input.display());
         }
     }
     let lock = Lock::load(&project.root.join(LOCK_PATH))?
-        .ok_or("no koxi.lock — run `koxi block setup` first")?;
-    let kconfig_sha = lock
-        .artifacts
-        .get("config")
-        .cloned()
-        .ok_or("effective kernel config not locked — run `koxi block setup` first")?;
+        .ok_or_else(|| anyhow!("no koxi.lock — run `koxi block setup` first"))?;
+    let kconfig_sha = lock.artifacts.get("config").cloned().ok_or_else(|| {
+        anyhow!("effective kernel config not locked — run `koxi block setup` first")
+    })?;
 
-    let results_root = anchored(&project.root, &opts.output);
-    let host = runner::hostname();
-    let accel = runner::accel();
-    if accel == "tcg" {
-        warn!("no KVM on this host — TCG numbers are smoke-only, never thesis data");
-    }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
-    let seed = opts.seed.unwrap_or(now);
-    let campaign = opts.campaign.clone().unwrap_or_else(|| now.to_string());
+    // One guest at a time: perf is sequential by design.
+    super::check_host(profile, &vm.guest.memory, vm.guest.smp, 1)?;
 
-    // Shared across every driver of this run.
-    let kernel_sha = fetch::sha256(&kernel, logs)?;
-    let initrd_sha = fetch::sha256(&initrd, logs)?;
-    let fio = FioKnobs {
-        bs: opts.fio_bs.clone(),
-        rw: opts.fio_rw.clone(),
-        qd: opts.fio_qd.clone(),
-        size: opts.fio_sz.clone(),
-        reps: opts.fio_reps,
-        runtime: opts.fio_runtime,
-        engine: opts.fio_engine.clone(),
+    let knobs = FioKnobs {
+        bs: fio.bs.clone(),
+        rw: fio.rw.clone(),
+        qd: fio.qd.clone(),
+        size: fio.sz.clone(),
+        reps: fio.reps,
+        runtime: fio.runtime,
+        engine: fio.engine.clone(),
     };
-    if fio.bs.is_empty() || fio.rw.is_empty() || fio.qd.is_empty() || fio.size.is_empty() {
-        return Err("empty fio matrix (check --fio-bs/--fio-rw/--fio-qd/--fio-sz)".into());
+    if knobs.bs.is_empty() || knobs.rw.is_empty() || knobs.qd.is_empty() || knobs.size.is_empty() {
+        bail!("empty fio matrix (check --fio-bs/--fio-rw/--fio-qd/--fio-sz)");
     }
-    let identity = |name: &str, driver: &Driver| -> Result<Identity, Box<dyn std::error::Error>> {
-        Ok(Identity {
-            domain: "perf".to_owned(),
-            driver: name.to_owned(),
-            spec: runner::driver_spec(name, driver),
-            prep: driver.prep.clone().unwrap_or_default(),
-            host: host.clone(),
-            accel: Some(accel.to_owned()),
-            smp: Some(opts.smp),
-            memory: Some(opts.memory.clone()),
-            artifacts: Some(ArtifactShas {
-                kernel: kernel_sha.clone(),
-                initrd: initrd_sha.clone(),
-                module: fetch::sha256(&artifacts.join(&driver.ko), logs)?,
-                kconfig: kconfig_sha.clone(),
-                syzkaller: None,
-                syz_template: None,
-            }),
-            source: None,
-            fio: Some(fio.clone()),
-            fuzz: None,
-            static_: None,
-        })
-    };
-
-    let pairs = super::driver_pairs(&project.config, &opts.only);
+    let pairs = super::driver_pairs(&project.config, &run.scope.only);
     if pairs.is_empty() {
-        return Err("no matching driver pairs in the [block.drivers] registry".into());
+        bail!("no matching driver pairs in the [block.drivers] registry");
     }
 
+    let now = util::unix_now();
+    let plan = Plan {
+        results_root: anchored(&project.root, &run.scope.output),
+        campaign: run.campaign(now),
+        now,
+        seed: fio.seed.unwrap_or(now),
+        force_p1: run.force_p1,
+        yes,
+    };
+    let ids = Ids {
+        host: runner::hostname(),
+        accel: host::accel(),
+        kernel_sha: util::sha256_file(&kernel)?,
+        initrd_sha: util::sha256_file(&initrd)?,
+        kconfig_sha,
+        module_dir: &artifacts,
+        smp: vm.guest.smp,
+        memory: &vm.guest.memory,
+        fio: knobs,
+    };
     let ctx = MatrixCtx {
         project: &project,
-        opts,
+        vm,
         logs,
         kernel: &kernel,
         initrd: &initrd,
         module_dir: &artifacts,
     };
 
-    for (rs_name, rs_driver, c_name, c_driver) in pairs {
-        // p1: the C baseline, content-addressed and cached.
-        let c_identity = identity(c_name, c_driver)?;
-        let c_hash = results::identity_hash(&c_identity)?;
-        let p1_dir = results::p1_dir(&results_root, c_name, "perf", &c_hash);
-        if !(opts.force_p1 || opts.force_build) && Manifest::is_complete(&p1_dir) {
-            info!(
-                "p1 perf cached for {c_name} at {} (--force-p1 re-runs)",
-                p1_dir.display()
-            );
-        } else {
-            info!("p1 perf: {c_name} -> {}", p1_dir.display());
-            let manifest = Manifest {
-                complete: false,
-                created: now,
-                seed,
-                koxi: env!("CARGO_PKG_VERSION").to_owned(),
-                identity: c_identity,
-                p2: None,
-            };
-            run_matrix(&ctx, c_name, c_driver, &p1_dir, manifest)?;
-        }
-
-        // p2: the Rust driver under a named campaign, baseline
-        // recorded by hash (no symlinks — results must survive rsync).
-        let rs_identity = identity(rs_name, rs_driver)?;
-        let p2_dir = results::p2_dir(&results_root, c_name, rs_name, &campaign, "perf");
-        let manifest = Manifest {
-            complete: false,
-            created: now,
-            seed,
-            koxi: env!("CARGO_PKG_VERSION").to_owned(),
-            identity: rs_identity,
-            p2: Some(Campaign {
-                campaign: campaign.clone(),
-                c_driver: c_name.clone(),
-                rs_driver: rs_name.clone(),
-                baseline: c_hash,
-            }),
-        };
-        if !results::clear_for_campaign(&p2_dir, &manifest, opts.yes)? {
-            info!("p2 perf skipped for {c_name}::{rs_name}");
-            continue;
-        }
-        info!("p2 perf: {c_name}::{rs_name} -> {}", p2_dir.display());
-        run_matrix(&ctx, rs_name, rs_driver, &p2_dir, manifest)?;
+    for pair in pairs {
+        measure_pair(&ctx, &ids, &plan, &pair)?;
     }
     Ok(())
 }
 
+/// What makes this run's numbers comparable: the substrate tags and
+/// the artifact hashes every driver of the run shares.
+struct Ids<'a> {
+    host: String,
+    accel: &'static str,
+    kernel_sha: String,
+    initrd_sha: String,
+    kconfig_sha: String,
+    module_dir: &'a Path,
+    smp: u32,
+    memory: &'a str,
+    fio: FioKnobs,
+}
+
+impl Ids<'_> {
+    fn identity(&self, name: &str, driver: &Driver) -> anyhow::Result<Identity> {
+        Ok(Identity {
+            domain: "perf".to_owned(),
+            driver: name.to_owned(),
+            spec: runner::driver_spec(name, driver),
+            prep: driver.prep.clone().unwrap_or_default(),
+            host: self.host.clone(),
+            accel: Some(self.accel.to_owned()),
+            smp: Some(self.smp),
+            memory: Some(self.memory.to_owned()),
+            artifacts: Some(ArtifactShas {
+                kernel: self.kernel_sha.clone(),
+                initrd: self.initrd_sha.clone(),
+                module: util::sha256_file(&self.module_dir.join(&driver.ko))?,
+                kconfig: self.kconfig_sha.clone(),
+                syzkaller: None,
+                syz_template: None,
+            }),
+            source: None,
+            fio: Some(self.fio.clone()),
+            fuzz: None,
+            static_: None,
+        })
+    }
+}
+
+/// Where this run writes and under what name.
+struct Plan {
+    results_root: std::path::PathBuf,
+    campaign: String,
+    now: u64,
+    seed: u64,
+    force_p1: bool,
+    yes: bool,
+}
+
+/// One pair: the cached C baseline, then the Rust driver under the
+/// named campaign, its baseline recorded by hash (no symlinks —
+/// results must survive rsync).
+fn measure_pair(ctx: &MatrixCtx, ids: &Ids, plan: &Plan, pair: &DriverPair) -> anyhow::Result<()> {
+    let manifest = |identity: Identity, p2: Option<Campaign>| Manifest {
+        complete: false,
+        created: plan.now,
+        seed: plan.seed,
+        koxi: env!("CARGO_PKG_VERSION").to_owned(),
+        identity,
+        p2,
+    };
+
+    let c_identity = ids.identity(pair.c_name, pair.c)?;
+    let c_hash = results::identity_hash(&c_identity)?;
+    let p1_dir = results::p1_dir(&plan.results_root, pair.c_name, "perf", &c_hash);
+    if !plan.force_p1 && Manifest::is_complete(&p1_dir) {
+        info!(
+            "p1 perf cached for {} at {} (--force-p1 re-runs)",
+            pair.c_name,
+            p1_dir.display()
+        );
+    } else {
+        info!("p1 perf: {} -> {}", pair.c_name, p1_dir.display());
+        run_matrix(
+            ctx,
+            pair.c_name,
+            pair.c,
+            &p1_dir,
+            manifest(c_identity, None),
+        )?;
+    }
+
+    let p2_dir = results::p2_dir(
+        &plan.results_root,
+        pair.c_name,
+        pair.rs_name,
+        &plan.campaign,
+        "perf",
+    );
+    let rs_manifest = manifest(
+        ids.identity(pair.rs_name, pair.rs)?,
+        Some(Campaign {
+            campaign: plan.campaign.clone(),
+            c_driver: pair.c_name.to_owned(),
+            rs_driver: pair.rs_name.to_owned(),
+            baseline: c_hash,
+        }),
+    );
+    if !results::clear_for_campaign(&p2_dir, &rs_manifest, plan.yes)? {
+        info!("p2 perf skipped for {}::{}", pair.c_name, pair.rs_name);
+        return Ok(());
+    }
+    info!(
+        "p2 perf: {}::{} -> {}",
+        pair.c_name,
+        pair.rs_name,
+        p2_dir.display()
+    );
+    run_matrix(ctx, pair.rs_name, pair.rs, &p2_dir, rs_manifest)
+}
+
 struct MatrixCtx<'a> {
     project: &'a Project,
-    opts: &'a Opts,
+    vm: &'a VmOpts,
     logs: &'a Path,
     kernel: &'a Path,
     initrd: &'a Path,
@@ -191,7 +240,7 @@ fn run_matrix(
     driver: &Driver,
     outdir: &Path,
     manifest: Manifest,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> anyhow::Result<()> {
     // An unfinished root resumes under its recorded seed so the
     // shuffled order stays the order that actually ran.
     let mut manifest = match Manifest::load(outdir)? {
@@ -206,7 +255,7 @@ fn run_matrix(
         .identity
         .fio
         .clone()
-        .ok_or("perf manifest lacks its [identity.fio] table")?;
+        .ok_or_else(|| anyhow!("perf manifest lacks its [identity.fio] table"))?;
     let reps = fio.reps;
     let runtime = fio.runtime;
 
@@ -226,11 +275,7 @@ fn run_matrix(
         return Ok(());
     }
 
-    let tmp_root = fetch::koxi_home()?.join("tmp");
-    fs::create_dir_all(&tmp_root)?;
-    let scratch = tempfile::Builder::new()
-        .prefix("perf-")
-        .tempdir_in(&tmp_root)?;
+    let scratch = Scratch::new(&home::koxi_home()?, "perf-")?;
     let run_initrd = runner::driver_initrd(
         scratch.path(),
         ctx.initrd,
@@ -245,19 +290,19 @@ fn run_matrix(
         &runner::Options {
             kernel: ctx.kernel.to_owned(),
             initrd: run_initrd,
-            memory: ctx.opts.memory.clone(),
-            smp: ctx.opts.smp,
-            port: ctx.opts.port,
+            memory: ctx.vm.guest.memory.clone(),
+            smp: ctx.vm.guest.smp,
+            port: ctx.vm.port,
             key: ctx.project.root.join(ARTIFACTS_DIR).join("keys/id_ed25519"),
             append: String::new(),
         },
         ctx.logs,
     )?;
-    vm.wait_ready(ctx.opts.vm_timeout)?;
+    vm.wait_ready(ctx.vm.vm_timeout)?;
     let device = driver.device.display().to_string();
     let check = vm.exec(&format!("test -e {device}"))?;
     if !check.status.success() {
-        return Err(format!("driver {name} setup ran but {device} is absent").into());
+        bail!("driver {name} setup ran but {device} is absent");
     }
 
     let mut failures = 0u32;
@@ -308,10 +353,7 @@ fn run_matrix(
     vm.shutdown();
 
     if failures > 0 {
-        return Err(format!(
-            "{failures} fio runs failed for {name}; rerunning resumes the missing reps"
-        )
-        .into());
+        bail!("{failures} fio runs failed for {name}; rerunning resumes the missing reps");
     }
     manifest.complete = true;
     manifest.save(outdir)?;

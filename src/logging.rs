@@ -1,19 +1,20 @@
 //! Two-sink logging: a quiet human console on stderr (level driven by
 //! `--verbose`/`--debug`) and an always-verbose run log file.
-//! Subprocess output does not go through here — `fetch` tees it to
-//! per-task files under `out/logs/`.
+//! Subprocess output does not go through here — `cmd` tees it to
+//! per-task files under the run log dir.
 
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
+
+use crate::home;
 
 /// `log/<project-label>/<run-id>` under the koxi home, with the
 /// project label derived from the project root path (or "global"
@@ -30,11 +31,11 @@ pub fn run_log_dir() -> PathBuf {
             .to_owned(),
         Err(_) => "global".to_owned(),
     };
-    let run_id = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
-    let base = crate::fetch::koxi_home().unwrap_or_else(|_| PathBuf::from("."));
-    base.join("log").join(label).join(run_id.to_string())
+    let run_id = crate::util::unix_now();
+    let base = home::koxi_home().unwrap_or_else(|_| PathBuf::from("."));
+    base.join(home::LOG_DIR)
+        .join(label)
+        .join(run_id.to_string())
 }
 
 /// Install the global subscriber. `logfile: None` means console only

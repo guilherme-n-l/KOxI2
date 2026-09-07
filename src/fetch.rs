@@ -3,12 +3,12 @@
 //! git checkouts (rev pin resolved to a locked commit). Artifacts are
 //! cached globally under the koxi home (`$KOXI_HOME`, default
 //! `~/.koxi`) and shared across projects, cargo-style; the config and
-//! lock stay per-project. Shells out to wget, sha256sum, tar, and
-//! git; subprocess output is teed to per-task files under `out/logs/`.
+//! lock stay per-project. Shells out to wget, tar, and
+//! git; subprocess output is teed to per-task files under the run's
+//! log dir. Every fetch runs under the home's cache lock (see
+//! `crate::home::CacheLock`), taken once per run by the driver.
 
-use std::fmt;
 use std::fs;
-use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -16,24 +16,12 @@ use tracing::{debug, info, warn};
 
 use crate::cmd;
 use crate::config::{Config, Source};
+use crate::home::CACHE_DIR;
 use crate::lock::{Lock, LockedSource};
-
-/// Reusable downloads under the koxi home (`--nocache` clears it):
-/// tarballs, extracted source trees, git checkouts and mirrors.
-pub const CACHE_DIR: &str = "cache";
+use crate::util::{self, confirm};
 
 /// Tools every fetch shells out to; `block test` preflights these.
-pub const REQUIRED_TOOLS: &[&str] = &["wget", "sha256sum", "tar", "git"];
-
-/// The global artifact home: `$KOXI_HOME`, defaulting to `~/.koxi`.
-pub fn koxi_home() -> Result<PathBuf, Error> {
-    if let Some(home) = std::env::var_os("KOXI_HOME") {
-        return Ok(PathBuf::from(home));
-    }
-    std::env::var_os("HOME")
-        .map(|home| Path::new(&home).join(".koxi"))
-        .ok_or(Error::NoHome)
-}
+pub const REQUIRED_TOOLS: &[&str] = &["wget", "tar", "git"];
 
 /// Everything a fetch needs besides the source name. The lock is
 /// loaded and saved once per run by the driver, not per fetch.
@@ -72,7 +60,7 @@ pub fn tarball(name: &str, ctx: &mut Ctx) -> Result<PathBuf, Error> {
     let stamp = out.join(format!(".{stem}.extracted"));
 
     if tarball.exists() {
-        let sha = sha256(&tarball, logs)?;
+        let sha = util::sha256_file(&tarball)?;
         if ctx.lock.satisfies(name, source) {
             match ctx.lock.sources.get(name) {
                 Some(LockedSource::Tarball { sha256: locked, .. }) if *locked == sha => {
@@ -99,7 +87,7 @@ pub fn tarball(name: &str, ctx: &mut Ctx) -> Result<PathBuf, Error> {
     }
 
     download(url, &tarball, logs)?;
-    let sha = sha256(&tarball, logs)?;
+    let sha = util::sha256_file(&tarball)?;
     match ctx.lock.sources.get(name) {
         Some(LockedSource::Tarball { sha256: locked, .. }) if ctx.lock.satisfies(name, source) => {
             if *locked != sha {
@@ -170,20 +158,19 @@ pub fn git(name: &str, ctx: &mut Ctx) -> Result<PathBuf, Error> {
         }
         _ => None,
     };
-    let commit = match locked_commit {
-        Some(commit) => commit,
-        None => {
-            let commit = resolve_commit(&repo, rev, logs)?;
-            ctx.lock.sources.insert(
-                name.to_owned(),
-                LockedSource::Git {
-                    git: url.clone(),
-                    rev: rev.clone(),
-                    commit: commit.clone(),
-                },
-            );
-            commit
-        }
+    let commit = if let Some(commit) = locked_commit {
+        commit
+    } else {
+        let commit = resolve_commit(&repo, rev, logs)?;
+        ctx.lock.sources.insert(
+            name.to_owned(),
+            LockedSource::Git {
+                git: url.clone(),
+                rev: rev.clone(),
+                commit: commit.clone(),
+            },
+        );
+        commit
     };
 
     if head_commit(&repo, logs)? != commit {
@@ -232,23 +219,20 @@ pub fn git_meta(name: &str, ctx: &mut Ctx) -> Result<PathBuf, Error> {
         }
         _ => None,
     };
-    let commit = match locked_commit {
-        Some(commit) => {
-            ensure_commit(&repo, &commit, logs)?;
-            commit
-        }
-        None => {
-            let commit = resolve_commit(&repo, rev, logs)?;
-            ctx.lock.sources.insert(
-                name.to_owned(),
-                LockedSource::GitMeta {
-                    git_meta: url.clone(),
-                    rev: rev.clone(),
-                    commit: commit.clone(),
-                },
-            );
-            commit
-        }
+    let commit = if let Some(commit) = locked_commit {
+        ensure_commit(&repo, &commit, logs)?;
+        commit
+    } else {
+        let commit = resolve_commit(&repo, rev, logs)?;
+        ctx.lock.sources.insert(
+            name.to_owned(),
+            LockedSource::GitMeta {
+                git_meta: url.clone(),
+                rev: rev.clone(),
+                commit: commit.clone(),
+            },
+        );
+        commit
     };
     debug!("{name}: history mirror holds {commit}");
     Ok(repo)
@@ -265,9 +249,7 @@ pub fn find_tool(tool: &str) -> Option<PathBuf> {
 #[cfg(unix)]
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    fs::metadata(path)
-        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+    fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(not(unix))]
@@ -286,6 +268,47 @@ pub fn tarball_path(name: &str, ctx: &Ctx) -> Result<(PathBuf, String), Error> {
     };
     let out = ctx.home.join(CACHE_DIR);
     Ok((out.join(tarball_name(url)?), format!("{name}-{version}")))
+}
+
+/// Extract a verified tarball into `into` (a build scratch) and
+/// return its `<into>/<stem>` tree — the pristine per-build copy that
+/// never touches the shared cache extraction. Errors when the
+/// tarball's top-level directory is not `stem`.
+pub fn extract_pristine(
+    tarball: &Path,
+    into: &Path,
+    stem: &str,
+    logs: &Path,
+) -> Result<PathBuf, Error> {
+    info!("extracting pristine {stem} for build");
+    let mut tar = Command::new("tar");
+    tar.arg("-xf").arg(tarball).arg("-C").arg(into);
+    cmd::status(tar, "tar-build", logs)?;
+    let tree = into.join(stem);
+    if !tree.is_dir() {
+        return Err(Error::UnexpectedLayout {
+            name: stem.to_owned(),
+            expected: tree,
+        });
+    }
+    Ok(tree)
+}
+
+/// Cache entry names (files or directories directly under `cache/`)
+/// a locked source occupies — what `koxi clean --cache` keeps.
+pub fn cache_entries(name: &str, source: &LockedSource) -> Vec<String> {
+    match source {
+        LockedSource::Tarball { version, url, .. } => {
+            let stem = format!("{name}-{version}");
+            let mut entries = vec![stem.clone(), format!(".{stem}.extracted")];
+            if let Ok(file) = tarball_name(url) {
+                entries.push(file.to_owned());
+            }
+            entries
+        }
+        LockedSource::Git { .. } => vec![name.to_owned()],
+        LockedSource::GitMeta { .. } => vec![format!("{name}.git")],
+    }
 }
 
 fn lookup<'c>(name: &str, config: &'c Config) -> Result<&'c Source, Error> {
@@ -366,18 +389,6 @@ fn download(url: &str, dest: &Path, logs: &Path) -> Result<(), Error> {
     }
     fs::rename(&partial, dest)?;
     Ok(())
-}
-
-/// sha256 of a file, via the same sha256sum used everywhere else.
-pub fn sha256(path: &Path, logs: &Path) -> Result<String, Error> {
-    let mut cmd = Command::new("sha256sum");
-    cmd.arg(path);
-    let stdout = cmd::stdout(cmd, "sha256sum", logs)?;
-    stdout
-        .split_whitespace()
-        .next()
-        .map(str::to_owned)
-        .ok_or(Error::Cmd(cmd::Error::Malformed("sha256sum")))
 }
 
 fn extract(tarball: &Path, out: &Path, logs: &Path) -> Result<(), Error> {
@@ -465,91 +476,39 @@ fn checkout_commit(repo: &Path, commit: &str, logs: &Path) -> Result<(), Error> 
     Ok(checkout()?)
 }
 
-fn confirm(prompt: &str, assume_yes: bool) -> Result<bool, Error> {
-    if assume_yes {
-        info!("{prompt} — assuming yes (--yes)");
-        return Ok(true);
-    }
-    if !io::stdin().is_terminal() {
-        return Err(Error::ConfirmationRequired(prompt.to_owned()));
-    }
-    eprint!("{prompt} [y/N] ");
-    io::stderr().flush()?;
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
-    Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
-}
-
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
-    NoHome,
+    #[error("koxi.toml has no [sources.{0}]")]
     NotConfigured(String),
+    #[error("[sources.{name}] must be a {expected} source")]
     WrongKind {
         name: String,
         expected: &'static str,
     },
+    #[error("cannot derive a file name from url {0}")]
     InvalidUrl(String),
-    UnexpectedLayout {
-        name: String,
-        expected: PathBuf,
-    },
-    ConfirmationRequired(String),
-    Io(std::io::Error),
-    Cmd(cmd::Error),
+    #[error(
+        "extracting {name} did not produce {}; the tarball's top-level directory does not \
+         match its version/url declaration",
+        expected.display()
+    )]
+    UnexpectedLayout { name: String, expected: PathBuf },
+    #[error(transparent)]
+    Confirm(#[from] util::ConfirmError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Cmd(#[from] cmd::Error),
+    #[error(
+        "{name} tarball sha256 {got} does not match locked {expected}; remove the {name} entry \
+         from koxi.lock to accept a new upstream tarball"
+    )]
     HashMismatch {
         name: String,
         expected: String,
         got: String,
     },
 }
-
-impl From<std::io::Error> for Error {
-    fn from(err: std::io::Error) -> Self {
-        Error::Io(err)
-    }
-}
-
-impl From<cmd::Error> for Error {
-    fn from(err: cmd::Error) -> Self {
-        Error::Cmd(err)
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::NoHome => write!(f, "cannot determine the koxi home: set KOXI_HOME or HOME"),
-            Error::NotConfigured(name) => write!(f, "koxi.toml has no [sources.{name}]"),
-            Error::WrongKind { name, expected } => {
-                write!(f, "[sources.{name}] must be a {expected} source")
-            }
-            Error::InvalidUrl(url) => write!(f, "cannot derive a file name from url {url}"),
-            Error::UnexpectedLayout { name, expected } => write!(
-                f,
-                "extracting {name} did not produce {}; the tarball's top-level \
-                 directory does not match its version/url declaration",
-                expected.display()
-            ),
-            Error::ConfirmationRequired(prompt) => write!(
-                f,
-                "{prompt} — confirmation needed but stdin is not a terminal; rerun with --yes"
-            ),
-            Error::Io(err) => write!(f, "{err}"),
-            Error::Cmd(err) => write!(f, "{err}"),
-            Error::HashMismatch {
-                name,
-                expected,
-                got,
-            } => write!(
-                f,
-                "{name} tarball sha256 {got} does not match locked {expected}; \
-                 remove the {name} entry from koxi.lock to accept a new upstream tarball"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {
@@ -665,6 +624,23 @@ mod tests {
         fs::write(&tarball_path, bytes).unwrap();
 
         assert!(matches!(run_tarball(&mut fx), Err(Error::Cmd(_))));
+    }
+
+    #[test]
+    fn pristine_extraction_requires_the_declared_top_dir() {
+        let fx = fixture("thing-1.0");
+        let tarball = fx.home.path().join(CACHE_DIR).join("thing-1.0.tar.gz");
+        let logs = fx.home.path().join("logs");
+        let into = tempfile::tempdir().unwrap();
+
+        let tree = extract_pristine(&tarball, into.path(), "thing-1.0", &logs).unwrap();
+        assert_eq!(tree, into.path().join("thing-1.0"));
+        assert!(tree.join("file").is_file());
+
+        assert!(matches!(
+            extract_pristine(&tarball, into.path(), "other-1.0", &logs),
+            Err(Error::UnexpectedLayout { name, .. }) if name == "other-1.0"
+        ));
     }
 
     #[test]

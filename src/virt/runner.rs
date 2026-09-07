@@ -9,7 +9,6 @@
 //! own `/koxi` tree. The same transport works for kexec bare metal,
 //! where there is no 9p.
 
-use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -23,6 +22,7 @@ use tracing::{debug, info, warn};
 use crate::assets;
 use crate::cmd;
 use crate::config::{Driver, Project, Role};
+use crate::host;
 
 /// Launch parameters; `port` forwards to the guest's dropbear.
 pub struct Options {
@@ -75,7 +75,7 @@ pub fn stage_overlay(
     }
     fs::copy(&ko, staging.join("koxi/modules").join(&driver.ko))?;
     let script = assets::load(&project.root, &project.config, "virt/vm-driver-setup")
-        .map_err(|err| Error::Overlay(err.to_string()))?;
+        .map_err(Error::Overlay)?;
     let script_path = staging.join("koxi/scripts/vm_driver_setup");
     fs::write(&script_path, script.as_bytes())?;
     fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))?;
@@ -134,14 +134,26 @@ pub fn shell_quote(word: &str) -> String {
     }
 }
 
-/// The acceleration this host will boot with — part of a perf
-/// result's identity (KVM and TCG numbers must never be pooled).
-pub fn accel() -> &'static str {
-    if kvm_available() {
-        "kvm"
-    } else {
-        "tcg"
+/// ssh to a koxi guest with the project's client key. The guest
+/// address answers as different kernels over time (qemu's forwarded
+/// port, or a bare-metal box before and after kexec), so host keys
+/// are neither checked nor remembered; `batch` refuses every prompt.
+pub fn ssh_command(key: &Path, batch: bool) -> Command {
+    let mut ssh = Command::new("ssh");
+    ssh.arg("-i").arg(key).args([
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "LogLevel=ERROR",
+        "-o",
+        "ConnectTimeout=3",
+    ]);
+    if batch {
+        ssh.args(["-o", "BatchMode=yes"]);
     }
+    ssh
 }
 
 /// Host identity for result manifests.
@@ -197,7 +209,7 @@ impl Vm {
             .arg(format!("user,id=net0,hostfwd=tcp::{}-:22", opts.port))
             .arg("-device")
             .arg("e1000,netdev=net0");
-        if kvm_available() {
+        if host::kvm_available() {
             qemu.arg("-enable-kvm").arg("-cpu").arg("host");
         } else {
             warn!("/dev/kvm unavailable — booting under TCG (slow)");
@@ -272,23 +284,10 @@ impl Vm {
     }
 
     fn ssh(&self, batch: bool) -> Command {
-        let mut ssh = Command::new("ssh");
-        ssh.arg("-i")
-            .arg(&self.key)
-            .arg("-p")
+        let mut ssh = ssh_command(&self.key, batch);
+        ssh.arg("-p")
             .arg(self.port.to_string())
-            .arg("-o")
-            .arg("StrictHostKeyChecking=no")
-            .arg("-o")
-            .arg("UserKnownHostsFile=/dev/null")
-            .arg("-o")
-            .arg("LogLevel=ERROR")
-            .arg("-o")
-            .arg("ConnectTimeout=3");
-        if batch {
-            ssh.arg("-o").arg("BatchMode=yes");
-        }
-        ssh.arg("root@localhost");
+            .arg("root@localhost");
         ssh
     }
 }
@@ -300,78 +299,28 @@ impl Drop for Vm {
     }
 }
 
-fn kvm_available() -> bool {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/kvm")
-        .is_ok()
-}
-
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
-    Io(io::Error),
+    #[error("vm: {0}")]
+    Io(#[from] io::Error),
+    #[error("{} missing — run `koxi block setup` first", .0.display())]
     MissingInput(PathBuf),
-    Overlay(String),
-    Spawn(io::Error),
-    Ssh(io::Error),
-    Cmd(cmd::Error),
+    #[error("staging overlay: {0}")]
+    Overlay(#[from] assets::Error),
+    #[error("launching qemu-system-x86_64: {0}")]
+    Spawn(#[source] io::Error),
+    #[error("running ssh: {0}")]
+    Ssh(#[source] io::Error),
+    #[error(transparent)]
+    Cmd(#[from] cmd::Error),
+    #[error("qemu exited early: {status} (console: {})", console.display())]
     Died {
         status: ExitStatus,
         console: PathBuf,
     },
-    Timeout {
-        secs: u64,
-        console: PathBuf,
-    },
+    #[error("guest not reachable after {secs}s (console: {})", console.display())]
+    Timeout { secs: u64, console: PathBuf },
 }
-
-impl From<io::Error> for Error {
-    fn from(err: io::Error) -> Self {
-        Error::Io(err)
-    }
-}
-
-impl From<cmd::Error> for Error {
-    fn from(err: cmd::Error) -> Self {
-        Error::Cmd(err)
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Io(err) => write!(f, "vm: {err}"),
-            Error::MissingInput(path) => {
-                write!(
-                    f,
-                    "{} missing — run `koxi block setup` first",
-                    path.display()
-                )
-            }
-            Error::Overlay(err) => write!(f, "staging overlay: {err}"),
-            Error::Spawn(err) => write!(f, "launching qemu-system-x86_64: {err}"),
-            Error::Ssh(err) => write!(f, "running ssh: {err}"),
-            Error::Cmd(err) => write!(f, "{err}"),
-            Error::Died { status, console } => {
-                write!(
-                    f,
-                    "qemu exited early: {status} (console: {})",
-                    console.display()
-                )
-            }
-            Error::Timeout { secs, console } => {
-                write!(
-                    f,
-                    "guest not reachable after {secs}s (console: {})",
-                    console.display()
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {
@@ -395,7 +344,7 @@ mod tests {
         assert_eq!(shell_quote("uname"), "uname");
         assert_eq!(shell_quote("-r"), "-r");
         assert_eq!(shell_quote("a b"), "'a b'");
-        assert_eq!(shell_quote("it's"), r#"'it'\''s'"#);
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
         assert_eq!(shell_quote(""), "''");
     }
 }

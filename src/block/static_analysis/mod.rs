@@ -14,16 +14,18 @@ pub mod commits;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use tracing::{error, info, warn};
+use anyhow::{anyhow, bail};
+use tracing::{info, warn};
 
-use crate::block::cli::Opts;
+use crate::block::cli::{RunOpts, StaticOpts};
 use crate::block::results::{self, Campaign, Identity, Manifest, SourceIds, StaticKnobs};
+use crate::block::DriverPair;
 use crate::config::{anchored, Driver, Project, Role};
-use crate::fetch::{self, Ctx};
+use crate::fetch::Ctx;
+use crate::home::{self, CacheLock};
 use crate::lock::{Lock, LockedSource, LOCK_PATH};
+use crate::util;
 use crate::virt::runner;
 use crate::{assets, kernel};
 
@@ -31,32 +33,28 @@ use crate::{assets, kernel};
 /// analyses never hash-match the new recipe.
 const AST_RECIPE: u32 = 1;
 
-pub fn static_phase(opts: &Opts, logs: &Path) -> ExitCode {
-    match drive(opts, logs) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            error!("koxi block static: {err}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-pub(crate) fn drive(opts: &Opts, logs: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn drive(
+    run: &RunOpts,
+    opts: &StaticOpts,
+    yes: bool,
+    logs: &Path,
+) -> anyhow::Result<()> {
     let project = Project::locate()?;
-    let home = fetch::koxi_home()?;
+    let home = home::koxi_home()?;
     let lock_path = project.root.join(LOCK_PATH);
     let mut lock = Lock::load(&lock_path)?.unwrap_or_default();
 
     // Sources first (fetch/verify through the shared machinery); the
     // lock is saved even on failure so resolved pins stick.
     let fetched = {
+        let _cache_lock = CacheLock::acquire(&home)?;
         let mut ctx = Ctx {
             config: &project.config,
             root: &project.root,
             home: &home,
             lock: &mut lock,
             logs,
-            assume_yes: opts.yes,
+            assume_yes: yes,
         };
         kernel::setup::setup(&mut ctx)
             .and_then(|ktree| Ok((ktree, kernel::setup::history(&mut ctx)?)))
@@ -78,123 +76,64 @@ pub(crate) fn drive(opts: &Opts, logs: &Path) -> Result<(), Box<dyn std::error::
         sha256: linux_sha, ..
     }) = lock.sources.get("linux")
     else {
-        return Err("linux source is not locked — run `koxi block setup` first".into());
+        bail!("linux source is not locked — run `koxi block setup` first");
     };
     let Some(LockedSource::GitMeta {
         commit: meta_commit,
         ..
     }) = lock.sources.get("linux-meta")
     else {
-        return Err("linux-meta mirror is not locked — run `koxi block setup` first".into());
+        bail!("linux-meta mirror is not locked — run `koxi block setup` first");
     };
-    let source = SourceIds {
-        linux: linux_sha.clone(),
-        meta_commit: meta_commit.clone(),
-        classify: classify.sha256.clone(),
-    };
-    let since = project.config.block.static_.since.clone();
 
-    let results_root = anchored(&project.root, &opts.output);
-    let host = runner::hostname();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
-    let campaign = opts.campaign.clone().unwrap_or_else(|| now.to_string());
-
-    let pairs = super::driver_pairs(&project.config, &opts.only);
+    let pairs = super::driver_pairs(&project.config, &run.scope.only);
     if pairs.is_empty() {
-        return Err("no matching driver pairs in the [block.drivers] registry".into());
+        bail!("no matching driver pairs in the [block.drivers] registry");
     }
 
     let analyzer = ast::Analyzer::new()?;
-    let identity = |name: &str, driver: &Driver| Identity {
-        domain: "static".to_owned(),
-        driver: name.to_owned(),
-        spec: runner::driver_spec(name, driver),
-        prep: driver.prep.clone().unwrap_or_default(),
-        host: host.clone(),
-        accel: None,
-        smp: None,
-        memory: None,
-        artifacts: None,
-        source: Some(source.clone()),
-        fio: None,
-        fuzz: None,
-        static_: Some(StaticKnobs {
-            gitpath: driver.gitpath.display().to_string(),
-            abstractions: driver
-                .abstractions
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect(),
-            since: since.clone().unwrap_or_default(),
-            ast_recipe: AST_RECIPE,
-        }),
-    };
-
-    let run = Run {
+    let analysis = Run {
         ktree: &ktree,
         mirror: &mirror,
         rules: &rules,
         analyzer: &analyzer,
-        since: since.as_deref(),
+        since: project.config.block.static_.since.clone(),
         meta_commit: meta_commit.clone(),
+        host: runner::hostname(),
+        source: SourceIds {
+            linux: linux_sha.clone(),
+            meta_commit: meta_commit.clone(),
+            classify: classify.sha256.clone(),
+        },
         validated_cwe: opts
             .validated_cwe
             .as_deref()
             .map(|path| anchored(&project.root, path)),
     };
+    let now = util::unix_now();
+    let plan = Plan {
+        results_root: anchored(&project.root, &run.scope.output),
+        campaign: run.campaign(now),
+        now,
+        p1: run.p1,
+        force_p1: run.force_p1,
+        yes,
+    };
 
-    for (rs_name, rs_driver, c_name, c_driver) in pairs {
-        // p1: the C baseline — static is phase-1 screening, so it
-        // runs even under --p1.
-        let c_identity = identity(c_name, c_driver);
-        let c_hash = results::identity_hash(&c_identity)?;
-        let p1_dir = results::p1_dir(&results_root, c_name, "static", &c_hash);
-        if !(opts.force_p1 || opts.force_build) && Manifest::is_complete(&p1_dir) {
-            info!(
-                "p1 static cached for {c_name} at {} (--force-p1 re-runs)",
-                p1_dir.display()
-            );
-        } else {
-            info!("p1 static: {c_name} -> {}", p1_dir.display());
-            let manifest = Manifest {
-                complete: false,
-                created: now,
-                seed: now,
-                koxi: env!("CARGO_PKG_VERSION").to_owned(),
-                identity: c_identity,
-                p2: None,
-            };
-            run.analyze(c_name, c_driver, &p1_dir, manifest)?;
-        }
-
-        if opts.p1 {
-            info!("phase 1 only: skipping p2 static for {c_name}::{rs_name}");
-            continue;
-        }
-        let p2_dir = results::p2_dir(&results_root, c_name, rs_name, &campaign, "static");
-        let manifest = Manifest {
-            complete: false,
-            created: now,
-            seed: now,
-            koxi: env!("CARGO_PKG_VERSION").to_owned(),
-            identity: identity(rs_name, rs_driver),
-            p2: Some(Campaign {
-                campaign: campaign.clone(),
-                c_driver: c_name.clone(),
-                rs_driver: rs_name.clone(),
-                baseline: c_hash,
-            }),
-        };
-        if !results::clear_for_campaign(&p2_dir, &manifest, opts.yes)? {
-            info!("p2 static skipped for {c_name}::{rs_name}");
-            continue;
-        }
-        info!("p2 static: {c_name}::{rs_name} -> {}", p2_dir.display());
-        run.analyze(rs_name, rs_driver, &p2_dir, manifest)?;
+    for pair in pairs {
+        analysis.pair(&plan, &pair)?;
     }
     Ok(())
+}
+
+/// Where this run writes and under what name.
+struct Plan {
+    results_root: PathBuf,
+    campaign: String,
+    now: u64,
+    p1: bool,
+    force_p1: bool,
+    yes: bool,
 }
 
 struct Run<'a> {
@@ -202,12 +141,106 @@ struct Run<'a> {
     mirror: &'a Path,
     rules: &'a commits::Rules,
     analyzer: &'a ast::Analyzer,
-    since: Option<&'a str>,
+    since: Option<String>,
     meta_commit: String,
+    host: String,
+    source: SourceIds,
     validated_cwe: Option<PathBuf>,
 }
 
 impl Run<'_> {
+    /// The static domain has no VM and no artifacts: what makes two
+    /// analyses comparable is the source pins, the classify rules,
+    /// and the scope (driver paths + abstraction layer + window).
+    fn identity(&self, name: &str, driver: &Driver) -> Identity {
+        Identity {
+            domain: "static".to_owned(),
+            driver: name.to_owned(),
+            spec: runner::driver_spec(name, driver),
+            prep: driver.prep.clone().unwrap_or_default(),
+            host: self.host.clone(),
+            accel: None,
+            smp: None,
+            memory: None,
+            artifacts: None,
+            source: Some(self.source.clone()),
+            fio: None,
+            fuzz: None,
+            static_: Some(StaticKnobs {
+                gitpath: driver.gitpath.display().to_string(),
+                abstractions: driver
+                    .abstractions
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect(),
+                since: self.since.clone().unwrap_or_default(),
+                ast_recipe: AST_RECIPE,
+            }),
+        }
+    }
+
+    /// One pair: the C baseline (static is phase-1 screening, so it
+    /// runs even under --p1) then the Rust driver under the campaign.
+    fn pair(&self, plan: &Plan, pair: &DriverPair) -> anyhow::Result<()> {
+        let manifest = |identity: Identity, p2: Option<Campaign>| Manifest {
+            complete: false,
+            created: plan.now,
+            seed: plan.now,
+            koxi: env!("CARGO_PKG_VERSION").to_owned(),
+            identity,
+            p2,
+        };
+
+        let c_identity = self.identity(pair.c_name, pair.c);
+        let c_hash = results::identity_hash(&c_identity)?;
+        let p1_dir = results::p1_dir(&plan.results_root, pair.c_name, "static", &c_hash);
+        if !plan.force_p1 && Manifest::is_complete(&p1_dir) {
+            info!(
+                "p1 static cached for {} at {} (--force-p1 re-runs)",
+                pair.c_name,
+                p1_dir.display()
+            );
+        } else {
+            info!("p1 static: {} -> {}", pair.c_name, p1_dir.display());
+            self.analyze(pair.c_name, pair.c, &p1_dir, manifest(c_identity, None))?;
+        }
+
+        if plan.p1 {
+            info!(
+                "phase 1 only: skipping p2 static for {}::{}",
+                pair.c_name, pair.rs_name
+            );
+            return Ok(());
+        }
+        let p2_dir = results::p2_dir(
+            &plan.results_root,
+            pair.c_name,
+            pair.rs_name,
+            &plan.campaign,
+            "static",
+        );
+        let rs_manifest = manifest(
+            self.identity(pair.rs_name, pair.rs),
+            Some(Campaign {
+                campaign: plan.campaign.clone(),
+                c_driver: pair.c_name.to_owned(),
+                rs_driver: pair.rs_name.to_owned(),
+                baseline: c_hash,
+            }),
+        );
+        if !results::clear_for_campaign(&p2_dir, &rs_manifest, plan.yes)? {
+            info!("p2 static skipped for {}::{}", pair.c_name, pair.rs_name);
+            return Ok(());
+        }
+        info!(
+            "p2 static: {}::{} -> {}",
+            pair.c_name,
+            pair.rs_name,
+            p2_dir.display()
+        );
+        self.analyze(pair.rs_name, pair.rs, &p2_dir, rs_manifest)
+    }
+
     /// One driver's full static profile: AST metrics over its tree
     /// paths (+ abstraction layer for Rust) and classified history.
     fn analyze(
@@ -216,7 +249,7 @@ impl Run<'_> {
         driver: &Driver,
         outdir: &Path,
         mut manifest: Manifest,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> anyhow::Result<()> {
         fs::create_dir_all(outdir)?;
         manifest.save(outdir)?;
 
@@ -247,21 +280,21 @@ impl Run<'_> {
             }
         }
         if results.densities.is_empty() {
-            return Err(format!("no sources found under {}", src.display()).into());
+            bail!("no sources found under {}", src.display());
         }
         write_ast_csvs(outdir, &results)?;
 
         let mut rows = commits::mine(
             self.mirror,
             &self.meta_commit,
-            self.since,
+            self.since.as_deref(),
             &driver.gitpath,
             name,
             self.rules,
         )?;
         if let Some(csv) = &self.validated_cwe {
             let contents = fs::read_to_string(csv)
-                .map_err(|err| format!("reading --validated-cwe {}: {err}", csv.display()))?;
+                .map_err(|err| anyhow!("reading --validated-cwe {}: {err}", csv.display()))?;
             commits::apply_validated(&mut rows, &contents);
         }
         fs::write(outdir.join("commits.csv"), commits::commits_csv(&rows))?;
@@ -298,30 +331,21 @@ impl Run<'_> {
 /// level deep, which silently skipped rust/kernel/block/mq/*.rs —
 /// the abstraction files that actually hold the unsafe surface.
 fn source_files(src: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>, std::io::Error> {
+    // An explicitly registered file is analyzed whatever its
+    // extension; a directory is walked for the ones that match.
     if src.is_file() {
         return Ok(vec![src.to_owned()]);
     }
-    let mut files = Vec::new();
-    let mut pending = vec![src.to_owned()];
-    while let Some(dir) = pending.pop() {
-        for entry in fs::read_dir(&dir)? {
-            let path = entry?.path();
-            if path.is_dir() {
-                pending.push(path);
-            } else if path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| extensions.contains(&ext))
-            {
-                files.push(path);
-            }
-        }
-    }
-    files.sort();
-    Ok(files)
+    util::files_under(src, |path| {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| extensions.contains(&ext))
+    })
 }
 
 fn write_ast_csvs(outdir: &Path, results: &ast::Results) -> Result<(), std::io::Error> {
+    use std::fmt::Write as _;
+
     let quote = |field: &str| {
         if field.contains(',') || field.contains('"') || field.contains('\n') {
             format!("\"{}\"", field.replace('"', "\"\""))
@@ -333,8 +357,9 @@ fn write_ast_csvs(outdir: &Path, results: &ast::Results) -> Result<(), std::io::
     let mut functions =
         String::from("driver,file,function_name,start_line,end_line,line_count,complexity\n");
     for func in &results.functions {
-        functions.push_str(&format!(
-            "{},{},{},{},{},{},{}\n",
+        let _ = writeln!(
+            functions,
+            "{},{},{},{},{},{},{}",
             quote(&func.driver),
             quote(&func.file),
             quote(&func.name),
@@ -342,14 +367,15 @@ fn write_ast_csvs(outdir: &Path, results: &ast::Results) -> Result<(), std::io::
             func.end_line,
             func.line_count,
             func.complexity
-        ));
+        );
     }
     fs::write(outdir.join("functions.csv"), functions)?;
 
     let mut sites = String::from("source,file,line,end_line,node_type,contents_preview,purpose\n");
     for site in &results.sites {
-        sites.push_str(&format!(
-            "{},{},{},{},{},{},{}\n",
+        let _ = writeln!(
+            sites,
+            "{},{},{},{},{},{},{}",
             site.source,
             quote(&site.file),
             site.line,
@@ -357,7 +383,7 @@ fn write_ast_csvs(outdir: &Path, results: &ast::Results) -> Result<(), std::io::
             site.node_type,
             quote(&site.preview),
             site.purpose
-        ));
+        );
     }
     fs::write(outdir.join("unsafe_sites.csv"), sites)?;
 
@@ -366,8 +392,9 @@ fn write_ast_csvs(outdir: &Path, results: &ast::Results) -> Result<(), std::io::
          ptr_derefs,alloc_calls,free_calls,memop_calls,cast_exprs\n",
     );
     for d in &results.densities {
-        densities.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{}\n",
+        let _ = writeln!(
+            densities,
+            "{},{},{},{},{},{},{},{},{},{},{},{}",
             quote(&d.driver),
             quote(&d.file),
             d.language,
@@ -380,21 +407,22 @@ fn write_ast_csvs(outdir: &Path, results: &ast::Results) -> Result<(), std::io::
             d.free_calls,
             d.memop_calls,
             d.cast_exprs
-        ));
+        );
     }
     fs::write(outdir.join("unsafe_density.csv"), densities)?;
 
     let mut loc = String::from("driver,file,language,blank,comment,code\n");
     for entry in &results.loc {
-        loc.push_str(&format!(
-            "{},{},{},{},{},{}\n",
+        let _ = writeln!(
+            loc,
+            "{},{},{},{},{},{}",
             quote(&entry.driver),
             quote(&entry.file),
             entry.language,
             entry.blank,
             entry.comment,
             entry.code
-        ));
+        );
     }
     fs::write(outdir.join("loc.csv"), loc)?;
     Ok(())

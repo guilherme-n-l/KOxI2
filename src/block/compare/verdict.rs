@@ -15,6 +15,8 @@ use std::path::Path;
 use serde_json::json;
 use tracing::info;
 
+use crate::util::unix_now;
+
 const QUALITY_ORDER: [&str; 4] = ["unavailable", "inferred", "measured", "manually_validated"];
 
 fn quality_rank(status: &str) -> usize {
@@ -103,14 +105,96 @@ fn summarize(name: &str, data: Option<&serde_json::Value>) -> serde_json::Value 
     }
 }
 
+/// What the dimensions add up to: v1's overall label, the
+/// recommendation row it selects, and the caveat that choice implies.
+struct Outcome {
+    overall: &'static str,
+    recommendation: String,
+    caveat: Option<String>,
+}
+
+/// Fold the three dimension summaries into the overall verdict.
+/// "partial" means a dimension is missing outright; "inconclusive"
+/// means what is present did not decide.
+fn decide(dimensions: &serde_json::Map<String, serde_json::Value>) -> Outcome {
+    let available: Vec<&serde_json::Value> = dimensions
+        .values()
+        .filter(|summary| summary["available"].as_bool() == Some(true))
+        .collect();
+    let missing: Vec<&str> = dimensions
+        .iter()
+        .filter(|(_, summary)| summary["available"].as_bool() != Some(true))
+        .map(|(name, _)| name.as_str())
+        .collect();
+
+    if available.is_empty() {
+        return Outcome {
+            overall: "inconclusive",
+            recommendation: "Inconclusive: no comparison dimensions were measured".to_string(),
+            caveat: Some("missing dimensions: safety, fuzzing, performance".into()),
+        };
+    }
+
+    let all_present = missing.is_empty();
+    let passes: Vec<Option<bool>> = ["safety", "fuzzing", "performance"]
+        .iter()
+        .map(|name| dimensions[*name]["pass"].as_bool())
+        .collect();
+    let all_decidable = all_present && passes.iter().all(Option::is_some);
+    let any_fail = passes.contains(&Some(false));
+    let all_pass = all_present && passes.iter().all(|pass| *pass == Some(true));
+    let none_decidable = available
+        .iter()
+        .all(|summary| summary["pass"].as_bool().is_none());
+
+    if none_decidable {
+        Outcome {
+            overall: "inconclusive",
+            recommendation: "Inconclusive: available dimensions did not yield usable verdicts"
+                .to_string(),
+            caveat: None,
+        }
+    } else if all_decidable {
+        let key = (passes[0].unwrap(), passes[1].unwrap(), passes[2].unwrap());
+        Outcome {
+            overall: if any_fail {
+                "fail"
+            } else if all_pass {
+                "pass"
+            } else {
+                "inconclusive"
+            },
+            recommendation: recommendation(key).to_string(),
+            caveat: None,
+        }
+    } else if missing.is_empty() {
+        Outcome {
+            overall: "inconclusive",
+            recommendation: "Inconclusive: at least one dimension did not yield a decisive verdict"
+                .to_string(),
+            caveat: None,
+        }
+    } else {
+        let missing_msg = missing.join(", ");
+        Outcome {
+            overall: "partial",
+            recommendation: format!(
+                "Partial evidence only: missing dimensions prevent a full verdict \
+                 ({missing_msg})"
+            ),
+            caveat: Some(format!("missing dimensions: {missing_msg}")),
+        }
+    }
+}
+
 pub fn write_verdict(
     compare_dir: &Path,
     campaign: &str,
     baselines: &BTreeMap<String, String>,
     c_name: &str,
     rs_name: &str,
-    screening: Option<serde_json::Value>,
-) -> Result<(), Box<dyn std::error::Error>> {
+    screening: Option<&serde_json::Value>,
+) -> anyhow::Result<()> {
     let files = [
         ("safety", "safety.json"),
         ("fuzzing", "fuzz_stats.json"),
@@ -126,69 +210,12 @@ pub fn write_verdict(
         dimensions.insert(name.to_string(), summarize(name, data.as_ref()));
     }
 
-    let available: Vec<(&str, &serde_json::Value)> = dimensions
-        .iter()
-        .filter(|(_, summary)| summary["available"].as_bool() == Some(true))
-        .map(|(name, summary)| (name.as_str(), summary))
-        .collect();
-    let missing: Vec<&str> = dimensions
-        .iter()
-        .filter(|(_, summary)| summary["available"].as_bool() != Some(true))
-        .map(|(name, _)| name.as_str())
-        .collect();
-
-    let (overall, recommendation_text) = if available.is_empty() {
-        caveats.push("missing dimensions: safety, fuzzing, performance".into());
-        (
-            "inconclusive",
-            "Inconclusive: no comparison dimensions were measured".to_string(),
-        )
-    } else {
-        let pass_of = |name: &str| dimensions[name]["pass"].as_bool();
-        let all_present = missing.is_empty();
-        let passes: Vec<Option<bool>> = ["safety", "fuzzing", "performance"]
-            .iter()
-            .map(|name| pass_of(name))
-            .collect();
-        let all_decidable = all_present && passes.iter().all(Option::is_some);
-        let any_fail = passes.iter().any(|pass| *pass == Some(false));
-        let all_pass = all_present && passes.iter().all(|pass| *pass == Some(true));
-        let none_decidable = available
-            .iter()
-            .all(|(_, summary)| summary["pass"].as_bool().is_none());
-
-        if none_decidable {
-            (
-                "inconclusive",
-                "Inconclusive: available dimensions did not yield usable verdicts".to_string(),
-            )
-        } else if all_decidable {
-            let key = (passes[0].unwrap(), passes[1].unwrap(), passes[2].unwrap());
-            let overall = if any_fail {
-                "fail"
-            } else if all_pass {
-                "pass"
-            } else {
-                "inconclusive"
-            };
-            (overall, recommendation(key).to_string())
-        } else if !missing.is_empty() {
-            let missing_msg = missing.join(", ");
-            caveats.push(format!("missing dimensions: {missing_msg}"));
-            (
-                "partial",
-                format!(
-                    "Partial evidence only: missing dimensions prevent a full verdict \
-                     ({missing_msg})"
-                ),
-            )
-        } else {
-            (
-                "inconclusive",
-                "Inconclusive: at least one dimension did not yield a decisive verdict".to_string(),
-            )
-        }
-    };
+    let Outcome {
+        overall,
+        recommendation: recommendation_text,
+        caveat,
+    } = decide(&dimensions);
+    caveats.extend(caveat);
 
     let overall_status = worst_quality(
         dimensions
@@ -196,13 +223,9 @@ pub fn write_verdict(
             .filter_map(|summary| summary["data_quality"].as_str())
             .filter(|status| *status != "unavailable"),
     );
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0);
 
     let result = json!({
-        "timestamp": timestamp,
+        "timestamp": unix_now(),
         "campaign": campaign,
         "baselines": baselines,
         "drivers": {"c": c_name, "rs": rs_name},
@@ -213,7 +236,6 @@ pub fn write_verdict(
                 .map(|(name, summary)| (name.clone(), summary["data_quality"].clone()))
                 .collect::<serde_json::Map<String, serde_json::Value>>(),
             "phase1_screening": screening
-                .as_ref()
                 .and_then(|value| value["data_quality"]["status"].as_str())
                 .unwrap_or("unavailable"),
         },

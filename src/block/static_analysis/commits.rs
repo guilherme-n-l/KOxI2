@@ -7,10 +7,11 @@
 //! (sha-recorded in the result identity), and the audited
 //! `--validated-cwe` overrides keep the paper's manual-review trail.
 
-use std::fmt;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
+use crate::util;
 use regex::RegexBuilder;
 use serde::Deserialize;
 
@@ -37,7 +38,7 @@ struct CweRule {
 
 impl Rules {
     pub fn parse(contents: &str) -> Result<Self, Error> {
-        let file: RulesFile = toml::from_str(contents).map_err(Error::Toml)?;
+        let file: RulesFile = toml::from_str(contents)?;
         let build = |pattern: &str| {
             RegexBuilder::new(pattern)
                 .case_insensitive(true)
@@ -80,6 +81,21 @@ pub struct CommitRow {
     pub validator: String,
     pub validation_date: String,
 }
+
+/// commits.csv columns (v1 field order; manual_cwe stays the
+/// human's column).
+const COLUMNS: [&str; 10] = [
+    "hash",
+    "date",
+    "author",
+    "subject",
+    "driver",
+    "safety_related",
+    "auto_cwe",
+    "manual_cwe",
+    "validator",
+    "validation_date",
+];
 
 /// `git log` over the blobless linux-meta mirror at the pinned rev.
 pub fn mine(
@@ -155,9 +171,9 @@ pub fn apply_validated(rows: &mut [CommitRow], csv: &str) {
         }
         for row in rows.iter_mut() {
             if row.hash.starts_with(sha) {
-                row.manual_cwe = cwe.to_owned();
-                row.validator = validator.to_owned();
-                row.validation_date = date.to_owned();
+                cwe.clone_into(&mut row.manual_cwe);
+                validator.clone_into(&mut row.validator);
+                date.clone_into(&mut row.validation_date);
                 if !row.manual_cwe.is_empty() {
                     row.safety_related = true;
                 }
@@ -166,27 +182,27 @@ pub fn apply_validated(rows: &mut [CommitRow], csv: &str) {
     }
 }
 
-/// commits.csv (v1 field order; manual_cwe stays the human's column).
+/// commits.csv, one row per mined commit in [`COLUMNS`] order.
 pub fn commits_csv(rows: &[CommitRow]) -> String {
-    let mut out = String::from(
-        "hash,date,author,subject,driver,safety_related,auto_cwe,manual_cwe,validator,validation_date\n",
-    );
-    for row in rows {
-        out.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{}\n",
-            row.hash,
-            csv_field(&row.date),
-            csv_field(&row.author),
-            csv_field(&row.subject),
-            csv_field(&row.driver),
-            row.safety_related,
-            row.auto_cwe,
-            row.manual_cwe,
-            csv_field(&row.validator),
-            csv_field(&row.validation_date),
-        ));
-    }
-    out
+    util::csv_text(|out| {
+        out.write_record(COLUMNS)?;
+        for row in rows {
+            let fields: [&str; 10] = [
+                &row.hash,
+                &row.date,
+                &row.author,
+                &row.subject,
+                &row.driver,
+                if row.safety_related { "true" } else { "false" },
+                &row.auto_cwe,
+                &row.manual_cwe,
+                &row.validator,
+                &row.validation_date,
+            ];
+            out.write_record(fields)?;
+        }
+        Ok(())
+    })
 }
 
 /// commits_summary.csv (v1 shape: totals then per-CWE counts, with
@@ -194,18 +210,12 @@ pub fn commits_csv(rows: &[CommitRow]) -> String {
 pub fn summary_csv(rows: &[CommitRow]) -> String {
     let total = rows.len();
     let safety = rows.iter().filter(|row| row.safety_related).count();
-    let mut out = String::from("metric,value\n");
-    out.push_str(&format!("total_commits,{total}\n"));
-    out.push_str(&format!("safety_related,{safety}\n"));
-    if total > 0 {
-        out.push_str(&format!(
-            "safety_pct,{:.1}\n",
-            safety as f64 * 100.0 / total as f64
-        ));
+    let safety_pct = if total > 0 {
+        format!("{:.1}", safety as f64 * 100.0 / total as f64)
     } else {
-        out.push_str("safety_pct,N/A\n");
-    }
-    let mut counts = std::collections::BTreeMap::new();
+        "N/A".to_owned()
+    };
+    let mut counts = BTreeMap::new();
     for row in rows {
         let cwe = if row.manual_cwe.is_empty() {
             &row.auto_cwe
@@ -216,42 +226,29 @@ pub fn summary_csv(rows: &[CommitRow]) -> String {
             *counts.entry(cwe.clone()).or_insert(0u32) += 1;
         }
     }
-    for (cwe, count) in counts {
-        out.push_str(&format!("{cwe}_count,{count}\n"));
-    }
-    out
+    util::csv_text(|out| {
+        out.write_record(["metric", "value"])?;
+        out.write_record(["total_commits", &total.to_string()])?;
+        out.write_record(["safety_related", &safety.to_string()])?;
+        out.write_record(["safety_pct", &safety_pct])?;
+        for (cwe, count) in &counts {
+            out.write_record([format!("{cwe}_count"), count.to_string()])?;
+        }
+        Ok(())
+    })
 }
 
-fn csv_field(field: &str) -> String {
-    if field.contains(',') || field.contains('"') || field.contains('\n') {
-        format!("\"{}\"", field.replace('"', "\"\""))
-    } else {
-        field.to_owned()
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
-    Toml(toml::de::Error),
-    Regex(String, regex::Error),
-    Git(std::io::Error),
+    #[error("parsing classify rules: {0}")]
+    Toml(#[from] toml::de::Error),
+    #[error("classify rule /{0}/: {1}")]
+    Regex(String, #[source] regex::Error),
+    #[error("running git log: {0}")]
+    Git(#[source] std::io::Error),
+    #[error("git log failed ({0}): {1}")]
     GitFailed(std::process::ExitStatus, String),
 }
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Toml(err) => write!(f, "parsing classify rules: {err}"),
-            Error::Regex(pattern, err) => write!(f, "classify rule /{pattern}/: {err}"),
-            Error::Git(err) => write!(f, "running git log: {err}"),
-            Error::GitFailed(status, stderr) => {
-                write!(f, "git log failed ({status}): {stderr}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {
@@ -343,5 +340,33 @@ mod tests {
             "truncation -> CWE-190: {summary}"
         );
         assert!(summary.contains("CWE-843_count,1"));
+    }
+
+    #[test]
+    fn csv_output_keeps_the_v1_shape_and_quotes_only_when_needed() {
+        let rules = rules();
+        let header = COLUMNS.join(",");
+        assert_eq!(commits_csv(&[]), format!("{header}\n"));
+
+        let mut awkward = row("b1", "null_blk: fix \"double\" free, again", &rules);
+        awkward.auto_cwe = "CWE-415".to_owned();
+        awkward.validator = "line\nbreak".to_owned();
+        let csv = commits_csv(&[awkward]);
+        let mut lines = csv.lines();
+        assert_eq!(lines.next(), Some(header.as_str()));
+        assert_eq!(
+            lines.next(),
+            Some(
+                "b1,2024-01-01T00:00:00+00:00,\"Dev, Some\",\"null_blk: fix \"\"double\"\" free, \
+                 again\",null_blk,true,CWE-415,,\"line"
+            ),
+            "quotes double, commas quote, newlines quote: {csv}"
+        );
+        assert_eq!(lines.next(), Some("break\","));
+
+        assert_eq!(
+            summary_csv(&[]),
+            "metric,value\ntotal_commits,0\nsafety_related,0\nsafety_pct,N/A\n"
+        );
     }
 }

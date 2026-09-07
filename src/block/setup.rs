@@ -1,45 +1,31 @@
 //! `koxi block setup` — acquire and verify every third-party source.
 
-use std::fs;
-use std::process::ExitCode;
+use anyhow::{anyhow, Context};
+use tracing::{info, warn};
 
-use tracing::{error, info, warn};
-
-use crate::block::cli::Opts;
+use crate::block::cli::{BuildOpts, DEFAULT_CC};
 use crate::config::Project;
-use crate::fetch::{self, Ctx};
+use crate::fetch::Ctx;
+use crate::home::{self, CacheLock};
 use crate::lock::{Lock, LOCK_PATH};
-use crate::{fuzz, kernel, virt};
+use crate::{fuzz, kernel, scratch, virt};
 
 use super::fio;
 
-pub fn setup(opts: &Opts, logs: &std::path::Path) -> ExitCode {
-    let project = match Project::locate() {
-        Ok(project) => project,
-        Err(err) => return fail(err),
-    };
-    let home = match fetch::koxi_home() {
-        Ok(home) => home,
-        Err(err) => return fail(err),
-    };
+pub fn drive(build: &BuildOpts, yes: bool, logs: &std::path::Path) -> anyhow::Result<()> {
+    let project = Project::locate()?;
+    let home = home::koxi_home()?;
 
-    if opts.nocache {
-        for sub in [fetch::CACHE_DIR, "tmp"] {
-            let dir = home.join(sub);
-            if dir.exists() {
-                info!("clearing {}", dir.display());
-                if let Err(err) = fs::remove_dir_all(&dir) {
-                    return fail(err);
-                }
-            }
-        }
+    // Every fetch/extract/build below happens under the cache lock,
+    // so concurrent runs sharing the home serialize instead of
+    // racing on the same tarball or extraction.
+    let _cache_lock = CacheLock::acquire(&home)?;
+    if build.nocache {
+        clear_cache(&home)?;
     }
 
     let lock_path = project.root.join(LOCK_PATH);
-    let mut lock = match Lock::load(&lock_path) {
-        Ok(lock) => lock.unwrap_or_default(),
-        Err(err) => return fail(err),
-    };
+    let mut lock = Lock::load(&lock_path)?.unwrap_or_default();
 
     let result = {
         let mut ctx = Ctx {
@@ -48,38 +34,30 @@ pub fn setup(opts: &Opts, logs: &std::path::Path) -> ExitCode {
             home: &home,
             lock: &mut lock,
             logs,
-            assume_yes: opts.yes,
+            assume_yes: yes,
         };
-        drive(&mut ctx, opts)
+        build_all(&mut ctx, build)
     };
 
     // Save even on failure so already-resolved sources stay locked.
     if let Err(err) = lock.save(&lock_path) {
         warn!("could not save {}: {err}", lock_path.display());
     }
-
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => fail(err),
-    }
+    result
 }
 
-fn drive(ctx: &mut Ctx, opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
+fn build_all(ctx: &mut Ctx, opts: &BuildOpts) -> anyhow::Result<()> {
     let kernel = kernel::setup::setup(ctx)?;
     info!("kernel source ready at {}", kernel.display());
     let history = kernel::setup::history(ctx)?;
     info!("kernel history mirror ready at {}", history.display());
     // CLI/env --cc beats koxi.toml [build].cc beats the gcc default;
     // target comes from [build].target.
-    let cc = if opts.cc_from_cli {
-        opts.cc.clone()
-    } else {
-        ctx.config
-            .build
-            .cc
-            .clone()
-            .unwrap_or_else(|| opts.cc.clone())
-    };
+    let cc = opts
+        .cc
+        .clone()
+        .or_else(|| ctx.config.build.cc.clone())
+        .unwrap_or_else(|| DEFAULT_CC.to_owned());
     let target = ctx
         .config
         .build
@@ -104,13 +82,15 @@ fn drive(ctx: &mut Ctx, opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let mut fuzz_modules = modules.clone();
     for extra in &ctx.config.build.extra_artifacts {
-        let Some(file) = extra.file_name().and_then(|name| name.to_str()) else {
-            return Err(format!(
-                "[build].extra-artifacts entry {} has no file name",
-                extra.display()
-            )
-            .into());
-        };
+        let file = extra
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                anyhow!(
+                    "[build].extra-artifacts entry {} has no file name",
+                    extra.display()
+                )
+            })?;
         fuzz_modules.push(kernel::build::Module {
             file: file.to_owned(),
             tree_path: extra.clone(),
@@ -147,52 +127,47 @@ fn drive(ctx: &mut Ctx, opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
     info!("fuzz kernel image ready at {}", fuzz_image.display());
+    userland(ctx, opts)
+}
+
+/// Everything the guest image and the fuzzing/benchmark tooling need,
+/// all sharing --force-build.
+fn userland(ctx: &mut Ctx, opts: &BuildOpts) -> anyhow::Result<()> {
+    let force = virt::build::Options {
+        force: opts.force_build,
+    };
     let (busybox, dropbear) = virt::setup::setup(ctx)?;
     info!("busybox source ready at {}", busybox.display());
     info!("dropbear source ready at {}", dropbear.display());
-    let busybox_bin = virt::build::build(
-        ctx,
-        &virt::build::Options {
-            force: opts.force_build,
-        },
-    )?;
+    let busybox_bin = virt::build::build(ctx, &force)?;
     info!("busybox ready at {}", busybox_bin.display());
-    let dropbear_bin = virt::build::build_dropbear(
-        ctx,
-        &virt::build::Options {
-            force: opts.force_build,
-        },
-    )?;
+    let dropbear_bin = virt::build::build_dropbear(ctx, &force)?;
     info!("dropbear ready at {}", dropbear_bin.display());
     let syzkaller = fuzz::setup::setup(ctx)?;
     info!("syzkaller source ready at {}", syzkaller.display());
-    let syz_bin = fuzz::build::build(
-        ctx,
-        &virt::build::Options {
-            force: opts.force_build,
-        },
-    )?;
+    let syz_bin = fuzz::build::build(ctx, &force)?;
     info!("syzkaller ready at {}", syz_bin.display());
     let fio = fio::setup(ctx)?;
     info!("fio source ready at {}", fio.display());
-    let fio_bin = fio::build(
-        ctx,
-        &virt::build::Options {
-            force: opts.force_build,
-        },
-    )?;
+    let fio_bin = fio::build(ctx, &force)?;
     info!("fio ready at {}", fio_bin.display());
-    let initramfs = virt::initramfs::build(
-        ctx,
-        &virt::build::Options {
-            force: opts.force_build,
-        },
-    )?;
+    let initramfs = virt::initramfs::build(ctx, &force)?;
     info!("initramfs ready at {}", initramfs.display());
     Ok(())
 }
 
-fn fail(err: impl std::fmt::Display) -> ExitCode {
-    error!("koxi block setup: {err}");
-    ExitCode::FAILURE
+/// `--nocache`: drop every cache entry (the lock file stays — it is
+/// the inode other runs block on) and sweep dead scratch.
+fn clear_cache(home: &std::path::Path) -> anyhow::Result<()> {
+    let plan = home::gc_plan(home, &std::collections::BTreeSet::new())
+        .context("planning the cache sweep")?;
+    if !plan.remove.is_empty() {
+        info!("clearing {}", home.join(home::CACHE_DIR).display());
+        home::gc_apply(&plan)?;
+    }
+    let swept = scratch::sweep(home)?;
+    for live in swept.live {
+        warn!("leaving live build scratch {}", live.display());
+    }
+    Ok(())
 }

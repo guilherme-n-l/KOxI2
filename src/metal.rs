@@ -10,17 +10,20 @@
 //! Interactive by design: ssh/scp/kexec output streams to the
 //! console rather than task logs.
 
-use std::io::IsTerminal;
 use std::path::Path;
 use std::process::{Command, ExitCode};
 use std::thread;
 use std::time::Duration;
 
-use clap::{Arg, ArgAction, ArgMatches};
+use anyhow::{bail, ensure, Context};
+use clap::ArgMatches;
 
+use crate::cli::Globals;
 use crate::config::{BaremetalConfig, Project};
 use crate::kernel::build::{ARTIFACTS_DIR, BZIMAGE};
+use crate::util::confirm;
 use crate::virt::initramfs::INITRAMFS;
+use crate::virt::runner;
 
 const REMOTE_DIR: &str = "/tmp/koxi-metal";
 
@@ -29,43 +32,30 @@ pub fn command() -> clap::Command {
         .about("Bare-metal target control (kexec)")
         .subcommand_required(true)
         .arg_required_else_help(true)
-        .subcommand(
-            clap::Command::new("boot")
-                .about("Push artifacts and kexec the target into the test kernel")
-                .arg(
-                    Arg::new("yes")
-                        .long("yes")
-                        .action(ArgAction::SetTrue)
-                        .help("Skip the confirmation prompt"),
-                ),
-        )
+        .subcommand(clap::Command::new("boot").about(
+            "Push artifacts and kexec the target into the test kernel (asks first; --yes skips)",
+        ))
         .subcommand(
             clap::Command::new("reset").about("Reboot the target back into its resident OS"),
         )
 }
 
-pub fn run(matches: &ArgMatches) -> ExitCode {
-    let result = match matches.subcommand() {
-        Some(("boot", sub)) => boot(sub.get_flag("yes")),
-        Some(("reset", _)) => reset(),
+pub fn run(matches: &ArgMatches, globals: &Globals) -> anyhow::Result<ExitCode> {
+    match matches.subcommand() {
+        Some(("boot", _)) => boot(globals.yes)?,
+        Some(("reset", _)) => reset()?,
         _ => unreachable!("subcommand is required"),
-    };
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("koxi metal: {err}");
-            ExitCode::FAILURE
-        }
     }
+    Ok(ExitCode::SUCCESS)
 }
 
-fn target() -> Result<(Project, BaremetalConfig), String> {
-    let project = Project::locate().map_err(|err| err.to_string())?;
+fn target() -> anyhow::Result<(Project, BaremetalConfig)> {
+    let project = Project::locate()?;
     let baremetal = project
         .config
         .baremetal
         .clone()
-        .ok_or("koxi.toml has no [baremetal] table (host = \"user@target\")")?;
+        .context("koxi.toml has no [baremetal] table (host = \"user@target\")")?;
     Ok((project, baremetal))
 }
 
@@ -80,41 +70,24 @@ fn guest_addr(config: &BaremetalConfig) -> String {
     })
 }
 
-fn boot(yes: bool) -> Result<(), String> {
+fn boot(yes: bool) -> anyhow::Result<()> {
     let (project, config) = target()?;
     let artifacts = project.root.join(ARTIFACTS_DIR);
     let bzimage = artifacts.join(BZIMAGE);
     let initramfs = artifacts.join(INITRAMFS);
     for path in [&bzimage, &initramfs] {
-        if !path.is_file() {
-            return Err(format!(
-                "{} missing — run `koxi block setup` first",
-                path.display()
-            ));
-        }
+        ensure!(
+            path.is_file(),
+            "{} missing — run `koxi block setup` first",
+            path.display()
+        );
     }
 
-    if !yes {
-        if !std::io::stdin().is_terminal() {
-            return Err(format!(
-                "kexec will replace the OS on {} until reset; rerun with --yes",
-                config.host
-            ));
-        }
-        eprint!(
-            "kexec will replace the running OS on {} until reset. Continue? [y/N] ",
-            config.host
-        );
-        use std::io::Write;
-        std::io::stderr().flush().ok();
-        let mut answer = String::new();
-        std::io::stdin()
-            .read_line(&mut answer)
-            .map_err(|err| err.to_string())?;
-        if !matches!(answer.trim(), "y" | "Y" | "yes") {
-            return Err("aborted".to_owned());
-        }
-    }
+    let prompt = format!(
+        "kexec will replace the running OS on {} until reset. Continue?",
+        config.host
+    );
+    ensure!(confirm(&prompt, yes)?, "aborted");
 
     println!("pushing artifacts to {}", config.host);
     host_ssh(&config, &["mkdir", "-p", REMOTE_DIR])?;
@@ -124,17 +97,14 @@ fn boot(yes: bool) -> Result<(), String> {
         .arg(&initramfs)
         .arg(format!("{}:{REMOTE_DIR}/", config.host))
         .status()
-        .map_err(|err| format!("running scp: {err}"))?;
-    if !status.success() {
-        return Err(format!("scp to {} failed: {status}", config.host));
-    }
+        .context("running scp")?;
+    ensure!(status.success(), "scp to {} failed: {status}", config.host);
 
-    let net = config.net.clone().unwrap_or_else(|| "dhcp".to_owned());
-    let append = format!(
-        "console=tty0 console=ttyS0,115200 koxi.net={net}{}{}",
-        if config.append.is_some() { " " } else { "" },
-        config.append.as_deref().unwrap_or("")
-    );
+    let net = config.net.as_deref().unwrap_or("dhcp");
+    let append = match &config.append {
+        Some(extra) => format!("console=tty0 console=ttyS0,115200 koxi.net={net} {extra}"),
+        None => format!("console=tty0 console=ttyS0,115200 koxi.net={net}"),
+    };
     println!("loading test kernel (append: {append})");
     host_ssh(
         &config,
@@ -148,17 +118,19 @@ fn boot(yes: bool) -> Result<(), String> {
             &format!("--append={append}"),
         ],
     )
-    .map_err(|err| format!("{err} (kexec-tools installed? passwordless sudo? lockdown off?)"))?;
+    .context("kexec-tools installed? passwordless sudo? lockdown off?")?;
 
     println!("executing kexec — the ssh connection will drop");
     // The machine warm-boots mid-command; any exit is fine.
     let _ = Command::new("ssh")
-        .arg("-o")
-        .arg("ConnectTimeout=5")
-        .arg("-o")
-        .arg("ServerAliveInterval=2")
-        .arg("-o")
-        .arg("ServerAliveCountMax=2")
+        .args([
+            "-o",
+            "ConnectTimeout=5",
+            "-o",
+            "ServerAliveInterval=2",
+            "-o",
+            "ServerAliveCountMax=2",
+        ])
         .arg(&config.host)
         .args(["sudo", "-n", "kexec", "-e"])
         .status();
@@ -174,13 +146,13 @@ fn boot(yes: bool) -> Result<(), String> {
             return Ok(());
         }
     }
-    Err(format!(
+    bail!(
         "test kernel did not answer at {guest} within 3 minutes; check the console \
          (wrong NIC driver in the kernel config, or koxi.net mismatch?)"
-    ))
+    )
 }
 
-fn reset() -> Result<(), String> {
+fn reset() -> anyhow::Result<()> {
     let (project, config) = target()?;
     let guest = guest_addr(&config);
     let key = project.root.join(ARTIFACTS_DIR).join("keys/id_ed25519");
@@ -197,50 +169,40 @@ fn reset() -> Result<(), String> {
             return Ok(());
         }
     }
-    Err(format!(
+    bail!(
         "{} did not come back within 5 minutes; it may need a manual power cycle",
         config.host
-    ))
+    )
 }
 
-fn host_ssh(config: &BaremetalConfig, args: &[&str]) -> Result<(), String> {
+/// Run `args` on the resident OS with the user's own ssh identity.
+fn host_ssh(config: &BaremetalConfig, args: &[&str]) -> anyhow::Result<()> {
     let status = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=5")
+        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"])
         .arg(&config.host)
         .args(args)
         .status()
-        .map_err(|err| format!("running ssh: {err}"))?;
-    if !status.success() {
-        return Err(format!(
-            "ssh {} {} failed: {status}",
-            config.host,
-            args.join(" ")
-        ));
-    }
+        .context("running ssh")?;
+    ensure!(
+        status.success(),
+        "ssh {} {} failed: {status}",
+        config.host,
+        args.join(" ")
+    );
     Ok(())
 }
 
-fn guest_ssh(key: &Path, guest: &str, command: &str) -> Result<String, String> {
-    let output = Command::new("ssh")
-        .arg("-i")
-        .arg(key)
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg("UserKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg("ConnectTimeout=3")
+/// Run `command` on the test kernel's dropbear, capturing stdout.
+fn guest_ssh(key: &Path, guest: &str, command: &str) -> anyhow::Result<String> {
+    let output = runner::ssh_command(key, true)
         .arg(format!("root@{guest}"))
         .arg(command)
         .output()
-        .map_err(|err| format!("running ssh: {err}"))?;
-    if !output.status.success() {
-        return Err(format!("guest ssh failed: {}", output.status));
-    }
+        .context("running ssh")?;
+    ensure!(
+        output.status.success(),
+        "guest ssh failed: {}",
+        output.status
+    );
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }

@@ -8,6 +8,7 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
+use anyhow::Context;
 use clap::{Arg, ArgAction, ArgMatches, Command};
 
 const TEMPLATE_FILES: &[(&str, &str)] = &[
@@ -32,28 +33,26 @@ pub fn command() -> Command {
         )
 }
 
-pub fn run(matches: &ArgMatches) -> ExitCode {
+pub fn run(matches: &ArgMatches) -> anyhow::Result<ExitCode> {
     match matches.subcommand() {
-        Some(("init", sub)) => init(sub.get_flag("force")),
+        Some(("init", sub)) => init(sub.get_flag("force"))?,
         _ => unreachable!("subcommand is required"),
     }
+    Ok(ExitCode::SUCCESS)
 }
 
-fn init(force: bool) -> ExitCode {
+fn init(force: bool) -> anyhow::Result<()> {
     for (name, contents) in TEMPLATE_FILES {
         let path = Path::new(name);
         if path.exists() && !force {
             println!("skipped {name} (exists; use --force to overwrite)");
             continue;
         }
-        if let Err(err) = fs::write(path, contents) {
-            eprintln!("koxi nix init: writing {name}: {err}");
-            return ExitCode::FAILURE;
-        }
+        fs::write(path, contents).with_context(|| format!("writing {name}"))?;
         println!("wrote {name}");
     }
     println!("\nnext: nix develop    # then: koxi block test && koxi block setup");
-    ExitCode::SUCCESS
+    Ok(())
 }
 
 #[cfg(test)]

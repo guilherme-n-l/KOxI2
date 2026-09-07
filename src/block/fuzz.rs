@@ -15,193 +15,251 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
-use std::process::{Command, ExitCode, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use tracing::{error, info, warn};
+use anyhow::{anyhow, bail};
+use tracing::{info, warn};
 
-use crate::block::cli::Opts;
+use crate::assets;
+use crate::block::cli::{FuzzOpts, Profile, RunOpts};
 use crate::block::results::{self, ArtifactShas, Campaign, FuzzKnobs, Identity, Manifest};
+use crate::block::DriverPair;
+use crate::cli::GuestOpts;
 use crate::config::{anchored, Driver, Project};
+use crate::home;
+use crate::host;
 use crate::kernel::build::{Flavor, ARTIFACTS_DIR, BZIMAGE};
 use crate::lock::{Lock, LOCK_PATH};
+use crate::scratch::Scratch;
+use crate::util;
 use crate::virt::runner;
-use crate::{assets, fetch};
 
-pub fn fuzz(opts: &Opts, logs: &Path) -> ExitCode {
-    match drive(opts, logs) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            error!("koxi block fuzz: {err}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-pub(crate) fn drive(opts: &Opts, logs: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn drive(
+    run: &RunOpts,
+    profile: Profile,
+    guest: &GuestOpts,
+    opts: &FuzzOpts,
+    yes: bool,
+    logs: &Path,
+) -> anyhow::Result<()> {
     let project = Project::locate()?;
     let artifacts = project.root.join(ARTIFACTS_DIR);
     let fuzz_dir = Flavor::Fuzz.dir(&artifacts);
     let kernel = fuzz_dir.join(BZIMAGE);
-    let base_initrd = anchored(&project.root, &opts.initrd);
-    let syz_root = opts
-        .syz_root
-        .as_deref()
-        .map(|path| anchored(&project.root, path))
-        .unwrap_or_else(|| artifacts.join("syzkaller"));
-    let syz_manager = opts
-        .syz_manager
-        .as_deref()
-        .map(|path| anchored(&project.root, path))
-        .unwrap_or_else(|| syz_root.join("bin/syz-manager"));
+    let base_initrd = anchored(&project.root, &guest.initrd);
+    let syz_root = opts.syz_root.as_deref().map_or_else(
+        || artifacts.join("syzkaller"),
+        |path| anchored(&project.root, path),
+    );
+    let syz_manager = opts.syz_manager.as_deref().map_or_else(
+        || syz_root.join("bin/syz-manager"),
+        |path| anchored(&project.root, path),
+    );
     let ssh_key = artifacts.join("keys/id_ed25519");
     for input in [&kernel, &base_initrd, &syz_manager, &ssh_key] {
         if !input.is_file() {
-            return Err(
-                format!("{} missing — run `koxi block setup` first", input.display()).into(),
-            );
+            bail!("{} missing — run `koxi block setup` first", input.display());
         }
     }
     let vmlinux = fuzz_dir.join("vmlinux");
     if !vmlinux.is_file() {
-        return Err(format!(
+        bail!(
             "{} missing — vmlinux must be in [build].extra-artifacts; re-run `koxi block setup`",
             vmlinux.display()
-        )
-        .into());
+        );
     }
     let lock = Lock::load(&project.root.join(LOCK_PATH))?
-        .ok_or("no koxi.lock — run `koxi block setup` first")?;
-    let kconfig_sha = lock
-        .artifacts
-        .get("fuzz/config")
-        .cloned()
-        .ok_or("fuzz kernel config not locked — run `koxi block setup` first")?;
+        .ok_or_else(|| anyhow!("no koxi.lock — run `koxi block setup` first"))?;
+    let kconfig_sha =
+        lock.artifacts.get("fuzz/config").cloned().ok_or_else(|| {
+            anyhow!("fuzz kernel config not locked — run `koxi block setup` first")
+        })?;
 
-    let results_root = anchored(&project.root, &opts.output);
-    let host = runner::hostname();
-    let accel = runner::accel();
-    if accel == "tcg" {
-        warn!("no KVM on this host — TCG fuzzing is smoke-only and finds very little");
-    }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
-    let campaign = opts.campaign.clone().unwrap_or_else(|| now.to_string());
+    // syz-manager drives --fuzz-parallel guests at once, all of them
+    // this size.
+    super::check_host(profile, &guest.memory, guest.smp, opts.parallel)?;
 
-    let kernel_sha = fetch::sha256(&kernel, logs)?;
-    let initrd_sha = fetch::sha256(&base_initrd, logs)?;
-    let syz_sha = fetch::sha256(&syz_manager, logs)?;
     let knobs = FuzzKnobs {
-        campaigns: opts.fuzz_campaigns,
-        hours: opts.fuzz_hours,
-        parallel: opts.fuzz_parallel,
+        campaigns: opts.campaigns,
+        hours: opts.hours,
+        parallel: opts.parallel,
     };
     if knobs.campaigns == 0 || knobs.hours <= 0.0 || knobs.parallel == 0 {
-        return Err("empty fuzz plan (check --fuzz-campaigns/--fuzz-hours/--fuzz-parallel)".into());
+        bail!("empty fuzz plan (check --fuzz-campaigns/--fuzz-hours/--fuzz-parallel)");
     }
-
-    let pairs = super::driver_pairs(&project.config, &opts.only);
+    let pairs = super::driver_pairs(&project.config, &run.scope.only);
     if pairs.is_empty() {
-        return Err("no matching driver pairs in the [block.drivers] registry".into());
+        bail!("no matching driver pairs in the [block.drivers] registry");
     }
 
-    for (rs_name, rs_driver, c_name, c_driver) in pairs {
-        let identity = |name: &str,
-                        driver: &Driver,
-                        base_cfg: &BaseCfg|
-         -> Result<Identity, Box<dyn std::error::Error>> {
-            Ok(Identity {
-                domain: "fuzz".to_owned(),
-                driver: name.to_owned(),
-                spec: runner::driver_spec(name, driver),
-                prep: driver.prep.clone().unwrap_or_default(),
-                host: host.clone(),
-                accel: Some(accel.to_owned()),
-                smp: Some(opts.smp),
-                memory: Some(opts.memory.clone()),
-                artifacts: Some(ArtifactShas {
-                    kernel: kernel_sha.clone(),
-                    initrd: initrd_sha.clone(),
-                    module: fetch::sha256(&fuzz_dir.join(&driver.ko), logs)?,
-                    kconfig: kconfig_sha.clone(),
-                    syzkaller: Some(syz_sha.clone()),
-                    syz_template: Some(base_cfg.sha256.clone()),
-                }),
-                source: None,
-                fio: None,
-                fuzz: Some(knobs.clone()),
-                static_: None,
-            })
-        };
-        let shared = SharedCfg {
-            project: &project,
-            opts,
-            logs,
-            kernel: &kernel,
-            base_initrd: &base_initrd,
-            fuzz_dir: &fuzz_dir,
-            syz_root: &syz_root,
-            syz_manager: &syz_manager,
-            ssh_key: &ssh_key,
-            qemu_args: if accel == "kvm" { "-enable-kvm" } else { "" },
-            knobs: &knobs,
-        };
+    let accel = host::accel();
+    let ids = Ids {
+        host: runner::hostname(),
+        accel,
+        kernel_sha: util::sha256_file(&kernel)?,
+        initrd_sha: util::sha256_file(&base_initrd)?,
+        syz_sha: util::sha256_file(&syz_manager)?,
+        kconfig_sha,
+        fuzz_dir: &fuzz_dir,
+        smp: guest.smp,
+        memory: &guest.memory,
+        knobs: &knobs,
+    };
+    let shared = SharedCfg {
+        project: &project,
+        guest,
+        logs,
+        kernel: &kernel,
+        base_initrd: &base_initrd,
+        fuzz_dir: &fuzz_dir,
+        syz_root: &syz_root,
+        syz_manager: &syz_manager,
+        syz_cfg: opts.syz_cfg.as_deref(),
+        syz_http_port: opts.syz_http_port,
+        ssh_key: &ssh_key,
+        qemu_args: if accel == "kvm" { "-enable-kvm" } else { "" },
+        knobs: &knobs,
+    };
+    let now = util::unix_now();
+    let plan = Plan {
+        results_root: anchored(&project.root, &run.scope.output),
+        campaign: run.campaign(now),
+        now,
+        p1: run.p1,
+        force_p1: run.force_p1,
+        yes,
+    };
 
-        // p1: the C baseline — fuzz is a phase-1 screening domain, so
-        // it runs even under --p1 (unlike perf).
-        let c_cfg = base_cfg(&project, opts, c_name)?;
-        let c_identity = identity(c_name, c_driver, &c_cfg)?;
-        let c_hash = results::identity_hash(&c_identity)?;
-        let p1_dir = results::p1_dir(&results_root, c_name, "fuzz", &c_hash);
-        if !(opts.force_p1 || opts.force_build) && Manifest::is_complete(&p1_dir) {
-            info!(
-                "p1 fuzz cached for {c_name} at {} (--force-p1 re-runs)",
-                p1_dir.display()
-            );
-        } else {
-            info!("p1 fuzz: {c_name} -> {}", p1_dir.display());
-            let manifest = Manifest {
-                complete: false,
-                created: now,
-                seed: now,
-                koxi: env!("CARGO_PKG_VERSION").to_owned(),
-                identity: c_identity,
-                p2: None,
-            };
-            run_campaigns(&shared, c_name, c_driver, &p1_dir, manifest, &c_cfg)?;
-        }
-
-        if opts.p1 {
-            info!("phase 1 only: skipping p2 fuzz for {c_name}::{rs_name}");
-            continue;
-        }
-        let rs_cfg = base_cfg(&project, opts, rs_name)?;
-        let rs_identity = identity(rs_name, rs_driver, &rs_cfg)?;
-        let p2_dir = results::p2_dir(&results_root, c_name, rs_name, &campaign, "fuzz");
-        let manifest = Manifest {
-            complete: false,
-            created: now,
-            seed: now,
-            koxi: env!("CARGO_PKG_VERSION").to_owned(),
-            identity: rs_identity,
-            p2: Some(Campaign {
-                campaign: campaign.clone(),
-                c_driver: c_name.clone(),
-                rs_driver: rs_name.clone(),
-                baseline: c_hash,
-            }),
-        };
-        if !results::clear_for_campaign(&p2_dir, &manifest, opts.yes)? {
-            info!("p2 fuzz skipped for {c_name}::{rs_name}");
-            continue;
-        }
-        info!("p2 fuzz: {c_name}::{rs_name} -> {}", p2_dir.display());
-        run_campaigns(&shared, rs_name, rs_driver, &p2_dir, manifest, &rs_cfg)?;
+    for pair in pairs {
+        fuzz_pair(&shared, &ids, &plan, &pair)?;
     }
     Ok(())
+}
+
+/// What makes this run's campaigns comparable: substrate tags plus
+/// the artifact hashes every driver of the run shares.
+struct Ids<'a> {
+    host: String,
+    accel: &'static str,
+    kernel_sha: String,
+    initrd_sha: String,
+    syz_sha: String,
+    kconfig_sha: String,
+    fuzz_dir: &'a Path,
+    smp: u32,
+    memory: &'a str,
+    knobs: &'a FuzzKnobs,
+}
+
+impl Ids<'_> {
+    fn identity(&self, name: &str, driver: &Driver, base: &BaseCfg) -> anyhow::Result<Identity> {
+        Ok(Identity {
+            domain: "fuzz".to_owned(),
+            driver: name.to_owned(),
+            spec: runner::driver_spec(name, driver),
+            prep: driver.prep.clone().unwrap_or_default(),
+            host: self.host.clone(),
+            accel: Some(self.accel.to_owned()),
+            smp: Some(self.smp),
+            memory: Some(self.memory.to_owned()),
+            artifacts: Some(ArtifactShas {
+                kernel: self.kernel_sha.clone(),
+                initrd: self.initrd_sha.clone(),
+                module: util::sha256_file(&self.fuzz_dir.join(&driver.ko))?,
+                kconfig: self.kconfig_sha.clone(),
+                syzkaller: Some(self.syz_sha.clone()),
+                syz_template: Some(base.sha256.clone()),
+            }),
+            source: None,
+            fio: None,
+            fuzz: Some(self.knobs.clone()),
+            static_: None,
+        })
+    }
+}
+
+/// Where this run writes and under what name.
+struct Plan {
+    results_root: PathBuf,
+    campaign: String,
+    now: u64,
+    p1: bool,
+    force_p1: bool,
+    yes: bool,
+}
+
+/// One pair: the C baseline (fuzz is a phase-1 screening domain, so
+/// it runs even under --p1) then the Rust driver under the campaign.
+fn fuzz_pair(shared: &SharedCfg, ids: &Ids, plan: &Plan, pair: &DriverPair) -> anyhow::Result<()> {
+    let manifest = |identity: Identity, p2: Option<Campaign>| Manifest {
+        complete: false,
+        created: plan.now,
+        seed: plan.now,
+        koxi: env!("CARGO_PKG_VERSION").to_owned(),
+        identity,
+        p2,
+    };
+
+    let c_cfg = base_cfg(shared, pair.c_name)?;
+    let c_identity = ids.identity(pair.c_name, pair.c, &c_cfg)?;
+    let c_hash = results::identity_hash(&c_identity)?;
+    let p1_dir = results::p1_dir(&plan.results_root, pair.c_name, "fuzz", &c_hash);
+    if !plan.force_p1 && Manifest::is_complete(&p1_dir) {
+        info!(
+            "p1 fuzz cached for {} at {} (--force-p1 re-runs)",
+            pair.c_name,
+            p1_dir.display()
+        );
+    } else {
+        info!("p1 fuzz: {} -> {}", pair.c_name, p1_dir.display());
+        run_campaigns(
+            shared,
+            pair.c_name,
+            pair.c,
+            &p1_dir,
+            manifest(c_identity, None),
+            &c_cfg,
+        )?;
+    }
+
+    if plan.p1 {
+        info!(
+            "phase 1 only: skipping p2 fuzz for {}::{}",
+            pair.c_name, pair.rs_name
+        );
+        return Ok(());
+    }
+    let rs_cfg = base_cfg(shared, pair.rs_name)?;
+    let p2_dir = results::p2_dir(
+        &plan.results_root,
+        pair.c_name,
+        pair.rs_name,
+        &plan.campaign,
+        "fuzz",
+    );
+    let rs_manifest = manifest(
+        ids.identity(pair.rs_name, pair.rs, &rs_cfg)?,
+        Some(Campaign {
+            campaign: plan.campaign.clone(),
+            c_driver: pair.c_name.to_owned(),
+            rs_driver: pair.rs_name.to_owned(),
+            baseline: c_hash,
+        }),
+    );
+    if !results::clear_for_campaign(&p2_dir, &rs_manifest, plan.yes)? {
+        info!("p2 fuzz skipped for {}::{}", pair.c_name, pair.rs_name);
+        return Ok(());
+    }
+    info!(
+        "p2 fuzz: {}::{} -> {}",
+        pair.c_name,
+        pair.rs_name,
+        p2_dir.display()
+    );
+    run_campaigns(shared, pair.rs_name, pair.rs, &p2_dir, rs_manifest, &rs_cfg)
 }
 
 /// The user-tunable base config: --syz-cfg wins, then the per-driver
@@ -211,49 +269,49 @@ struct BaseCfg {
     sha256: String,
 }
 
-fn base_cfg(
-    project: &Project,
-    opts: &Opts,
-    driver: &str,
-) -> Result<BaseCfg, Box<dyn std::error::Error>> {
-    let contents = match &opts.syz_cfg {
-        Some(path) => {
-            let path = anchored(&project.root, path);
-            fs::read_to_string(&path)
-                .map_err(|err| format!("reading --syz-cfg {}: {err}", path.display()))?
-        }
-        None => {
-            let custom = format!("syzkaller/{driver}.cfg");
-            match assets::load(&project.root, &project.config, &custom) {
-                Ok(contents) => {
-                    info!("using custom syzkaller config asset {custom}");
-                    contents.into_owned()
-                }
-                Err(assets::Error::Unknown(_)) => {
-                    assets::load(&project.root, &project.config, "syzkaller/generic.cfg")?
-                        .into_owned()
-                }
-                Err(err) => return Err(err.into()),
+fn base_cfg(shared: &SharedCfg, driver: &str) -> anyhow::Result<BaseCfg> {
+    let contents = if let Some(path) = shared.syz_cfg {
+        let path = anchored(&shared.project.root, path);
+        fs::read_to_string(&path)
+            .map_err(|err| anyhow!("reading --syz-cfg {}: {err}", path.display()))?
+    } else {
+        let custom = format!("syzkaller/{driver}.cfg");
+        let project = shared.project;
+        match assets::load(&project.root, &project.config, &custom) {
+            Ok(contents) => {
+                info!("using custom syzkaller config asset {custom}");
+                contents.into_owned()
             }
+            Err(assets::Error::Unknown(_)) => {
+                assets::load(&project.root, &project.config, "syzkaller/generic.cfg")?.into_owned()
+            }
+            Err(err) => return Err(err.into()),
         }
     };
-    let sha256 = assets::sha256_text(&contents)?;
+    let sha256 = util::sha256_bytes(contents.as_bytes());
     Ok(BaseCfg { contents, sha256 })
 }
 
 struct SharedCfg<'a> {
     project: &'a Project,
-    opts: &'a Opts,
+    guest: &'a GuestOpts,
     logs: &'a Path,
     kernel: &'a Path,
     base_initrd: &'a Path,
     fuzz_dir: &'a Path,
     syz_root: &'a Path,
     syz_manager: &'a Path,
+    syz_cfg: Option<&'a Path>,
+    syz_http_port: u16,
     ssh_key: &'a Path,
     qemu_args: &'a str,
     knobs: &'a FuzzKnobs,
 }
+
+/// Written when a campaign has run its whole budget (v1
+/// `.campaign_done`). Its absence means the process died mid-campaign,
+/// which is what separates "found nothing" from "we do not know".
+pub const CAMPAIGN_DONE: &str = ".campaign_done";
 
 /// One driver's campaigns: the overlay initrd is staged once and
 /// lives for the whole run; campaigns resume via per-campaign
@@ -265,7 +323,7 @@ fn run_campaigns(
     outdir: &Path,
     manifest: Manifest,
     base: &BaseCfg,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> anyhow::Result<()> {
     let mut manifest = match Manifest::load(outdir)? {
         Some(existing) if existing.identity == manifest.identity => existing,
         _ => {
@@ -274,11 +332,7 @@ fn run_campaigns(
         }
     };
 
-    let tmp_root = fetch::koxi_home()?.join("tmp");
-    fs::create_dir_all(&tmp_root)?;
-    let scratch = tempfile::Builder::new()
-        .prefix("fuzz-")
-        .tempdir_in(&tmp_root)?;
+    let scratch = Scratch::new(&home::koxi_home()?, "fuzz-")?;
     let run_initrd = runner::driver_initrd(
         scratch.path(),
         shared.base_initrd,
@@ -289,7 +343,7 @@ fn run_campaigns(
         shared.logs,
     )?;
 
-    let mem = mem_mb(&shared.opts.memory)?;
+    let mem = mem_mb(&shared.guest.memory)?;
     info!(
         "fuzzing {name}: {} campaigns x {}h, {} VMs each",
         shared.knobs.campaigns, shared.knobs.hours, shared.knobs.parallel
@@ -302,14 +356,14 @@ fn run_campaigns(
                 "syzkaller": shared.syz_root.display().to_string(),
                 "kernel_obj": shared.fuzz_dir.display().to_string(),
                 "image": image.display().to_string(),
-                "http": format!("127.0.0.1:{}", shared.opts.syz_http_port),
+                "http": format!("127.0.0.1:{}", shared.syz_http_port),
                 "workdir": workdir.display().to_string(),
                 "type": "qemu",
                 "vm": {
                     "count": shared.knobs.parallel,
                     "kernel": shared.kernel.display().to_string(),
                     "initrd": run_initrd.display().to_string(),
-                    "cpu": shared.opts.smp,
+                    "cpu": shared.guest.smp,
                     "mem": mem,
                     "qemu_args": shared.qemu_args,
                 },
@@ -342,8 +396,8 @@ fn run_campaign(
     shared: &SharedCfg,
     base: &str,
     machine: impl Fn(&Path, &Path) -> serde_json::Value,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let done = workdir.join(".campaign_done");
+) -> anyhow::Result<()> {
+    let done = workdir.join(CAMPAIGN_DONE);
     if done.is_file() {
         info!("campaign {index} already complete at {}", workdir.display());
         return Ok(());
@@ -359,7 +413,7 @@ fn run_campaign(
     let image = scratch.join(format!("disk_{index}.img"));
     File::create(&image)?.set_len(128 * 1024 * 1024)?;
 
-    let config = merged_config(base, machine(&image, workdir))?;
+    let config = merged_config(base, machine(&image, workdir)).map_err(anyhow::Error::msg)?;
     let config_path = workdir.join("syz.cfg");
     fs::write(&config_path, config)?;
 
@@ -421,14 +475,12 @@ fn run_campaign(
 }
 
 fn crash_buckets(workdir: &Path) -> usize {
-    fs::read_dir(workdir.join("crashes"))
-        .map(|entries| {
-            entries
-                .filter_map(Result::ok)
-                .filter(|entry| entry.path().is_dir())
-                .count()
-        })
-        .unwrap_or(0)
+    fs::read_dir(workdir.join("crashes")).map_or(0, |entries| {
+        entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_dir())
+            .count()
+    })
 }
 
 /// Overlay the machine-owned fields onto the user's base config as
@@ -441,16 +493,14 @@ fn merged_config(base: &str, machine: serde_json::Value) -> Result<String, Strin
     let object = config
         .as_object_mut()
         .ok_or("base syzkaller config is not a JSON object")?;
-    let machine = match machine {
-        serde_json::Value::Object(map) => map,
-        _ => unreachable!("machine config is an object"),
+    let serde_json::Value::Object(machine) = machine else {
+        unreachable!("machine config is an object")
     };
     for (key, value) in machine {
         if key == "vm" {
             if let Some(user_vm) = object.get_mut("vm").and_then(|vm| vm.as_object_mut()) {
-                let vm = match value {
-                    serde_json::Value::Object(map) => map,
-                    _ => unreachable!("vm config is an object"),
+                let serde_json::Value::Object(vm) = value else {
+                    unreachable!("vm config is an object")
                 };
                 for (vm_key, vm_value) in vm {
                     if user_vm.contains_key(&vm_key) {
@@ -471,19 +521,12 @@ fn merged_config(base: &str, machine: serde_json::Value) -> Result<String, Strin
     serde_json::to_string_pretty(&config).map_err(|err| err.to_string())
 }
 
-/// "4G" -> 4096, "512M" -> 512, bare numbers are MB (syz-manager's
-/// vm.mem unit).
-fn mem_mb(memory: &str) -> Result<u64, String> {
-    let trimmed = memory.trim();
-    let (digits, unit) = match trimmed.chars().last() {
-        Some('G') | Some('g') => (&trimmed[..trimmed.len() - 1], 1024),
-        Some('M') | Some('m') => (&trimmed[..trimmed.len() - 1], 1),
-        _ => (trimmed, 1),
-    };
-    digits
-        .parse::<u64>()
-        .map(|value| value * unit)
-        .map_err(|_| format!("cannot parse --memory {memory} as a size"))
+/// syz-manager's vm.mem is in MiB; the qemu-style spelling is
+/// parsed once, by the same code the host-fitness gate uses.
+fn mem_mb(memory: &str) -> anyhow::Result<u64> {
+    host::parse_memory(memory)
+        .map(|bytes| bytes >> 20)
+        .ok_or_else(|| anyhow!("cannot parse --memory {memory} as a size"))
 }
 
 #[cfg(test)]

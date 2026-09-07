@@ -22,13 +22,16 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use anyhow::{ensure, Context};
 use regex::{Regex, RegexBuilder};
 use serde_json::json;
 use tracing::{info, warn};
 
-use crate::block::cli::Opts;
+use crate::block::cli::CompareOpts;
+use crate::block::fuzz::CAMPAIGN_DONE;
 use crate::block::results::Manifest;
 use crate::stats;
+use crate::util::{csv_text, files_under, round};
 
 const TARGET: &str = "target_attributable";
 const INFRA: &str = "infrastructure_noise";
@@ -98,23 +101,23 @@ pub(super) struct OverrideRow {
 /// Sidecar override CSV: campaign,crash_id,classification,validator,date,notes.
 pub(super) fn load_validated_crashes(
     path: &Path,
-) -> Result<HashMap<(String, String), OverrideRow>, Box<dyn std::error::Error>> {
+) -> anyhow::Result<HashMap<(String, String), OverrideRow>> {
     let mut overrides = HashMap::new();
-    for line in fs::read_to_string(path)?.lines().skip(1) {
+    let content =
+        fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    for line in content.lines().skip(1) {
         let fields: Vec<&str> = line.split(',').collect();
-        let get = |index: usize| fields.get(index).map(|f| f.trim()).unwrap_or("");
+        let get = |index: usize| fields.get(index).map_or("", |field| field.trim());
         let (campaign, crash_id, class) = (get(0), get(1), get(2));
         if campaign.is_empty() || crash_id.is_empty() || class.is_empty() {
             continue;
         }
-        if !CLASSES.contains(&class) {
-            return Err(format!(
-                "{}: invalid classification {class:?} for {campaign}/{crash_id}; \
-                 expected one of {CLASSES:?}",
-                path.display()
-            )
-            .into());
-        }
+        ensure!(
+            CLASSES.contains(&class),
+            "{}: invalid classification {class:?} for {campaign}/{crash_id}; \
+             expected one of {CLASSES:?}",
+            path.display()
+        );
         overrides.insert(
             (campaign.to_string(), crash_id.to_string()),
             OverrideRow {
@@ -159,34 +162,12 @@ pub(super) fn classify_campaign(
     classifier: &Classifier,
     campaign_dir: &Path,
     overrides: &HashMap<(String, String), OverrideRow>,
-) -> Result<CampaignSummary, Box<dyn std::error::Error>> {
+) -> anyhow::Result<CampaignSummary> {
     let campaign = campaign_dir
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let crashes_dir = campaign_dir.join("crashes");
-
-    let mut groups: Vec<(String, Vec<PathBuf>)> = Vec::new();
-    if crashes_dir.is_dir() {
-        let mut children: Vec<PathBuf> = fs::read_dir(&crashes_dir)?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .collect();
-        children.sort();
-        for child in children {
-            let name = child
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            if child.is_dir() {
-                let mut files: Vec<PathBuf> = walk_files(&child);
-                files.sort();
-                groups.push((name, files));
-            } else {
-                groups.push((name, vec![child]));
-            }
-        }
-    }
+    let groups = crash_buckets(campaign_dir)?;
 
     let mut counts = Counts::default();
     let mut manual_applied = 0u64;
@@ -207,9 +188,7 @@ pub(super) fn classify_campaign(
             .join("\n");
         let auto = classifier.classify(&text);
         let manual = overrides.get(&(campaign.clone(), crash_id.clone()));
-        let effective = manual
-            .map(|row| row.classification.as_str())
-            .unwrap_or(auto);
+        let effective = manual.map_or(auto, |row| row.classification.as_str());
         if manual.is_some() {
             manual_applied += 1;
         }
@@ -235,9 +214,15 @@ pub(super) fn classify_campaign(
         }));
     }
 
+    // A campaign that ran its whole budget is measured evidence even
+    // when it crashed nothing: syzkaller only creates `crashes/` once
+    // there is something to put in it, so "no directory" from a
+    // completed campaign means zero crashes, not missing data. Only a
+    // campaign that neither completed nor left any crashes behind is
+    // genuinely unavailable.
     let quality = if manual_applied > 0 {
         "manually_validated"
-    } else if crashes_dir.is_dir() {
+    } else if campaign_dir.join(CAMPAIGN_DONE).is_file() || campaign_dir.join("crashes").is_dir() {
         "measured"
     } else {
         "unavailable"
@@ -267,27 +252,39 @@ pub(super) fn classify_campaign(
     })
 }
 
-fn walk_files(dir: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    let Ok(entries) = fs::read_dir(dir) else {
-        return files;
-    };
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        if path.is_dir() {
-            files.extend(walk_files(&path));
-        } else {
-            files.push(path);
-        }
+/// syzkaller's crashes/ dir: one bucket per unique crash, either a
+/// dir of evidence files or a single file. Sorted for determinism.
+fn crash_buckets(campaign_dir: &Path) -> anyhow::Result<Vec<(String, Vec<PathBuf>)>> {
+    let crashes_dir = campaign_dir.join("crashes");
+    if !crashes_dir.is_dir() {
+        return Ok(Vec::new());
     }
-    files
+    let mut children: Vec<PathBuf> = fs::read_dir(&crashes_dir)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect();
+    children.sort();
+    let mut groups = Vec::new();
+    for child in children {
+        let name = child
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let files = if child.is_dir() {
+            files_under(&child, |_| true)?
+        } else {
+            vec![child]
+        };
+        groups.push((name, files));
+    }
+    Ok(groups)
 }
 
 fn load_side(
     classifier: &Classifier,
     fuzz_dir: &Path,
     overrides: &HashMap<(String, String), OverrideRow>,
-) -> Result<Vec<CampaignSummary>, Box<dyn std::error::Error>> {
+) -> anyhow::Result<Vec<CampaignSummary>> {
     let campaigns_dir = fuzz_dir.join("campaigns");
     if !campaigns_dir.is_dir() {
         return Ok(Vec::new());
@@ -300,9 +297,9 @@ fn load_side(
     dirs.sort();
     let mut campaigns = Vec::new();
     for dir in dirs {
-        if !dir.join(".campaign_done").exists() {
+        if !dir.join(CAMPAIGN_DONE).is_file() {
             warn!(
-                "{} has no .campaign_done marker; including anyway",
+                "{} has no {CAMPAIGN_DONE} marker; including anyway",
                 dir.display()
             );
         }
@@ -318,7 +315,7 @@ fn crash_metric(
     rs_campaigns: &[CampaignSummary],
     class: &str,
     alpha: f64,
-) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+) -> anyhow::Result<Option<serde_json::Value>> {
     let extract = |campaigns: &[CampaignSummary]| -> Vec<f64> {
         campaigns
             .iter()
@@ -402,43 +399,71 @@ fn rate_ratio_gate(
     alpha: f64,
     margin: f64,
 ) -> (serde_json::Value, serde_json::Value) {
+    if c_total + rs_total == 0 {
+        zero_event_sensitivity(t_c, t_rs, alpha, margin)
+    } else {
+        conditional_rate_ratio(c_total, rs_total, t_c, t_rs, alpha, margin)
+    }
+}
+
+/// No events anywhere: the ratio is 0/0 and unbounded, so the gate
+/// falls back to what the exposure could have ruled out — the exact
+/// one-sided Poisson bound per side (the rule of three at 95%).
+fn zero_event_sensitivity(
+    t_c: f64,
+    t_rs: f64,
+    alpha: f64,
+    margin: f64,
+) -> (serde_json::Value, serde_json::Value) {
+    let one_sided = 1.0 - alpha;
+    let bound_c = stats::poisson_upper(0, one_sided) / t_c;
+    let bound_rs = stats::poisson_upper(0, one_sided) / t_rs;
+    let block = json!({
+        "events": {"c": 0, "rs": 0},
+        "exposure_hours": {"c": round(t_c, 3), "rs": round(t_rs, 3)},
+        "rates_per_hour": {"c": 0.0, "rs": 0.0},
+        "max_undetected_rate_per_hour": {
+            "level": one_sided,
+            "c": round(bound_c, 4),
+            "rs": round(bound_rs, 4),
+        },
+        "ratio": serde_json::Value::Null,
+        "mde_ratio_80pct_power": serde_json::Value::Null,
+    });
+    let verdict = json!({
+        "pass": true,
+        "gate_basis": "zero_event_sensitivity",
+        "criterion": format!(
+            "one-sided {:.0}% exact upper bound on the rs/c attributable crash \
+             rate ratio <= {margin}; with zero events on both sides the per-side \
+             exact Poisson rate bound stands in",
+            one_sided * 100.0
+        ),
+        "detail": format!(
+            "0 target-attributable crashes over {t_c:.2}h (C) and {t_rs:.2}h (Rust); \
+             {:.0}% per-side rate bound {:.4}/h (C), {:.4}/h (Rust)",
+            one_sided * 100.0,
+            bound_c,
+            bound_rs
+        ),
+    });
+    (block, verdict)
+}
+
+/// Events on at least one side: conditional on the total, the rs
+/// share is binomial with p0 fixed by the exposure split, so the
+/// Clopper-Pearson bounds on that share transform into exact bounds
+/// on the rate ratio.
+fn conditional_rate_ratio(
+    c_total: u64,
+    rs_total: u64,
+    t_c: f64,
+    t_rs: f64,
+    alpha: f64,
+    margin: f64,
+) -> (serde_json::Value, serde_json::Value) {
     let one_sided = 1.0 - alpha;
     let total = c_total + rs_total;
-    if total == 0 {
-        let bound_c = stats::poisson_upper(0, one_sided) / t_c;
-        let bound_rs = stats::poisson_upper(0, one_sided) / t_rs;
-        let block = json!({
-            "events": {"c": 0, "rs": 0},
-            "exposure_hours": {"c": round(t_c, 3), "rs": round(t_rs, 3)},
-            "rates_per_hour": {"c": 0.0, "rs": 0.0},
-            "max_undetected_rate_per_hour": {
-                "level": one_sided,
-                "c": round(bound_c, 4),
-                "rs": round(bound_rs, 4),
-            },
-            "ratio": serde_json::Value::Null,
-            "mde_ratio_80pct_power": serde_json::Value::Null,
-        });
-        let verdict = json!({
-            "pass": true,
-            "gate_basis": "zero_event_sensitivity",
-            "criterion": format!(
-                "one-sided {:.0}% exact upper bound on the rs/c attributable crash \
-                 rate ratio <= {margin}; with zero events on both sides the per-side \
-                 exact Poisson rate bound stands in",
-                one_sided * 100.0
-            ),
-            "detail": format!(
-                "0 target-attributable crashes over {t_c:.2}h (C) and {t_rs:.2}h (Rust); \
-                 {:.0}% per-side rate bound {:.4}/h (C), {:.4}/h (Rust)",
-                one_sided * 100.0,
-                bound_c,
-                bound_rs
-            ),
-        });
-        return (block, verdict);
-    }
-
     let p0 = t_rs / (t_rs + t_c);
     let p_one_sided = stats::binomial_sf(rs_total, total, p0);
     // One-sided (1 - alpha) bounds = the matching sides of the
@@ -460,7 +485,6 @@ fn rate_ratio_gate(
         serde_json::Value::Null
     };
     let mde = stats::binomial_mde_ratio(total, t_c, t_rs, alpha, 0.8);
-    let pass = ratio_hi <= margin;
 
     let block = json!({
         "events": {"c": c_total, "rs": rs_total},
@@ -483,7 +507,7 @@ fn rate_ratio_gate(
         "mde_ratio_80pct_power": mde.map(|value| round(value, 3)),
     });
     let verdict = json!({
-        "pass": pass,
+        "pass": ratio_hi <= margin,
         "gate_basis": "rate_ratio_ci",
         "criterion": format!(
             "one-sided {:.0}% exact upper bound on the rs/c attributable crash rate \
@@ -495,7 +519,7 @@ fn rate_ratio_gate(
              {t_c:.2}h/{t_rs:.2}h; ratio upper bound {}, margin {margin}, one-sided \
              p={p_one_sided:.4}{}",
             if ratio_hi.is_finite() {
-                format!("{:.3}", ratio_hi)
+                format!("{ratio_hi:.3}")
             } else {
                 "unbounded".to_string()
             },
@@ -512,75 +536,33 @@ pub fn compare_fuzz(
     p1_dir: &Path,
     p2_dir: &Path,
     manifest: &Manifest,
-    opts: &Opts,
+    opts: &CompareOpts,
     outdir: &Path,
     c_name: &str,
     rs_name: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> anyhow::Result<()> {
     let alpha = opts.alpha;
     let margin = opts.fuzz_rate_margin;
-    let a12_large_upper = opts.a12_large_threshold;
 
     let classifier = Classifier::new(c_name, rs_name)?;
-    let overrides = match &opts.validated_crashes {
+    let overrides = match &opts.screen.validated_crashes {
         Some(path) => load_validated_crashes(path)?,
         None => HashMap::new(),
     };
     let c_campaigns = load_side(&classifier, p1_dir, &overrides)?;
     let rs_campaigns = load_side(&classifier, p2_dir, &overrides)?;
-    if c_campaigns.is_empty() || rs_campaigns.is_empty() {
-        return Err("missing fuzz campaign data for one or both drivers".into());
-    }
-
-    // Exposure comes from the identity knobs (hours per campaign),
-    // scaled by the campaigns actually present on disk.
-    let baseline =
-        Manifest::load(p1_dir)?.ok_or_else(|| format!("{} lost its manifest", p1_dir.display()))?;
-    let hours = |manifest: &Manifest, side: &str| {
-        manifest
-            .identity
-            .fuzz
-            .as_ref()
-            .map(|knobs| knobs.hours)
-            .ok_or_else(|| format!("{side} manifest has no fuzz knobs in its identity"))
-    };
-    let t_c = hours(&baseline, "baseline")? * c_campaigns.len() as f64;
-    let t_rs = hours(manifest, "campaign")? * rs_campaigns.len() as f64;
-
-    let mut metrics = serde_json::Map::new();
-    if let Some(value) = crash_metric(&c_campaigns, &rs_campaigns, "unique_crashes", alpha)? {
-        metrics.insert("unique_crashes".into(), value);
-    }
-    let attributable = crash_metric(&c_campaigns, &rs_campaigns, TARGET, alpha)?;
-    if let Some(value) = &attributable {
-        metrics.insert("target_attributable_crashes".into(), value.clone());
-    }
-    metrics.insert(
-        "crash_attribution".into(),
-        json!({
-            "c": aggregate_attribution(&c_campaigns),
-            "rs": aggregate_attribution(&rs_campaigns),
-        }),
+    ensure!(
+        !c_campaigns.is_empty() && !rs_campaigns.is_empty(),
+        "missing fuzz campaign data for one or both drivers"
     );
+
+    let (t_c, t_rs) = exposure_hours(p1_dir, manifest, c_campaigns.len(), rs_campaigns.len())?;
+    let evidence = Evidence::gather(&c_campaigns, &rs_campaigns, alpha)?;
 
     let c_total: u64 = c_campaigns.iter().map(|c| c.counts.target).sum();
     let rs_total: u64 = rs_campaigns.iter().map(|c| c.counts.target).sum();
     let (rate_ratio, verdict) = rate_ratio_gate(c_total, rs_total, t_c, t_rs, alpha, margin);
-
-    let quality = |side: &str| {
-        metrics["crash_attribution"][side]["data_quality"]
-            .as_str()
-            .unwrap_or("inferred")
-            .to_string()
-    };
-    let (c_quality, rs_quality) = (quality("c"), quality("rs"));
-    let attribution_quality = if c_quality == "inferred" || rs_quality == "inferred" {
-        "inferred"
-    } else if c_quality == "manually_validated" || rs_quality == "manually_validated" {
-        "manually_validated"
-    } else {
-        "measured"
-    };
+    let passed = verdict["pass"].as_bool() == Some(true);
 
     let result = json!({
         "methodology": "Klees et al. CCS 2018 + Schloegel et al. S&P 2024 campaign \
@@ -590,16 +572,19 @@ pub fn compare_fuzz(
         "thresholds": {
             "alpha": alpha,
             "rate_ratio_margin": margin,
-            "a12_large_upper": round(a12_large_upper, 4),
-            "a12_large_lower": round(1.0 - a12_large_upper, 4),
+            // The effect-size labels come from the fixed
+            // Vargha-Delaney bands, not from a knob: the gate is the
+            // rate ratio, so nothing a threshold could move.
+            "a12_large_upper": round(stats::A12_LARGE, 4),
+            "a12_large_lower": round(1.0 - stats::A12_LARGE, 4),
         },
         "data_quality": {
-            "status": if attributable.is_none() { "unavailable" } else { attribution_quality },
-            "crash_attribution": attribution_quality,
+            "status": evidence.status(),
+            "crash_attribution": evidence.attribution_quality,
         },
         "sample_size": {"c": c_campaigns.len(), "rs": rs_campaigns.len()},
         "exposure_hours": {"c": round(t_c, 3), "rs": round(t_rs, 3)},
-        "metrics": metrics,
+        "metrics": evidence.metrics,
         "rate_ratio": rate_ratio,
         "verdict": verdict,
     });
@@ -607,49 +592,139 @@ pub fn compare_fuzz(
         outdir.join("fuzz_stats.json"),
         serde_json::to_string_pretty(&result)?,
     )?;
-    write_csv(&c_campaigns, &rs_campaigns, outdir)?;
+    fs::write(
+        outdir.join("fuzz.csv"),
+        fuzz_csv(&c_campaigns, &rs_campaigns),
+    )?;
 
     info!(
         "fuzz gate: attributable c={c_total} rs={rs_total} over {t_c:.2}h/{t_rs:.2}h -> {}",
-        if result["verdict"]["pass"].as_bool() == Some(true) {
-            "PASS"
-        } else {
-            "FAIL"
-        }
+        if passed { "PASS" } else { "FAIL" }
     );
     Ok(())
 }
 
-/// v1 fuzz.csv columns; coverage/ttfc are not captured by the v2
-/// fuzz phase and stay empty.
-fn write_csv(
-    c_campaigns: &[CampaignSummary],
-    rs_campaigns: &[CampaignSummary],
-    outdir: &Path,
-) -> Result<(), std::io::Error> {
-    let mut csv = String::from(
-        "driver,campaign_id,unique_crashes,coverage_blocks,time_to_first_crash_s,\
-         target_attributable,infrastructure_noise,unknown\n",
-    );
-    for (driver, campaigns) in [("c", c_campaigns), ("rs", rs_campaigns)] {
-        for campaign in campaigns {
-            csv.push_str(&format!(
-                "{driver},{},{},0,,{},{},{}\n",
-                campaign.id,
-                campaign.unique_crashes,
-                campaign.counts.target,
-                campaign.counts.infra,
-                campaign.counts.unknown
-            ));
-        }
-    }
-    fs::write(outdir.join("fuzz.csv"), csv)
+/// Exposure comes from the identity knobs (hours per campaign),
+/// scaled by the campaigns actually present on disk.
+fn exposure_hours(
+    p1_dir: &Path,
+    manifest: &Manifest,
+    c_campaigns: usize,
+    rs_campaigns: usize,
+) -> anyhow::Result<(f64, f64)> {
+    let baseline = Manifest::load(p1_dir)?
+        .with_context(|| format!("{} lost its manifest", p1_dir.display()))?;
+    let hours = |manifest: &Manifest, side: &str| -> anyhow::Result<f64> {
+        manifest
+            .identity
+            .fuzz
+            .as_ref()
+            .map(|knobs| knobs.hours)
+            .with_context(|| format!("{side} manifest has no fuzz knobs in its identity"))
+    };
+    Ok((
+        hours(&baseline, "baseline")? * c_campaigns as f64,
+        hours(manifest, "campaign")? * rs_campaigns as f64,
+    ))
 }
 
-/// Same rounding helper as the perf comparator.
-fn round(value: f64, decimals: u32) -> f64 {
-    let factor = 10f64.powi(decimals as i32);
-    (value * factor).round() / factor
+/// The descriptive layer around the gate: v1's rank statistics over
+/// per-campaign counts, the attribution reconciliation, and the
+/// data-quality label they imply.
+struct Evidence {
+    metrics: serde_json::Map<String, serde_json::Value>,
+    /// v1 reported the whole gate as unavailable when no
+    /// attributable-crash metric could be formed at all.
+    attributable: bool,
+    attribution_quality: &'static str,
+}
+
+impl Evidence {
+    fn gather(
+        c_campaigns: &[CampaignSummary],
+        rs_campaigns: &[CampaignSummary],
+        alpha: f64,
+    ) -> anyhow::Result<Self> {
+        let mut metrics = serde_json::Map::new();
+        if let Some(value) = crash_metric(c_campaigns, rs_campaigns, "unique_crashes", alpha)? {
+            metrics.insert("unique_crashes".into(), value);
+        }
+        let attributable = crash_metric(c_campaigns, rs_campaigns, TARGET, alpha)?;
+        if let Some(value) = &attributable {
+            metrics.insert("target_attributable_crashes".into(), value.clone());
+        }
+        metrics.insert(
+            "crash_attribution".into(),
+            json!({
+                "c": aggregate_attribution(c_campaigns),
+                "rs": aggregate_attribution(rs_campaigns),
+            }),
+        );
+
+        let quality = |side: &str| {
+            metrics["crash_attribution"][side]["data_quality"]
+                .as_str()
+                .unwrap_or("inferred")
+                .to_string()
+        };
+        let (c_quality, rs_quality) = (quality("c"), quality("rs"));
+        let attribution_quality = if c_quality == "inferred" || rs_quality == "inferred" {
+            "inferred"
+        } else if c_quality == "manually_validated" || rs_quality == "manually_validated" {
+            "manually_validated"
+        } else {
+            "measured"
+        };
+        Ok(Self {
+            metrics,
+            attributable: attributable.is_some(),
+            attribution_quality,
+        })
+    }
+
+    fn status(&self) -> &'static str {
+        if self.attributable {
+            self.attribution_quality
+        } else {
+            "unavailable"
+        }
+    }
+}
+
+/// v1 fuzz.csv columns; coverage/ttfc are not captured by the v2
+/// fuzz phase and stay empty.
+fn fuzz_csv(c_campaigns: &[CampaignSummary], rs_campaigns: &[CampaignSummary]) -> String {
+    csv_text(|out| {
+        out.write_record([
+            "driver",
+            "campaign_id",
+            "unique_crashes",
+            "coverage_blocks",
+            "time_to_first_crash_s",
+            "target_attributable",
+            "infrastructure_noise",
+            "unknown",
+        ])?;
+        for (driver, campaigns) in [("c", c_campaigns), ("rs", rs_campaigns)] {
+            for campaign in campaigns {
+                let unique = campaign.unique_crashes.to_string();
+                let target = campaign.counts.target.to_string();
+                let infra = campaign.counts.infra.to_string();
+                let unknown = campaign.counts.unknown.to_string();
+                out.write_record([
+                    driver,
+                    campaign.id.as_str(),
+                    unique.as_str(),
+                    "0",
+                    "",
+                    target.as_str(),
+                    infra.as_str(),
+                    unknown.as_str(),
+                ])?;
+            }
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -761,5 +836,152 @@ mod tests {
             .unwrap();
         assert_eq!(evidence.len(), 2);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// End-to-end over the whole pass: classification, exposure,
+    /// descriptive metrics, the rate-ratio gate, artifacts.
+    #[test]
+    fn compare_fuzz_writes_both_artifacts() {
+        use crate::block::cli::{CompareOpts, ScreenOpts};
+        use crate::block::results::{FuzzKnobs, Identity, Manifest};
+
+        let manifest = |hours: f64| Manifest {
+            complete: true,
+            created: 0,
+            seed: 42,
+            koxi: "test".to_owned(),
+            identity: Identity {
+                domain: "fuzz".to_owned(),
+                driver: "null_blk".to_owned(),
+                spec: String::new(),
+                prep: String::new(),
+                host: "test".to_owned(),
+                accel: None,
+                smp: None,
+                memory: None,
+                artifacts: None,
+                source: None,
+                fio: None,
+                fuzz: Some(FuzzKnobs {
+                    campaigns: 2,
+                    hours,
+                    parallel: 1,
+                }),
+                static_: None,
+            },
+            p2: None,
+        };
+
+        let base = std::env::temp_dir().join(format!("koxi-fuzz-e2e-{}", std::process::id()));
+        let (p1, p2, out) = (base.join("p1"), base.join("p2"), base.join("out"));
+        for root in [&p1, &p2] {
+            for campaign in ["campaign_1", "campaign_2"] {
+                let dir = root.join("campaigns").join(campaign);
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(dir.join(CAMPAIGN_DONE), "").unwrap();
+            }
+            fs::write(
+                root.join("manifest.toml"),
+                toml::to_string(&manifest(1.5)).unwrap(),
+            )
+            .unwrap();
+        }
+        // One attributable crash on the C side only.
+        let bucket = p1.join("campaigns/campaign_1/crashes/abc");
+        fs::create_dir_all(&bucket).unwrap();
+        fs::write(bucket.join("report0"), "Call Trace:\n null_blk_rq+0x1\n\n").unwrap();
+        fs::create_dir_all(&out).unwrap();
+
+        let opts = CompareOpts {
+            alpha: 0.05,
+            perf_threshold: 5.0,
+            bootstrap_resamples: 200,
+            fuzz_rate_margin: 2.0,
+            safety_threshold: 34.2,
+            seed: Some(7),
+            screen: ScreenOpts {
+                validated_crashes: None,
+            },
+        };
+        compare_fuzz(&p1, &p2, &manifest(1.5), &opts, &out, "null_blk", "rnull").unwrap();
+
+        let stats: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(out.join("fuzz_stats.json")).unwrap())
+                .unwrap();
+        // Two campaigns per side at 1.5h each.
+        assert_eq!(stats["exposure_hours"]["c"], 3.0);
+        assert_eq!(stats["exposure_hours"]["rs"], 3.0);
+        assert_eq!(stats["sample_size"]["c"], 2);
+        assert_eq!(stats["rate_ratio"]["events"]["c"], 1);
+        assert_eq!(stats["rate_ratio"]["events"]["rs"], 0);
+        assert_eq!(stats["verdict"]["gate_basis"], "rate_ratio_ci");
+        assert_eq!(
+            stats["metrics"]["crash_attribution"]["c"]["counts"][TARGET],
+            1
+        );
+        // Every campaign here ran its budget, so a side that crashed
+        // nothing is still measured evidence: zero is a result.
+        assert_eq!(stats["data_quality"]["status"], "measured");
+        assert_eq!(
+            stats["metrics"]["crash_attribution"]["rs"]["data_quality"], "measured",
+            "the clean side measured zero crashes"
+        );
+        let csv = fs::read_to_string(out.join("fuzz.csv")).unwrap();
+        assert_eq!(csv.lines().count(), 5);
+        assert!(csv.contains("c,campaign_1,1,0,,1,0,0"));
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn completion_separates_a_clean_campaign_from_an_unknown_one() {
+        let base = std::env::temp_dir().join(format!("koxi-fuzz-q-{}", std::process::id()));
+        let done = base.join("done");
+        let partial = base.join("partial");
+        fs::create_dir_all(&done).unwrap();
+        fs::create_dir_all(&partial).unwrap();
+        fs::write(done.join(CAMPAIGN_DONE), "").unwrap();
+
+        let classifier = classifier();
+        let overrides = HashMap::new();
+        // Ran its budget, crashed nothing: a measured zero.
+        let clean = classify_campaign(&classifier, &done, &overrides).unwrap();
+        assert_eq!(clean.counts.target, 0);
+        assert_eq!(clean.quality, "measured");
+        // Died mid-campaign with nothing to show: we do not know.
+        let unknown = classify_campaign(&classifier, &partial, &overrides).unwrap();
+        assert_eq!(unknown.quality, "unavailable");
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// fuzz.csv is a v1 artifact shape: the header and the empty
+    /// coverage/ttfc columns are read by downstream tooling.
+    #[test]
+    fn fuzz_csv_pins_the_v1_columns() {
+        let summary = |id: &str, unique, target, infra, unknown| CampaignSummary {
+            id: id.to_owned(),
+            unique_crashes: unique,
+            counts: Counts {
+                target,
+                infra,
+                unknown,
+            },
+            quality: "measured",
+        };
+        let csv = fuzz_csv(
+            &[summary("campaign_01", 3, 1, 1, 1)],
+            &[summary("campaign_02", 0, 0, 0, 0)],
+        );
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(
+            lines[0],
+            "driver,campaign_id,unique_crashes,coverage_blocks,time_to_first_crash_s,\
+             target_attributable,infrastructure_noise,unknown"
+        );
+        assert_eq!(lines[1], "c,campaign_01,3,0,,1,1,1");
+        assert_eq!(lines[2], "rs,campaign_02,0,0,,0,0,0");
+        assert_eq!(lines.len(), 3);
+        assert!(csv.ends_with('\n'));
     }
 }

@@ -1,22 +1,23 @@
 //! Build the static BusyBox for the initramfs (v1
-//! `kernel/busybox-*/build`): pristine tarball extract into tempdir
-//! scratch, apply the `busybox/config` asset, `yes "" | make
-//! oldconfig`, then a static musl build. The binary is harvested to
-//! `artifacts/busybox` and sha-locked; the build is skipped when the
-//! input fingerprint (recipe, tarball sha, config sha, musl-gcc
-//! identity) is unchanged.
+//! `kernel/busybox-*/build`) and the static dropbear multibinary —
+//! two instances of one shape shared with fio: pristine tarball
+//! extract into scratch, an optional config asset at `.config`, the
+//! recipe's own configure + make, then the binary at the tree root
+//! harvested into `artifacts/` and sha-locked. A build is skipped
+//! when the input fingerprint (recipe, tarball sha, config sha,
+//! musl-gcc identity) is unchanged.
 
-use std::fmt;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::thread;
 
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::fetch::{self, Ctx};
 use crate::kernel::build::ARTIFACTS_DIR;
 use crate::lock::LockedSource;
+use crate::scratch::Scratch;
+use crate::util;
 use crate::{assets, cmd};
 
 /// Artifact and lock key.
@@ -24,9 +25,6 @@ pub const BUSYBOX: &str = "busybox";
 
 /// Artifact name; the lock build key is "dropbear".
 pub const DROPBEARMULTI: &str = "dropbearmulti";
-
-/// koxi.toml sources key.
-const SOURCE: &str = "busybox";
 
 /// Bumped when the build steps themselves change.
 const RECIPE: u32 = 1;
@@ -58,54 +56,32 @@ pub struct Options {
     pub force: bool,
 }
 
+/// What varies between the static musl userland builds.
+pub struct Recipe {
+    /// koxi.toml sources key; also the lock build key and log label.
+    pub source: &'static str,
+    /// Artifact file name; also the lock artifact key.
+    pub artifact: &'static str,
+    /// Tree-relative path of the built binary.
+    pub binary: &'static str,
+    /// Config asset written to the tree's `.config` before
+    /// `compile` runs; its sha joins the fingerprint.
+    pub config: Option<&'static str>,
+    /// The module's `RECIPE` constant, part of the fingerprint.
+    pub version: u32,
+}
+
 /// Ensure the static busybox is built; returns `artifacts/busybox`.
 pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
-    if !cfg!(target_os = "linux") {
-        return Err(Error::NotLinux);
-    }
-
-    let logs = ctx.logs;
-    let artifacts = ctx.root.join(ARTIFACTS_DIR);
-    let artifact = artifacts.join(BUSYBOX);
-
-    let config = assets::load_locked(ctx.root, ctx.config, "busybox/config", ctx.lock)?;
-    let (tarball, stem) = fetch::tarball_path(SOURCE, ctx)?;
-    let Some(LockedSource::Tarball {
-        sha256: source_sha, ..
-    }) = ctx.lock.sources.get(SOURCE)
-    else {
-        return Err(Error::NotFetched(SOURCE));
+    const BUSYBOX_RECIPE: Recipe = Recipe {
+        source: BUSYBOX,
+        artifact: BUSYBOX,
+        binary: "busybox",
+        config: Some("busybox/config"),
+        version: RECIPE,
     };
-
-    // The resolved compiler is part of the identity: on nix MUSL_GCC
-    // is a store path, so a musl/gcc bump changes the fingerprint.
-    let cc = musl_cc();
-    let toolchain = format!("{cc}:{}", probe_version(&cc));
-    let expected = format!("r{RECIPE}:{source_sha}:{}:{toolchain}", config.sha256);
-
-    if artifact.is_file() && !opts.force && ctx.lock.builds.get(SOURCE) == Some(&expected) {
-        debug!("busybox cached at {}", artifact.display());
-        return Ok(artifact);
-    }
-
-    let tmp_root = ctx.home.join("tmp");
-    fs::create_dir_all(&tmp_root)?;
-    let scratch = tempfile::Builder::new()
-        .prefix(&format!("{stem}-"))
-        .tempdir_in(&tmp_root)?;
-    let tree = scratch.path().join(&stem);
-
-    let result = (|| -> Result<(), Error> {
-        info!("extracting pristine {stem} for build");
-        let mut tar = Command::new("tar");
-        tar.arg("-xf").arg(&tarball).arg("-C").arg(scratch.path());
-        cmd::status(tar, "tar-build", logs)?;
-        if !tree.is_dir() {
-            return Err(Error::UnexpectedLayout(tree.clone()));
-        }
-
-        fs::write(tree.join(".config"), config.contents.as_bytes())?;
-
+    let logs = ctx.logs;
+    build_static(ctx, opts, &BUSYBOX_RECIPE, |tree, cc| {
         // v1: `yes "" | make oldconfig` — accept defaults for any
         // symbol the asset does not pin.
         info!("configuring busybox (oldconfig)");
@@ -115,14 +91,14 @@ pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
             .arg(format!("yes '' | make -C '{}' oldconfig", tree.display()));
         cmd::status(oldconfig, "make-busybox-oldconfig", logs)?;
 
-        let jobs = thread::available_parallelism().map_or(1, |n| n.get());
+        let jobs = util::jobs();
         info!(
             "building busybox with {jobs} jobs (log: {})",
             logs.join("make-busybox.log").display()
         );
         let mut make = Command::new("make");
         make.arg("-C")
-            .arg(&tree)
+            .arg(tree)
             .arg(format!("CC={cc}"))
             // v1 parity: lets musl-gcc find kernel headers on
             // FHS hosts; harmless where /usr/include is absent.
@@ -133,110 +109,105 @@ pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
             .env("NIX_HARDENING_ENABLE", "")
             .arg("-j")
             .arg(jobs.to_string());
-        cmd::status(make, "make-busybox", logs)?;
-
-        let built = tree.join("busybox");
-        if !built.is_file() {
-            return Err(Error::MissingBinary(built));
-        }
-        fs::create_dir_all(&artifacts)?;
-        fs::copy(&built, &artifact)?;
-        ctx.lock
-            .artifacts
-            .insert(BUSYBOX.to_owned(), fetch::sha256(&artifact, logs)?);
-
-        let used = assets::load_locked(ctx.root, ctx.config, "busybox/config", ctx.lock)?;
-        let source_sha = match ctx.lock.sources.get(SOURCE) {
-            Some(LockedSource::Tarball { sha256, .. }) => sha256.clone(),
-            _ => return Err(Error::NotFetched(SOURCE)),
-        };
-        ctx.lock.builds.insert(
-            SOURCE.to_owned(),
-            format!("r{RECIPE}:{source_sha}:{}:{toolchain}", used.sha256),
-        );
-        Ok(())
-    })();
-
-    if let Err(err) = result {
-        let kept = scratch.keep();
-        warn!("build scratch kept for debugging at {}", kept.display());
-        return Err(err);
-    }
-
-    info!("busybox at {}", artifact.display());
-    Ok(artifact)
+        Ok(cmd::status(make, "make-busybox", logs)?)
+    })
 }
 
 /// Ensure the static dropbear multibinary is built; returns
 /// `artifacts/dropbearmulti`.
 pub fn build_dropbear(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
-    if !cfg!(target_os = "linux") {
-        return Err(Error::NotLinux);
-    }
-
-    let logs = ctx.logs;
-    let artifacts = ctx.root.join(ARTIFACTS_DIR);
-    let artifact = artifacts.join(DROPBEARMULTI);
-
-    let (tarball, stem) = fetch::tarball_path("dropbear", ctx)?;
-    let Some(LockedSource::Tarball {
-        sha256: source_sha, ..
-    }) = ctx.lock.sources.get("dropbear")
-    else {
-        return Err(Error::NotFetched("dropbear"));
-    };
-    let cc = musl_cc();
-    let toolchain = format!("{cc}:{}", probe_version(&cc));
     // No config asset: the configure flags are part of the recipe.
-    let expected = format!("r{RECIPE}:{source_sha}:{toolchain}");
-
-    if artifact.is_file() && !opts.force && ctx.lock.builds.get("dropbear") == Some(&expected) {
-        debug!("dropbear cached at {}", artifact.display());
-        return Ok(artifact);
-    }
-
-    let tmp_root = ctx.home.join("tmp");
-    fs::create_dir_all(&tmp_root)?;
-    let scratch = tempfile::Builder::new()
-        .prefix(&format!("{stem}-"))
-        .tempdir_in(&tmp_root)?;
-    let tree = scratch.path().join(&stem);
-
-    let result = (|| -> Result<(), Error> {
-        info!("extracting pristine {stem} for build");
-        let mut tar = Command::new("tar");
-        tar.arg("-xf").arg(&tarball).arg("-C").arg(scratch.path());
-        cmd::status(tar, "tar-build", logs)?;
-        if !tree.is_dir() {
-            return Err(Error::UnexpectedLayout(tree.clone()));
-        }
-
+    const DROPBEAR_RECIPE: Recipe = Recipe {
+        source: "dropbear",
+        artifact: DROPBEARMULTI,
+        binary: "dropbearmulti",
+        config: None,
+        version: RECIPE,
+    };
+    let logs = ctx.logs;
+    build_static(ctx, opts, &DROPBEAR_RECIPE, |tree, cc| {
         info!("configuring dropbear");
         let mut configure = Command::new("./configure");
         configure
-            .current_dir(&tree)
+            .current_dir(tree)
             .args(DROPBEAR_CONFIGURE)
-            .env("CC", &cc)
+            .env("CC", cc)
             .env("NIX_HARDENING_ENABLE", "");
         cmd::status(configure, "dropbear-configure", logs)?;
 
-        let jobs = thread::available_parallelism().map_or(1, |n| n.get());
+        let jobs = util::jobs();
         info!(
             "building dropbear with {jobs} jobs (log: {})",
             logs.join("make-dropbear.log").display()
         );
         let mut make = Command::new("make");
         make.arg("-C")
-            .arg(&tree)
+            .arg(tree)
             .arg("PROGRAMS=dropbear dropbearkey scp")
             .arg("MULTI=1")
             .arg("STATIC=1")
             .env("NIX_HARDENING_ENABLE", "")
             .arg("-j")
             .arg(jobs.to_string());
-        cmd::status(make, "make-dropbear", logs)?;
+        Ok(cmd::status(make, "make-dropbear", logs)?)
+    })
+}
 
-        let built = tree.join("dropbearmulti");
+/// The shared shape: fingerprint check, pristine extract into
+/// scratch, config asset, the recipe's `compile(tree, cc)`, then
+/// harvest and lock. Returns the artifact path.
+pub fn build_static(
+    ctx: &mut Ctx,
+    opts: &Options,
+    recipe: &Recipe,
+    compile: impl FnOnce(&Path, &str) -> Result<(), Error>,
+) -> Result<PathBuf, Error> {
+    if !cfg!(target_os = "linux") {
+        return Err(Error::NotLinux);
+    }
+
+    let logs = ctx.logs;
+    let label = recipe.source;
+    let artifacts = ctx.root.join(ARTIFACTS_DIR);
+    let artifact = artifacts.join(recipe.artifact);
+
+    let config = recipe
+        .config
+        .map(|name| assets::load_locked(ctx.root, ctx.config, name, ctx.lock))
+        .transpose()?;
+    let (tarball, stem) = fetch::tarball_path(recipe.source, ctx)?;
+    let Some(LockedSource::Tarball {
+        sha256: source_sha, ..
+    }) = ctx.lock.sources.get(recipe.source)
+    else {
+        return Err(Error::NotFetched(recipe.source));
+    };
+
+    // The resolved compiler is part of the identity: on nix MUSL_GCC
+    // is a store path, so a musl/gcc bump changes the fingerprint.
+    let cc = musl_cc();
+    let toolchain = format!("{cc}:{}", probe_version(&cc));
+    let expected = match &config {
+        Some(config) => format!(
+            "r{}:{source_sha}:{}:{toolchain}",
+            recipe.version, config.sha256
+        ),
+        None => format!("r{}:{source_sha}:{toolchain}", recipe.version),
+    };
+
+    if artifact.is_file() && !opts.force && ctx.lock.builds.get(label) == Some(&expected) {
+        debug!("{label} cached at {}", artifact.display());
+        return Ok(artifact);
+    }
+
+    Scratch::new(ctx.home, &format!("{stem}-"))?.run(|dir| {
+        let tree = fetch::extract_pristine(&tarball, dir, &stem, logs)?;
+        if let Some(config) = &config {
+            fs::write(tree.join(".config"), config.contents.as_bytes())?;
+        }
+        compile(&tree, &cc)?;
+
+        let built = tree.join(recipe.binary);
         if !built.is_file() {
             return Err(Error::MissingBinary(built));
         }
@@ -244,20 +215,12 @@ pub fn build_dropbear(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
         fs::copy(&built, &artifact)?;
         ctx.lock
             .artifacts
-            .insert(DROPBEARMULTI.to_owned(), fetch::sha256(&artifact, logs)?);
-        ctx.lock
-            .builds
-            .insert("dropbear".to_owned(), expected.clone());
+            .insert(recipe.artifact.to_owned(), util::sha256_file(&artifact)?);
+        ctx.lock.builds.insert(label.to_owned(), expected);
         Ok(())
-    })();
+    })?;
 
-    if let Err(err) = result {
-        let kept = scratch.keep();
-        warn!("build scratch kept for debugging at {}", kept.display());
-        return Err(err);
-    }
-
-    info!("dropbear at {}", artifact.display());
+    info!("{label} at {}", artifact.display());
     Ok(artifact)
 }
 
@@ -267,85 +230,28 @@ pub fn musl_cc() -> String {
     std::env::var("MUSL_GCC").unwrap_or_else(|_| "musl-gcc".to_owned())
 }
 
+/// First line of `<cc> --version` for fingerprints ("unknown" when
+/// the compiler is missing).
 pub fn probe_version(cc: &str) -> String {
-    let output = Command::new(cc).arg("--version").output();
-    match output {
-        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_owned(),
-        _ => "unknown".to_owned(),
-    }
+    util::probe_version(cc, &["--version"], "unknown")
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("this build step requires a Linux host")]
     NotLinux,
+    #[error("the {0} source is not locked yet (fetch step missing)")]
     NotFetched(&'static str),
+    #[error("prerequisite artifact {0} missing (run earlier build steps)")]
     MissingPrereq(String),
-    UnexpectedLayout(PathBuf),
+    #[error("build finished without producing {}", .0.display())]
     MissingBinary(PathBuf),
-    Io(std::io::Error),
-    Asset(assets::Error),
-    Fetch(fetch::Error),
-    Cmd(cmd::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Asset(#[from] assets::Error),
+    #[error(transparent)]
+    Fetch(#[from] fetch::Error),
+    #[error(transparent)]
+    Cmd(#[from] cmd::Error),
 }
-
-impl From<std::io::Error> for Error {
-    fn from(err: std::io::Error) -> Self {
-        Error::Io(err)
-    }
-}
-
-impl From<assets::Error> for Error {
-    fn from(err: assets::Error) -> Self {
-        Error::Asset(err)
-    }
-}
-
-impl From<fetch::Error> for Error {
-    fn from(err: fetch::Error) -> Self {
-        Error::Fetch(err)
-    }
-}
-
-impl From<cmd::Error> for Error {
-    fn from(err: cmd::Error) -> Self {
-        Error::Cmd(err)
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::NotLinux => write!(f, "this build step requires a Linux host"),
-            Error::NotFetched(name) => {
-                write!(
-                    f,
-                    "the {name} source is not locked yet (fetch step missing)"
-                )
-            }
-            Error::MissingPrereq(what) => {
-                write!(
-                    f,
-                    "prerequisite artifact {what} missing (run earlier build steps)"
-                )
-            }
-            Error::UnexpectedLayout(tree) => write!(
-                f,
-                "extracting the tarball did not produce {}",
-                tree.display()
-            ),
-            Error::MissingBinary(path) => {
-                write!(f, "build finished without producing {}", path.display())
-            }
-            Error::Io(err) => write!(f, "{err}"),
-            Error::Asset(err) => write!(f, "{err}"),
-            Error::Fetch(err) => write!(f, "{err}"),
-            Error::Cmd(err) => write!(f, "{err}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}

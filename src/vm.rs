@@ -5,20 +5,19 @@
 //! the overlay-initrd driver transport the perf and fuzz phases
 //! reuse.
 
-use std::fs;
 use std::io::IsTerminal;
-use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::builder::FalseyValueParser;
-use clap::parser::ValueSource;
-use clap::{value_parser, Arg, ArgAction, ArgMatches};
-use tracing::{error, info};
+use anyhow::{anyhow, bail};
+use clap::{Arg, ArgAction, ArgMatches};
+use tracing::info;
 
+use crate::cli::VmOpts;
 use crate::config::{anchored, Project};
+use crate::home;
 use crate::kernel::build::{Flavor, ARTIFACTS_DIR, BZIMAGE};
+use crate::scratch::Scratch;
 use crate::virt::runner;
-use crate::{fetch, logging};
 
 pub fn command() -> clap::Command {
     clap::Command::new("vm")
@@ -35,67 +34,9 @@ pub fn command() -> clap::Command {
                 .action(ArgAction::SetTrue)
                 .help("Boot the fuzz flavor (instrumented kernel + modules from artifacts/fuzz)"),
         )
-        .arg(
-            Arg::new("kernel")
-                .long("kernel")
-                .value_name("path")
-                .value_parser(value_parser!(PathBuf))
-                .env("KERNEL")
-                .default_value("artifacts/bzImage")
-                .help("Kernel bzImage (default resolved under the project root)"),
-        )
-        .arg(
-            Arg::new("initrd")
-                .long("initrd")
-                .value_name("path")
-                .value_parser(value_parser!(PathBuf))
-                .env("INITRD")
-                .default_value("artifacts/initramfs.cpio.gz")
-                .help("Initrd"),
-        )
-        .arg(
-            Arg::new("port")
-                .long("port")
-                .value_name("port")
-                .value_parser(value_parser!(u16))
-                .env("FWDPORT")
-                .default_value("5555")
-                .help("SSH forward port"),
-        )
-        .arg(
-            Arg::new("smp")
-                .long("smp")
-                .value_name("n")
-                .value_parser(value_parser!(u32))
-                .env("SMP")
-                .default_value("4")
-                .help("vCPUs"),
-        )
-        .arg(
-            Arg::new("memory")
-                .long("memory")
-                .value_name("size")
-                .env("MEMORY")
-                .default_value("4G")
-                .help("RAM"),
-        )
-        .arg(
-            Arg::new("vm-timeout")
-                .long("vm-timeout")
-                .value_name("s")
-                .value_parser(value_parser!(u64))
-                .env("VM_TIMEOUT")
-                .default_value("120")
-                .help("VM ready timeout in seconds"),
-        )
-        .arg(
-            Arg::new("verbose")
-                .long("verbose")
-                .action(ArgAction::SetTrue)
-                .value_parser(FalseyValueParser::new())
-                .env("VERBOSE")
-                .help("Verbose output (V=1)"),
-        )
+        // The same geometry the perf phase boots, so a `koxi vm`
+        // reproduction of a benchmark run is the same guest.
+        .args(VmOpts::args())
         .arg(
             Arg::new("cmd")
                 .num_args(0..)
@@ -105,60 +46,39 @@ pub fn command() -> clap::Command {
         )
 }
 
-pub fn run(matches: &ArgMatches) -> ExitCode {
-    let logs = logging::run_log_dir();
-    logging::init(
-        matches.get_flag("verbose"),
-        false,
-        Some(&logs.join("run.log")),
-    );
-    match drive(matches, &logs) {
-        Ok(code) => code,
-        Err(err) => {
-            error!("koxi vm: {err}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn drive(matches: &ArgMatches, logs: &Path) -> Result<ExitCode, Box<dyn std::error::Error>> {
+pub fn run(matches: &ArgMatches, logs: &std::path::Path) -> anyhow::Result<ExitCode> {
     let command: Vec<&String> = matches
         .get_many::<String>("cmd")
         .into_iter()
         .flatten()
         .collect();
     if command.is_empty() && !std::io::stdin().is_terminal() {
-        return Err("no command given and stdin is not a terminal".into());
+        bail!("no command given and stdin is not a terminal");
     }
+    let opts = VmOpts::from_matches(matches)?;
 
     let project = Project::locate()?;
     let artifacts = project.root.join(ARTIFACTS_DIR);
     // --fuzz flips the kernel default and the module source to the
-    // fuzz flavor's namespace; an explicit --kernel still wins.
+    // fuzz flavor's namespace; an explicit --kernel (or KERNEL) wins.
     let flavor = if matches.get_flag("fuzz") {
         Flavor::Fuzz
     } else {
         Flavor::Clean
     };
-    let cli_kernel = matches.get_one::<PathBuf>("kernel").expect("defaulted");
-    let kernel = if flavor == Flavor::Fuzz
-        && matches.value_source("kernel") == Some(ValueSource::DefaultValue)
-    {
+    let kernel = if flavor == Flavor::Fuzz && VmOpts::kernel_defaulted(matches) {
         flavor.dir(&artifacts).join(BZIMAGE)
     } else {
-        anchored(&project.root, cli_kernel)
+        anchored(&project.root, &opts.kernel)
     };
     let module_dir = flavor.dir(&artifacts);
-    let base_initrd = anchored(
-        &project.root,
-        matches.get_one::<PathBuf>("initrd").expect("defaulted"),
-    );
+    let base_initrd = anchored(&project.root, &opts.guest.initrd);
 
     let driver = match matches.get_one::<String>("driver") {
         Some(name) => {
             let driver =
                 project.config.block.drivers.get(name).ok_or_else(|| {
-                    format!("driver {name} is not in the [block.drivers] registry")
+                    anyhow!("driver {name} is not in the [block.drivers] registry")
                 })?;
             Some((name.as_str(), driver))
         }
@@ -167,11 +87,7 @@ fn drive(matches: &ArgMatches, logs: &Path) -> Result<ExitCode, Box<dyn std::err
 
     // Per-run scratch for the overlay and the concatenated initrd;
     // qemu is torn down before this drops.
-    let tmp_root = fetch::koxi_home()?.join("tmp");
-    fs::create_dir_all(&tmp_root)?;
-    let scratch = tempfile::Builder::new()
-        .prefix("vm-")
-        .tempdir_in(&tmp_root)?;
+    let scratch = Scratch::new(&home::koxi_home()?, "vm-")?;
 
     let initrd = match driver {
         Some((name, driver)) => runner::driver_initrd(
@@ -190,33 +106,26 @@ fn drive(matches: &ArgMatches, logs: &Path) -> Result<ExitCode, Box<dyn std::err
         &runner::Options {
             kernel,
             initrd,
-            memory: matches
-                .get_one::<String>("memory")
-                .cloned()
-                .expect("defaulted"),
-            smp: *matches.get_one::<u32>("smp").expect("defaulted"),
-            port: *matches.get_one::<u16>("port").expect("defaulted"),
+            memory: opts.guest.memory.clone(),
+            smp: opts.guest.smp,
+            port: opts.port,
             key: artifacts.join("keys/id_ed25519"),
             append: String::new(),
         },
         logs,
     )?;
-    vm.wait_ready(*matches.get_one::<u64>("vm-timeout").expect("defaulted"))?;
-    info!(
-        "guest is up (root@localhost:{})",
-        matches.get_one::<u16>("port").expect("defaulted")
-    );
+    vm.wait_ready(opts.vm_timeout)?;
+    info!("guest is up (root@localhost:{})", opts.port);
 
     if let Some((name, driver)) = driver {
         // Init powers off on setup failure, so a reachable guest means
         // the script ran; the device node is the observable contract.
         let check = vm.exec(&format!("test -e {}", driver.device.display()))?;
         if !check.status.success() {
-            return Err(format!(
+            bail!(
                 "driver {name} setup ran but {} is absent",
                 driver.device.display()
-            )
-            .into());
+            );
         }
         info!("driver {name} is up ({} present)", driver.device.display());
     }

@@ -7,16 +7,15 @@
 //! the conventional location for editing.
 
 use std::borrow::Cow;
-use std::fmt;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command as Process, ExitCode, Stdio};
+use std::process::ExitCode;
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
 
 use crate::config::{Config, Project};
 use crate::lock::Lock;
+use crate::util;
 
 pub struct Asset {
     pub name: &'static str,
@@ -89,16 +88,15 @@ pub fn load(root: &Path, config: &Config, name: &str) -> Result<Cow<'static, str
         .ok_or_else(|| Error::Unknown(name.to_owned()))
 }
 
-/// An asset loaded through the lock: its contents, content hash, and
-/// whether it changed since the previous recorded use.
+/// An asset loaded through the lock: its contents and content hash.
 pub struct Loaded {
     pub contents: Cow<'static, str>,
     pub sha256: String,
-    /// True on first use and whenever the hash moved.
-    pub changed: bool,
 }
 
-/// Load an asset and record its sha256 in the lock.
+/// Load an asset and record its sha256 in the lock (build steps
+/// fingerprint on the hash, so a moved hash is staleness, not an
+/// error).
 pub fn load_locked(
     root: &Path,
     config: &Config,
@@ -106,42 +104,9 @@ pub fn load_locked(
     lock: &mut Lock,
 ) -> Result<Loaded, Error> {
     let contents = load(root, config, name)?;
-    let sha256 = sha256_text(&contents)?;
-    let changed = lock.assets.get(name) != Some(&sha256);
-    if changed {
-        lock.assets.insert(name.to_owned(), sha256.clone());
-    }
-    Ok(Loaded {
-        contents,
-        sha256,
-        changed,
-    })
-}
-
-/// sha256 of a string via the host sha256sum (same tool the rest of
-/// the pipeline trusts for artifact hashing).
-pub fn sha256_text(text: &str) -> Result<String, Error> {
-    let mut child = Process::new("sha256sum")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(Error::Sha)?;
-    child
-        .stdin
-        .take()
-        .expect("stdin was piped")
-        .write_all(text.as_bytes())
-        .map_err(Error::Sha)?;
-    let output = child.wait_with_output().map_err(Error::Sha)?;
-    if !output.status.success() {
-        return Err(Error::ShaFailed(output.status));
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .next()
-        .map(str::to_owned)
-        .ok_or(Error::ShaFailed(output.status))
+    let sha256 = util::sha256_bytes(contents.as_bytes());
+    lock.assets.insert(name.to_owned(), sha256.clone());
+    Ok(Loaded { contents, sha256 })
 }
 
 /// The `koxi assets` subcommand tree.
@@ -168,15 +133,16 @@ pub fn command() -> Command {
         )
 }
 
-pub fn run(matches: &ArgMatches) -> ExitCode {
+pub fn run(matches: &ArgMatches) -> anyhow::Result<ExitCode> {
     match matches.subcommand() {
         Some(("list", _)) => list(),
-        Some(("dump", sub)) => dump(sub),
+        Some(("dump", sub)) => dump(sub)?,
         _ => unreachable!("subcommand is required"),
     }
+    Ok(ExitCode::SUCCESS)
 }
 
-fn list() -> ExitCode {
+fn list() {
     let project = Project::locate().ok();
     for asset in ASSETS {
         let declared = project
@@ -190,85 +156,45 @@ fn list() -> ExitCode {
             _ => println!("embedded  {}", asset.name),
         }
     }
-    ExitCode::SUCCESS
 }
 
-fn dump(matches: &ArgMatches) -> ExitCode {
+fn dump(matches: &ArgMatches) -> anyhow::Result<()> {
     let force = matches.get_flag("force");
-    let root = match Project::locate() {
-        Ok(project) => project.root,
-        Err(err) => return fail(err),
-    };
+    let root = Project::locate()?.root;
 
     let selected: Vec<&Asset> = match matches.get_many::<String>("name") {
         None => ASSETS.iter().collect(),
-        Some(names) => {
-            let mut picked = Vec::new();
-            for name in names {
-                match embedded(name) {
-                    Some(asset) => picked.push(asset),
-                    None => return fail(Error::Unknown(name.clone())),
-                }
-            }
-            picked
-        }
+        Some(names) => names
+            .map(|name| embedded(name).ok_or_else(|| Error::Unknown(name.clone())))
+            .collect::<Result<_, _>>()?,
     };
 
     for asset in &selected {
         let path = default_override_path(&root, asset.name);
-        if path.exists() && !force {
-            return fail(format!(
-                "{} exists (use --force to overwrite)",
-                path.display()
-            ));
-        }
+        anyhow::ensure!(
+            force || !path.exists(),
+            "{} exists (use --force to overwrite)",
+            path.display()
+        );
         if let Some(parent) = path.parent() {
-            if let Err(err) = fs::create_dir_all(parent) {
-                return fail(err);
-            }
+            fs::create_dir_all(parent)?;
         }
-        if let Err(err) = fs::write(&path, asset.contents) {
-            return fail(err);
-        }
+        fs::write(&path, asset.contents)?;
         println!("wrote {}", path.display());
     }
 
     println!("\nFiles under assets/ are picked up automatically; declare a");
     println!("custom path in the koxi.toml [assets] table to keep them elsewhere.");
-    ExitCode::SUCCESS
+    Ok(())
 }
 
-fn fail(err: impl fmt::Display) -> ExitCode {
-    eprintln!("koxi assets: {err}");
-    ExitCode::FAILURE
-}
-
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("reading declared asset override {path}: {err}", path = .0.display(), err = .1)]
     Override(PathBuf, std::io::Error),
+    #[error("unknown asset {0}")]
     Unknown(String),
-    Sha(std::io::Error),
-    ShaFailed(std::process::ExitStatus),
 }
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Override(path, err) => {
-                write!(
-                    f,
-                    "reading declared asset override {}: {err}",
-                    path.display()
-                )
-            }
-            Error::Unknown(name) => write!(f, "unknown asset {name}"),
-            Error::Sha(err) => write!(f, "running sha256sum: {err}"),
-            Error::ShaFailed(status) => write!(f, "sha256sum failed: {status}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {
@@ -328,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn load_locked_records_and_detects_changes() {
+    fn load_locked_records_the_hash() {
         let root = std::env::temp_dir().join(format!("koxi-assets-lock-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("init"), "one").unwrap();
@@ -343,14 +269,17 @@ mod tests {
         let mut lock = Lock::default();
 
         let first = load_locked(&root, &config, "virt/init", &mut lock).unwrap();
-        assert!(first.changed, "first use counts as changed");
+        assert_eq!(
+            lock.assets["virt/init"], first.sha256,
+            "first use is recorded"
+        );
         let second = load_locked(&root, &config, "virt/init", &mut lock).unwrap();
-        assert!(!second.changed, "unchanged asset is not stale");
         assert_eq!(first.sha256, second.sha256);
 
         fs::write(root.join("init"), "two").unwrap();
         let edited = load_locked(&root, &config, "virt/init", &mut lock).unwrap();
-        assert!(edited.changed, "edited asset is stale");
+        assert_ne!(edited.sha256, first.sha256, "edited asset moves the hash");
+        assert_eq!(lock.assets["virt/init"], edited.sha256);
         assert_eq!(edited.contents.as_ref(), "two");
         fs::remove_dir_all(&root).unwrap();
     }

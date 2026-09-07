@@ -14,14 +14,14 @@
 //! separate .done marker. Results are project data under the
 //! `--output` root — they belong to neither the lock nor $KOXI_HOME.
 
-use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 
-use crate::assets;
+use crate::util::{self, confirm};
 
 pub const MANIFEST: &str = "manifest.toml";
 
@@ -138,6 +138,9 @@ pub struct FuzzKnobs {
 
 /// Phase-2 campaign record; `baseline` is the p1 identity hash of
 /// the paired C driver (recorded, not symlinked).
+// The manifest key is literally `campaign` (the run's name), so the
+// field keeps the name clippy would rather it drop.
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Campaign {
     pub campaign: String,
@@ -149,9 +152,8 @@ pub struct Campaign {
 /// The dirname hash, derived from the identity's TOML serialization
 /// (12 hex chars, like v1's `hash`).
 pub fn identity_hash(identity: &Identity) -> Result<String, Error> {
-    let text = toml::to_string(identity).map_err(Error::Toml)?;
-    let sha = assets::sha256_text(&text).map_err(Error::Sha)?;
-    Ok(sha[..12].to_owned())
+    let text = toml::to_string(identity)?;
+    Ok(util::sha256_bytes(text.as_bytes())[..12].to_owned())
 }
 
 pub fn p1_dir(root: &Path, c_driver: &str, domain: &str, hash: &str) -> PathBuf {
@@ -173,9 +175,9 @@ pub fn p2_dir(
 
 impl Manifest {
     pub fn save(&self, dir: &Path) -> Result<(), Error> {
-        fs::create_dir_all(dir).map_err(Error::Io)?;
-        let text = toml::to_string_pretty(self).map_err(Error::Toml)?;
-        fs::write(dir.join(MANIFEST), text).map_err(Error::Io)
+        fs::create_dir_all(dir)?;
+        let text = toml::to_string_pretty(self)?;
+        Ok(fs::write(dir.join(MANIFEST), text)?)
     }
 
     /// Load a result root's manifest; Ok(None) when the dir has none.
@@ -184,7 +186,7 @@ impl Manifest {
         if !path.is_file() {
             return Ok(None);
         }
-        let text = fs::read_to_string(&path).map_err(Error::Io)?;
+        let text = fs::read_to_string(&path)?;
         toml::from_str(&text)
             .map(Some)
             .map_err(|err| Error::Parse(path, err))
@@ -202,63 +204,40 @@ pub fn clear_for_campaign(
     dir: &Path,
     manifest: &Manifest,
     assume_yes: bool,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    use std::io::IsTerminal;
-
+) -> anyhow::Result<bool> {
     if !dir.exists() {
         return Ok(true);
     }
-    match Manifest::load(dir)? {
-        Some(existing) if !existing.complete && existing.identity == manifest.identity => {
-            tracing::info!("resuming unfinished campaign at {}", dir.display());
-            return Ok(true);
-        }
-        _ => {}
+    if matches!(
+        Manifest::load(dir)?,
+        Some(existing) if !existing.complete && existing.identity == manifest.identity
+    ) {
+        tracing::info!("resuming unfinished campaign at {}", dir.display());
+        return Ok(true);
     }
     let question = format!(
         "campaign data exists at {}; delete and re-run?",
         dir.display()
     );
-    let wipe = if assume_yes {
-        true
-    } else if std::io::stdin().is_terminal() {
-        eprint!("{question} [y/N] ");
-        use std::io::Write;
-        std::io::stderr().flush().ok();
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        matches!(answer.trim(), "y" | "Y" | "yes")
-    } else {
-        return Err(format!("{question} (rerun with --yes or pick another --campaign)").into());
-    };
+    // The prompt's own hint covers --yes; add the escape hatch that
+    // only makes sense for a campaign dir.
+    let wipe = confirm(&question, assume_yes)
+        .map_err(|err| anyhow!("{err} (or pick another --campaign)"))?;
     if wipe {
         fs::remove_dir_all(dir)?;
     }
     Ok(wipe)
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
-    Io(io::Error),
-    Toml(toml::ser::Error),
-    Parse(PathBuf, toml::de::Error),
-    Sha(assets::Error),
+    #[error("results manifest: {0}")]
+    Io(#[from] io::Error),
+    #[error("serializing manifest: {0}")]
+    Toml(#[from] toml::ser::Error),
+    #[error("parsing {}: {}", .0.display(), .1)]
+    Parse(PathBuf, #[source] toml::de::Error),
 }
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Io(err) => write!(f, "results manifest: {err}"),
-            Error::Toml(err) => write!(f, "serializing manifest: {err}"),
-            Error::Parse(path, err) => {
-                write!(f, "parsing {}: {err}", path.display())
-            }
-            Error::Sha(err) => write!(f, "hashing identity: {err}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {

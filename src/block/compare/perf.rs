@@ -11,17 +11,22 @@
 //! perf_stats.json/perf.csv shapes so downstream artifact tooling
 //! keeps working; the bootstrap is seeded from the campaign
 //! manifest, making the verdict reproducible (v1's was not).
+//!
+//! The pass reads load -> per-workload cells -> Holm annotation ->
+//! coverage -> aggregate/gate -> artifacts, one function per step.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
+use anyhow::ensure;
 use serde_json::json;
 use tracing::{info, warn};
 
-use crate::block::cli::Opts;
+use crate::block::cli::CompareOpts;
 use crate::block::results::Manifest;
 use crate::stats;
+use crate::util::{csv_text, round};
 
 #[derive(Debug, Clone)]
 struct Run {
@@ -40,169 +45,347 @@ struct WorkloadBundle {
 
 #[derive(Debug, Default)]
 struct LoadStats {
-    declared_workloads: usize,
     invalid_files: usize,
+}
+
+/// Everything the gate is parameterised by, resolved once from the
+/// CLI and the campaign manifest.
+#[derive(Debug, Clone, Copy)]
+struct Gates {
+    alpha: f64,
+    threshold: f64,
+    resamples: u64,
+    seed: u64,
+}
+
+/// The IOPS numbers the aggregate re-reads after a workload's JSON
+/// is built. They are stored exactly as emitted (already rounded),
+/// because Holm and the gate must see the numbers the artifact
+/// reports.
+#[derive(Debug)]
+struct IopsCell {
+    p_value: f64,
+    delta_pct: f64,
+    /// Bootstrap median-delta CI lower bound, in percent.
+    ci_lo: f64,
+    tost_pass: bool,
+    /// Filled in by the Holm pass, which runs over all cells at once.
+    significant: bool,
+    c_median: f64,
+    rs_median: f64,
+}
+
+/// One workload: its JSON entry plus the typed IOPS cell. v1 threaded
+/// the same numbers through parallel vectors and indexed back into
+/// the entry list by position; the cell removes that coupling.
+struct WorkloadOutcome {
+    entry: serde_json::Value,
+    iops: Option<IopsCell>,
 }
 
 pub fn compare_perf(
     p1_dir: &Path,
     p2_dir: &Path,
     manifest: &Manifest,
-    opts: &Opts,
+    opts: &CompareOpts,
     outdir: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let alpha = opts.alpha;
-    let threshold = opts.perf_threshold;
-    let resamples = opts.bootstrap_resamples;
-    let seed = opts.seed.unwrap_or(manifest.seed);
+) -> anyhow::Result<()> {
+    let gates = Gates {
+        alpha: opts.alpha,
+        threshold: opts.perf_threshold,
+        resamples: opts.bootstrap_resamples,
+        seed: opts.seed.unwrap_or(manifest.seed),
+    };
 
     let (c_workloads, c_stats) = load_workloads(p1_dir)?;
     let (rs_workloads, rs_stats) = load_workloads(p2_dir)?;
-    if c_workloads.is_empty() || rs_workloads.is_empty() {
-        return Err("missing workload data for one or both drivers".into());
-    }
+    ensure!(
+        !c_workloads.is_empty() && !rs_workloads.is_empty(),
+        "missing workload data for one or both drivers"
+    );
     let common: Vec<&String> = c_workloads
         .keys()
         .filter(|name| rs_workloads.contains_key(*name))
         .collect();
-    if common.is_empty() {
-        return Err("no common workloads between baseline and campaign".into());
+    ensure!(
+        !common.is_empty(),
+        "no common workloads between baseline and campaign"
+    );
+
+    let mut outcomes = Vec::with_capacity(common.len());
+    for name in &common {
+        outcomes.push(workload_outcome(
+            name,
+            &c_workloads[*name],
+            &rs_workloads[*name],
+            &gates,
+        )?);
     }
+    holm_annotate(&mut outcomes, gates.alpha);
 
-    let mut workload_results = Vec::new();
-    let mut iops_p_values = Vec::new();
-    let mut iops_indices = Vec::new();
-    let mut all_deltas = Vec::new();
-    let mut ci_lower_bounds = Vec::new();
-    let mut tost_passes = Vec::new();
-    let mut c_medians = Vec::new();
-    let mut rs_medians = Vec::new();
-    let mut insufficient = 0usize;
+    let coverage = Coverage::measure(
+        &c_workloads,
+        &rs_workloads,
+        common.len(),
+        &outcomes,
+        &c_stats,
+        &rs_stats,
+    );
+    let aggregate = Aggregate::fold(&outcomes, &coverage, gates.threshold)?;
+    let result = perf_stats(&outcomes, &coverage, &aggregate, &gates);
 
-    for (index, name) in common.iter().enumerate() {
-        let c_bundle = &c_workloads[*name];
-        let rs_bundle = &rs_workloads[*name];
-        let mut entry = json!({
-            "name": name,
-            "n_c_samples": c_bundle.runs.len(),
-            "n_rs_samples": rs_bundle.runs.len(),
-            "warmup_runs_skipped": {
-                "c": c_bundle.warmups_skipped,
-                "rs": rs_bundle.warmups_skipped,
-            },
-        });
-        merge(&mut entry, parse_workload_name(name));
+    fs::write(
+        outdir.join("perf_stats.json"),
+        serde_json::to_string_pretty(&result)?,
+    )?;
+    fs::write(
+        outdir.join("perf.csv"),
+        perf_csv(&c_workloads, &rs_workloads),
+    )?;
 
-        let mut had_iops = false;
-        for (metric, extract) in [
-            ("iops", (|run: &Run| run.iops) as fn(&Run) -> f64),
-            ("lat_mean_us", |run| run.lat_mean_us),
-            ("lat_p99_us", |run| run.lat_p99_us),
-        ] {
-            let c_values: Vec<f64> = c_bundle.runs.iter().map(extract).collect();
-            let rs_values: Vec<f64> = rs_bundle.runs.iter().map(extract).collect();
-            let Some(mut comparison) =
-                compare_metric(&c_values, &rs_values, alpha, resamples, seed)?
-            else {
-                continue;
-            };
-            if metric == "iops" {
-                had_iops = true;
-                iops_p_values.push(comparison["test"]["p_value"].as_f64().unwrap_or(f64::NAN));
-                iops_indices.push(index);
-                all_deltas.push(comparison["delta_pct"].as_f64().unwrap_or(0.0));
-                ci_lower_bounds.push(comparison["ci_95"]["lo"].as_f64().unwrap_or(0.0));
-                let equivalence = equivalence_entry(&c_values, &rs_values, alpha, threshold);
-                tost_passes.push(equivalence["pass"].as_bool() == Some(true));
-                comparison["equivalence"] = equivalence;
-                c_medians.push(stats::descriptive(&c_values)?.median);
-                rs_medians.push(stats::descriptive(&rs_values)?.median);
-            }
-            entry[metric] = comparison;
+    info!(
+        "perf gate: tost {}/{} median_delta={}% worst={}% margin={}% -> {}",
+        aggregate.tost_passed,
+        coverage.common,
+        aggregate.median_delta,
+        aggregate.worst_delta,
+        gates.threshold,
+        if aggregate.tost_gate { "PASS" } else { "FAIL" }
+    );
+    Ok(())
+}
+
+/// One workload's three metric cells (v1's per-workload block). IOPS
+/// is the gated metric, so it also carries the TOST cell; latency is
+/// descriptive only.
+fn workload_outcome(
+    name: &str,
+    c_bundle: &WorkloadBundle,
+    rs_bundle: &WorkloadBundle,
+    gates: &Gates,
+) -> anyhow::Result<WorkloadOutcome> {
+    let mut entry = json!({
+        "name": name,
+        "n_c_samples": c_bundle.runs.len(),
+        "n_rs_samples": rs_bundle.runs.len(),
+        "warmup_runs_skipped": {
+            "c": c_bundle.warmups_skipped,
+            "rs": rs_bundle.warmups_skipped,
+        },
+    });
+    merge(&mut entry, &parse_workload_name(name));
+
+    let mut iops = None;
+    for (metric, extract) in [
+        ("iops", (|run: &Run| run.iops) as fn(&Run) -> f64),
+        ("lat_mean_us", |run| run.lat_mean_us),
+        ("lat_p99_us", |run| run.lat_p99_us),
+    ] {
+        let c_values: Vec<f64> = c_bundle.runs.iter().map(extract).collect();
+        let rs_values: Vec<f64> = rs_bundle.runs.iter().map(extract).collect();
+        let Some(mut comparison) = compare_metric(
+            &c_values,
+            &rs_values,
+            gates.alpha,
+            gates.resamples,
+            gates.seed,
+        )?
+        else {
+            continue;
+        };
+        if metric == "iops" {
+            let equivalence =
+                equivalence_entry(&c_values, &rs_values, gates.alpha, gates.threshold);
+            iops = Some(IopsCell {
+                p_value: comparison["test"]["p_value"].as_f64().unwrap_or(f64::NAN),
+                delta_pct: comparison["delta_pct"].as_f64().unwrap_or(0.0),
+                ci_lo: comparison["ci_95"]["lo"].as_f64().unwrap_or(0.0),
+                tost_pass: equivalence["pass"].as_bool() == Some(true),
+                significant: false,
+                c_median: stats::descriptive(&c_values)?.median,
+                rs_median: stats::descriptive(&rs_values)?.median,
+            });
+            comparison["equivalence"] = equivalence;
         }
-        if !had_iops {
-            insufficient += 1;
-        }
-        workload_results.push(entry);
+        entry[metric] = comparison;
     }
+    Ok(WorkloadOutcome { entry, iops })
+}
 
-    // Holm-Bonferroni across the IOPS p-values (v1 semantics, kept
-    // as descriptive evidence — the gate is the IUT below).
-    let (adjusted, significant) = stats::holm_bonferroni(&iops_p_values, alpha);
-    for entry in workload_results.iter_mut() {
-        entry["p_value_adjusted"] = serde_json::Value::Null;
-        entry["significant_after_correction"] = json!(false);
+/// Holm-Bonferroni across the IOPS p-values (v1 semantics, kept as
+/// descriptive evidence — the gate is the IUT below). Every workload
+/// carries the two v1 keys; only cells with IOPS evidence get a
+/// number.
+fn holm_annotate(outcomes: &mut [WorkloadOutcome], alpha: f64) {
+    let p_values: Vec<f64> = outcomes
+        .iter()
+        .filter_map(|outcome| outcome.iops.as_ref().map(|cell| cell.p_value))
+        .collect();
+    let (adjusted, significant) = stats::holm_bonferroni(&p_values, alpha);
+    let mut tested = 0;
+    for outcome in outcomes {
+        outcome.entry["p_value_adjusted"] = serde_json::Value::Null;
+        outcome.entry["significant_after_correction"] = json!(false);
+        let Some(cell) = outcome.iops.as_mut() else {
+            continue;
+        };
+        cell.significant = significant[tested];
+        outcome.entry["p_value_adjusted"] = json!(round(adjusted[tested], 6));
+        outcome.entry["significant_after_correction"] = json!(significant[tested]);
+        tested += 1;
     }
-    for (holm_index, &workload_index) in iops_indices.iter().enumerate() {
-        workload_results[workload_index]["p_value_adjusted"] =
-            json!(round(adjusted[holm_index], 6));
-        workload_results[workload_index]["significant_after_correction"] =
-            json!(significant[holm_index]);
-    }
+}
 
-    let median_delta = if all_deltas.is_empty() {
-        0.0
-    } else {
-        let mut sorted = all_deltas.clone();
-        sorted.sort_by(|a, b| a.total_cmp(b));
-        round(stats::descriptive(&sorted)?.median, 2)
-    };
-    let worst_delta = all_deltas.iter().copied().fold(f64::INFINITY, f64::min);
-    let worst_delta = if worst_delta.is_finite() {
-        round(worst_delta, 2)
-    } else {
-        0.0
-    };
-    let ci_gate =
-        !ci_lower_bounds.is_empty() && ci_lower_bounds.iter().all(|&bound| bound > -threshold);
-    let count_corrected = |direction: fn(f64) -> bool| {
-        iops_indices
+/// What the two sides actually offered (v1's data_quality/coverage
+/// block). The two zero-counts matter beyond reporting: a cell that
+/// never produced comparable evidence is an untested cell, and the
+/// IUT cannot claim equivalence for it.
+struct Coverage {
+    common: usize,
+    declared: usize,
+    missing_on_one_side: usize,
+    insufficient: usize,
+    c_invalid: usize,
+    rs_invalid: usize,
+    status: &'static str,
+}
+
+impl Coverage {
+    fn measure(
+        c_workloads: &BTreeMap<String, WorkloadBundle>,
+        rs_workloads: &BTreeMap<String, WorkloadBundle>,
+        common: usize,
+        outcomes: &[WorkloadOutcome],
+        c_stats: &LoadStats,
+        rs_stats: &LoadStats,
+    ) -> Self {
+        let declared = {
+            let mut names: Vec<&String> = c_workloads.keys().chain(rs_workloads.keys()).collect();
+            names.sort();
+            names.dedup();
+            names.len()
+        };
+        let missing_on_one_side = declared - common;
+        let insufficient = outcomes
             .iter()
-            .enumerate()
-            .filter(|(holm_index, &workload_index)| {
-                significant[*holm_index]
-                    && workload_results[workload_index]["iops"]["delta_pct"]
-                        .as_f64()
-                        .is_some_and(direction)
-            })
-            .count()
-    };
-    let slower = count_corrected(|delta| delta < 0.0);
-    let faster = count_corrected(|delta| delta > 0.0);
+            .filter(|outcome| outcome.iops.is_none())
+            .count();
+        let degraded = c_stats.invalid_files > 0
+            || rs_stats.invalid_files > 0
+            || missing_on_one_side > 0
+            || insufficient > 0;
+        let status = if outcomes.is_empty() {
+            "unavailable"
+        } else if degraded {
+            "inferred"
+        } else {
+            "measured"
+        };
+        Self {
+            common,
+            declared,
+            missing_on_one_side,
+            insufficient,
+            c_invalid: c_stats.invalid_files,
+            rs_invalid: rs_stats.invalid_files,
+            status,
+        }
+    }
+}
 
-    let declared: usize = {
-        let mut names: Vec<&String> = c_workloads.keys().chain(rs_workloads.keys()).collect();
-        names.sort();
-        names.dedup();
-        names.len()
-    };
-    let missing_on_one_side = declared - common.len();
-    let degraded = c_stats.invalid_files > 0
-        || rs_stats.invalid_files > 0
-        || missing_on_one_side > 0
-        || insufficient > 0;
-    let data_quality = if workload_results.is_empty() {
-        "unavailable"
-    } else if degraded {
-        "inferred"
-    } else {
-        "measured"
-    };
+/// The aggregate row and the gate itself: an intersection-union over
+/// the per-workload TOSTs. Every cell must pass, and every declared
+/// cell must have been testable.
+struct Aggregate {
+    median_delta: f64,
+    worst_delta: f64,
+    ci_gate: bool,
+    slower: usize,
+    faster: usize,
+    tost_passed: usize,
+    tost_gate: bool,
+}
 
-    // The gate: intersection-union over the per-workload TOSTs. A
-    // cell that never produced comparable evidence (missing on one
-    // side, too few samples) is an untested cell — the IUT cannot
-    // claim equivalence for it, so the gate fails.
-    let tost_passed = tost_passes.iter().filter(|&&pass| pass).count();
-    let tost_gate = !tost_passes.is_empty()
-        && tost_passed == tost_passes.len()
-        && insufficient == 0
-        && missing_on_one_side == 0;
+impl Aggregate {
+    fn fold(
+        outcomes: &[WorkloadOutcome],
+        coverage: &Coverage,
+        threshold: f64,
+    ) -> Result<Self, stats::Error> {
+        let cells: Vec<&IopsCell> = outcomes
+            .iter()
+            .filter_map(|outcome| outcome.iops.as_ref())
+            .collect();
+        let mut deltas: Vec<f64> = cells.iter().map(|cell| cell.delta_pct).collect();
+        deltas.sort_by(f64::total_cmp);
+        let median_delta = if deltas.is_empty() {
+            0.0
+        } else {
+            round(stats::descriptive(&deltas)?.median, 2)
+        };
+        let worst = deltas.iter().copied().fold(f64::INFINITY, f64::min);
+        let worst_delta = if worst.is_finite() {
+            round(worst, 2)
+        } else {
+            0.0
+        };
+        let ci_gate = !cells.is_empty() && cells.iter().all(|cell| cell.ci_lo > -threshold);
+        let corrected = |direction: fn(f64) -> bool| {
+            cells
+                .iter()
+                .filter(|cell| cell.significant && direction(cell.delta_pct))
+                .count()
+        };
+        let tost_passed = cells.iter().filter(|cell| cell.tost_pass).count();
+        Ok(Self {
+            median_delta,
+            worst_delta,
+            ci_gate,
+            slower: corrected(|delta| delta < 0.0),
+            faster: corrected(|delta| delta > 0.0),
+            tost_passed,
+            tost_gate: !cells.is_empty()
+                && tost_passed == cells.len()
+                && coverage.insufficient == 0
+                && coverage.missing_on_one_side == 0,
+        })
+    }
+}
+
+/// v1's perf_stats.json, extended with the TOST/IUT fields.
+fn perf_stats(
+    outcomes: &[WorkloadOutcome],
+    coverage: &Coverage,
+    aggregate: &Aggregate,
+    gates: &Gates,
+) -> serde_json::Value {
+    let Gates {
+        alpha,
+        threshold,
+        resamples,
+        seed,
+    } = *gates;
+    let Aggregate {
+        median_delta,
+        worst_delta,
+        tost_passed,
+        tost_gate,
+        ..
+    } = *aggregate;
+    let Coverage {
+        common,
+        insufficient,
+        missing_on_one_side,
+        ..
+    } = *coverage;
     let conf_level = 1.0 - 2.0 * alpha;
     let margin_ratio = 1.0 - threshold / 100.0;
-    let global_descriptive = signed_rank_global(&c_medians, &rs_medians);
 
-    let result = json!({
+    let cells = || outcomes.iter().filter_map(|outcome| outcome.iops.as_ref());
+    let c_medians: Vec<f64> = cells().map(|cell| cell.c_median).collect();
+    let rs_medians: Vec<f64> = cells().map(|cell| cell.rs_median).collect();
+
+    json!({
         "methodology": "Per-workload TOST non-inferiority on the Hodges-Lehmann log-IOPS \
                         ratio, combined as an intersection-union test across workloads; \
                         Mann-Whitney U + Holm-Bonferroni, bootstrap median-delta CI, A12 \
@@ -216,29 +399,29 @@ pub fn compare_perf(
             "bootstrap_seed": seed,
         },
         "data_quality": {
-            "status": data_quality,
+            "status": coverage.status,
             "warmup_policy": "warmup-marked runs excluded from comparison",
             "coverage": {
-                "common_workloads": common.len(),
-                "declared_common_workloads": declared,
+                "common_workloads": common,
+                "declared_common_workloads": coverage.declared,
                 "workloads_missing_on_one_side": missing_on_one_side,
                 "workloads_with_insufficient_samples": insufficient,
                 "invalid_fio_json_files": {
-                    "c": c_stats.invalid_files,
-                    "rs": rs_stats.invalid_files,
+                    "c": coverage.c_invalid,
+                    "rs": coverage.rs_invalid,
                 },
             },
         },
-        "workloads": workload_results,
-        "global_descriptive": global_descriptive,
+        "workloads": outcomes.iter().map(|outcome| &outcome.entry).collect::<Vec<_>>(),
+        "global_descriptive": signed_rank_global(&c_medians, &rs_medians),
         "aggregate": {
             "median_delta_pct": median_delta,
             "worst_case_delta_pct": worst_delta,
-            "workloads_significantly_slower": format!("{slower}/{}", common.len()),
-            "workloads_significantly_faster": format!("{faster}/{}", common.len()),
-            "workloads_passing_tost": format!("{tost_passed}/{}", common.len()),
+            "workloads_significantly_slower": format!("{}/{common}", aggregate.slower),
+            "workloads_significantly_faster": format!("{}/{common}", aggregate.faster),
+            "workloads_passing_tost": format!("{tost_passed}/{common}"),
             "tost_gate": tost_gate,
-            "bootstrap_ci_gate": ci_gate,
+            "bootstrap_ci_gate": aggregate.ci_gate,
         },
         "verdict": {
             "pass": tost_gate,
@@ -251,9 +434,8 @@ pub fn compare_perf(
             "threshold": threshold,
             "actual_median_delta_pct": median_delta,
             "detail": format!(
-                "{} workloads, {tost_passed} pass TOST, median delta {median_delta}%, worst \
-                 case {worst_delta}%{}",
-                common.len(),
+                "{common} workloads, {tost_passed} pass TOST, median delta {median_delta}%, \
+                 worst case {worst_delta}%{}",
                 if insufficient > 0 || missing_on_one_side > 0 {
                     format!(
                         ", {insufficient} with insufficient samples, {missing_on_one_side} \
@@ -264,21 +446,7 @@ pub fn compare_perf(
                 },
             ),
         },
-    });
-    fs::write(
-        outdir.join("perf_stats.json"),
-        serde_json::to_string_pretty(&result)?,
-    )?;
-    write_csv(&c_workloads, &rs_workloads, outdir)?;
-
-    info!(
-        "perf gate: tost {tost_passed}/{} median_delta={median_delta}% worst={worst_delta}% \
-         margin={threshold}% -> {}",
-        common.len(),
-        if tost_gate { "PASS" } else { "FAIL" }
-    );
-    let _ = c_stats.declared_workloads + rs_stats.declared_workloads;
-    Ok(())
+    })
 }
 
 /// Independent-sample MWU + bootstrap CI + A12 for one metric (v1
@@ -289,16 +457,16 @@ fn compare_metric(
     alpha: f64,
     resamples: u64,
     seed: u64,
-) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+) -> anyhow::Result<Option<serde_json::Value>> {
     if c_values.len() < 2 || rs_values.len() < 2 {
         return Ok(None);
     }
     let c_desc = stats::descriptive(c_values)?;
     let rs_desc = stats::descriptive(rs_values)?;
-    let delta_pct = if c_desc.median != 0.0 {
-        (rs_desc.median - c_desc.median) / c_desc.median * 100.0
-    } else {
+    let delta_pct = if c_desc.median == 0.0 {
         0.0
+    } else {
+        (rs_desc.median - c_desc.median) / c_desc.median * 100.0
     };
     let (ci_lo, ci_hi) = stats::bootstrap_median_delta_ci(c_values, rs_values, resamples, seed)?;
     let test = stats::mann_whitney(
@@ -441,33 +609,31 @@ fn load_workloads(
         .collect();
     entries.sort();
     for config_dir in entries {
-        stats.declared_workloads += 1;
         let mut bundle = WorkloadBundle::default();
         let mut files: Vec<_> = fs::read_dir(&config_dir)?
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("fio_") && name.ends_with(".json"))
+                path.extension().is_some_and(|ext| ext == "json")
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("fio_"))
             })
             .collect();
         files.sort();
         for file in files {
             bundle.total_files += 1;
-            match parse_fio_json(&file) {
-                Some((run, warmup)) => {
-                    if warmup {
-                        bundle.warmups_skipped += 1;
-                    } else {
-                        bundle.runs.push(run);
-                    }
+            if let Some((run, warmup)) = parse_fio_json(&file) {
+                if warmup {
+                    bundle.warmups_skipped += 1;
+                } else {
+                    bundle.runs.push(run);
                 }
-                None => {
-                    warn!("skipping malformed fio JSON: {}", file.display());
-                    bundle.invalid_files += 1;
-                    stats.invalid_files += 1;
-                }
+            } else {
+                warn!("skipping malformed fio JSON: {}", file.display());
+                bundle.invalid_files += 1;
+                stats.invalid_files += 1;
             }
         }
         if !bundle.runs.is_empty() {
@@ -490,7 +656,13 @@ fn parse_fio_json(path: &Path) -> Option<(Run, bool)> {
     let section = ["read", "write", "trim"]
         .iter()
         .filter_map(|direction| job.get(*direction))
-        .find(|section| section.get("iops").and_then(|v| v.as_f64()).unwrap_or(0.0) > 0.0)?;
+        .find(|section| {
+            section
+                .get("iops")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0)
+                > 0.0
+        })?;
     let run = Run {
         iops: section.get("iops")?.as_f64()?,
         lat_mean_us: section.get("lat_ns")?.get("mean")?.as_f64()? / 1000.0,
@@ -505,7 +677,7 @@ fn parse_fio_json(path: &Path) -> Option<(Run, bool)> {
         .get("koxi_metadata")
         .or_else(|| data.get("nullb_metadata"))
         .and_then(|meta| meta.get("warmup"))
-        .and_then(|value| value.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     Some((run, warmup))
 }
@@ -524,29 +696,46 @@ fn parse_workload_name(name: &str) -> serde_json::Value {
     }
 }
 
-fn write_csv(
+/// v1 perf.csv: one row per retained run, C side then Rust side.
+/// Warmups never reach `runs`, so the column is constant.
+fn perf_csv(
     c_workloads: &BTreeMap<String, WorkloadBundle>,
     rs_workloads: &BTreeMap<String, WorkloadBundle>,
-    outdir: &Path,
-) -> Result<(), std::io::Error> {
-    let mut csv = String::from("workload,driver,run_id,warmup,iops,lat_mean_us,lat_p99_us\n");
-    for (driver, workloads) in [("c", c_workloads), ("rs", rs_workloads)] {
-        for (name, bundle) in workloads {
-            for (index, run) in bundle.runs.iter().enumerate() {
-                csv.push_str(&format!(
-                    "{name},{driver},{},false,{},{},{}\n",
-                    index + 1,
-                    round(run.iops, 2),
-                    round(run.lat_mean_us, 2),
-                    round(run.lat_p99_us, 2)
-                ));
+) -> String {
+    csv_text(|out| {
+        out.write_record([
+            "workload",
+            "driver",
+            "run_id",
+            "warmup",
+            "iops",
+            "lat_mean_us",
+            "lat_p99_us",
+        ])?;
+        for (driver, workloads) in [("c", c_workloads), ("rs", rs_workloads)] {
+            for (name, bundle) in workloads {
+                for (index, run) in bundle.runs.iter().enumerate() {
+                    let run_id = (index + 1).to_string();
+                    let iops = round(run.iops, 2).to_string();
+                    let lat_mean = round(run.lat_mean_us, 2).to_string();
+                    let lat_p99 = round(run.lat_p99_us, 2).to_string();
+                    out.write_record([
+                        name.as_str(),
+                        driver,
+                        run_id.as_str(),
+                        "false",
+                        iops.as_str(),
+                        lat_mean.as_str(),
+                        lat_p99.as_str(),
+                    ])?;
+                }
             }
         }
-    }
-    fs::write(outdir.join("perf.csv"), csv)
+        Ok(())
+    })
 }
 
-fn merge(target: &mut serde_json::Value, extra: serde_json::Value) {
+fn merge(target: &mut serde_json::Value, extra: &serde_json::Value) {
     if let (Some(target), Some(extra)) = (target.as_object_mut(), extra.as_object()) {
         for (key, value) in extra {
             target.insert(key.clone(), value.clone());
@@ -554,17 +743,111 @@ fn merge(target: &mut serde_json::Value, extra: serde_json::Value) {
     }
 }
 
-/// Python-style rounding for the output shape (half away from zero
-/// is close enough at these magnitudes). NaN passes through and
-/// serializes as null.
-fn round(value: f64, decimals: u32) -> f64 {
-    let factor = 10f64.powi(decimals as i32);
-    (value * factor).round() / factor
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::cli::ScreenOpts;
+    use crate::block::results::Identity;
+
+    /// Ten reps per side, the same grid on both, Rust 0.1% slower:
+    /// well inside a 5% margin.
+    const REPS: [f64; 10] = [
+        100.0, 102.0, 98.0, 101.0, 99.0, 100.5, 97.5, 103.0, 100.2, 99.8,
+    ];
+
+    fn opts() -> CompareOpts {
+        CompareOpts {
+            alpha: 0.05,
+            perf_threshold: 5.0,
+            bootstrap_resamples: 200,
+            fuzz_rate_margin: 2.0,
+            safety_threshold: 34.2,
+            seed: Some(7),
+            screen: ScreenOpts {
+                validated_crashes: None,
+            },
+        }
+    }
+
+    fn manifest() -> Manifest {
+        Manifest {
+            complete: true,
+            created: 0,
+            seed: 42,
+            koxi: "test".to_owned(),
+            identity: Identity {
+                domain: "perf".to_owned(),
+                driver: "null_blk".to_owned(),
+                spec: String::new(),
+                prep: String::new(),
+                host: "test".to_owned(),
+                accel: None,
+                smp: None,
+                memory: None,
+                artifacts: None,
+                source: None,
+                fio: None,
+                fuzz: None,
+                static_: None,
+            },
+            p2: None,
+        }
+    }
+
+    fn write_fio(dir: &Path, index: usize, iops: f64) {
+        fs::write(
+            dir.join(format!("fio_{index}.json")),
+            serde_json::to_string(&json!({
+                "jobs": [{"read": {
+                    "iops": iops,
+                    "lat_ns": {"mean": 32000.0},
+                    "clat_ns": {"percentile": {"99.000000": 64000.0}},
+                }}],
+                "koxi_metadata": {"warmup": false},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// End-to-end over the whole pass: load, cells, Holm, coverage,
+    /// aggregate, artifacts.
+    #[test]
+    fn compare_perf_writes_both_artifacts() {
+        let base = std::env::temp_dir().join(format!("koxi-perf-e2e-{}", std::process::id()));
+        let (p1, p2, out) = (base.join("p1"), base.join("p2"), base.join("out"));
+        for (root, scale) in [(&p1, 1.0), (&p2, 0.999)] {
+            for workload in ["4k_randread_32", "4k_randwrite_1"] {
+                let dir = root.join(workload);
+                fs::create_dir_all(&dir).unwrap();
+                for (index, iops) in REPS.iter().enumerate() {
+                    write_fio(&dir, index + 1, iops * scale);
+                }
+            }
+        }
+        fs::create_dir_all(&out).unwrap();
+        compare_perf(&p1, &p2, &manifest(), &opts(), &out).unwrap();
+
+        let stats: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(out.join("perf_stats.json")).unwrap())
+                .unwrap();
+        assert_eq!(stats["data_quality"]["status"], "measured");
+        assert_eq!(stats["aggregate"]["workloads_passing_tost"], "2/2");
+        assert_eq!(stats["verdict"]["pass"], true);
+        assert_eq!(stats["thresholds"]["bootstrap_seed"], 7);
+        // Every workload entry carries the Holm keys and a TOST cell.
+        for entry in stats["workloads"].as_array().unwrap() {
+            assert!(entry["p_value_adjusted"].is_number());
+            assert_eq!(entry["significant_after_correction"], false);
+            assert_eq!(entry["iops"]["equivalence"]["pass"], true);
+            assert!(entry["lat_p99_us"]["delta_pct"].is_number());
+        }
+        // Header plus two workloads x ten reps x two drivers.
+        let csv = fs::read_to_string(out.join("perf.csv")).unwrap();
+        assert_eq!(csv.lines().count(), 1 + 2 * 10 * 2);
+
+        fs::remove_dir_all(&base).unwrap();
+    }
 
     #[test]
     fn workload_names_parse_like_v1() {
@@ -670,5 +953,121 @@ mod tests {
         assert!(signed_rank_global(&equal, &equal)["error"]
             .as_str()
             .is_some());
+    }
+
+    /// perf_stats.json is a v1 artifact shape: the aggregate counters
+    /// and the verdict prose are quoted in the paper, so pin them.
+    #[test]
+    fn perf_stats_pins_the_v1_json_shape() {
+        let cell = |delta_pct: f64, tost_pass: bool, significant: bool| IopsCell {
+            p_value: 0.01,
+            delta_pct,
+            ci_lo: -1.0,
+            tost_pass,
+            significant,
+            c_median: 100.0,
+            rs_median: 99.0,
+        };
+        let outcomes = vec![
+            WorkloadOutcome {
+                entry: json!({"name": "4k_randread_32"}),
+                iops: Some(cell(-1.5, true, true)),
+            },
+            WorkloadOutcome {
+                entry: json!({"name": "4k_randwrite_1"}),
+                iops: None,
+            },
+        ];
+        let coverage = Coverage {
+            common: 2,
+            declared: 2,
+            missing_on_one_side: 0,
+            insufficient: 1,
+            c_invalid: 0,
+            rs_invalid: 0,
+            status: "inferred",
+        };
+        let aggregate = Aggregate {
+            median_delta: -1.5,
+            worst_delta: -3.0,
+            ci_gate: true,
+            slower: 1,
+            faster: 0,
+            tost_passed: 1,
+            tost_gate: false,
+        };
+        let gates = Gates {
+            alpha: 0.05,
+            threshold: 5.0,
+            resamples: 1000,
+            seed: 7,
+        };
+        let stats = perf_stats(&outcomes, &coverage, &aggregate, &gates);
+
+        assert_eq!(stats["threshold_pct"], 5.0);
+        assert_eq!(stats["thresholds"]["tost_conf_level"], 0.9);
+        assert_eq!(stats["thresholds"]["bootstrap_seed"], 7);
+        assert_eq!(stats["data_quality"]["status"], "inferred");
+        assert_eq!(
+            stats["data_quality"]["coverage"]["workloads_with_insufficient_samples"],
+            1
+        );
+        assert_eq!(stats["workloads"].as_array().unwrap().len(), 2);
+        assert_eq!(stats["aggregate"]["workloads_significantly_slower"], "1/2");
+        assert_eq!(stats["aggregate"]["workloads_significantly_faster"], "0/2");
+        assert_eq!(stats["aggregate"]["workloads_passing_tost"], "1/2");
+        assert_eq!(stats["aggregate"]["tost_gate"], false);
+        assert_eq!(stats["verdict"]["pass"], false);
+        assert_eq!(
+            stats["verdict"]["criterion"],
+            "intersection-union TOST: every workload's 90% Hodges-Lehmann CI lower bound on \
+             the IOPS ratio (rs/c) exceeds 0.95 (margin 5%); FWER <= alpha=0.05 with no \
+             multiplicity correction (Berger IUT)"
+        );
+        assert_eq!(
+            stats["verdict"]["detail"],
+            "2 workloads, 1 pass TOST, median delta -1.5%, worst case -3%, 1 with \
+             insufficient samples, 0 missing on one side"
+        );
+        // The global test pairs the per-workload medians of the
+        // cells that produced IOPS evidence — here, one of the two.
+        assert_eq!(stats["global_descriptive"]["n_workloads"], 1);
+    }
+
+    /// perf.csv is a v1 artifact shape: header and row layout are
+    /// read by downstream tooling and must not drift.
+    #[test]
+    fn perf_csv_pins_the_v1_columns() {
+        let bundle = |iops: f64| WorkloadBundle {
+            runs: vec![
+                Run {
+                    iops,
+                    lat_mean_us: 32.0,
+                    lat_p99_us: 64.125,
+                },
+                Run {
+                    iops: iops + 1.0,
+                    lat_mean_us: 32.0,
+                    lat_p99_us: 64.0,
+                },
+            ],
+            ..WorkloadBundle::default()
+        };
+        let c: BTreeMap<String, WorkloadBundle> =
+            [("4k_randread_32".to_owned(), bundle(30236.456))].into();
+        let rs: BTreeMap<String, WorkloadBundle> =
+            [("4k_randread_32".to_owned(), bundle(29000.0))].into();
+
+        let csv = perf_csv(&c, &rs);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(
+            lines[0],
+            "workload,driver,run_id,warmup,iops,lat_mean_us,lat_p99_us"
+        );
+        assert_eq!(lines[1], "4k_randread_32,c,1,false,30236.46,32,64.13");
+        assert_eq!(lines[2], "4k_randread_32,c,2,false,30237.46,32,64");
+        assert_eq!(lines[3], "4k_randread_32,rs,1,false,29000,32,64.13");
+        assert_eq!(lines.len(), 5);
+        assert!(csv.ends_with('\n'));
     }
 }

@@ -16,7 +16,8 @@ use std::path::Path;
 use serde_json::json;
 use tracing::info;
 
-use crate::block::cli::Opts;
+use crate::block::cli::CompareOpts;
+use crate::util::{csv_text, round};
 
 /// ACSAC 2024 taxonomy: CWE -> what Rust does about it.
 const ACSAC_TAXONOMY: [(&str, &str); 9] = [
@@ -52,8 +53,7 @@ fn acsac_class(cwe: &str) -> &'static str {
     ACSAC_TAXONOMY
         .iter()
         .find(|(known, _)| *known == cwe)
-        .map(|(_, class)| *class)
-        .unwrap_or("unaffected")
+        .map_or("unaffected", |(_, class)| *class)
 }
 
 pub(super) type Row = BTreeMap<String, String>;
@@ -61,9 +61,9 @@ pub(super) type Row = BTreeMap<String, String>;
 /// Quote-aware CSV reader over the whole file (fields may embed
 /// commas, doubled quotes, and newlines). Missing file = no rows,
 /// matching v1 read_csv.
-pub(super) fn read_csv(path: &Path) -> Result<Vec<Row>, Box<dyn std::error::Error>> {
+pub(super) fn read_csv(path: &Path) -> Vec<Row> {
     let Ok(content) = fs::read_to_string(path) else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
     let mut records: Vec<Vec<String>> = Vec::new();
     let mut record: Vec<String> = Vec::new();
@@ -115,11 +115,11 @@ pub(super) fn read_csv(path: &Path) -> Result<Vec<Row>, Box<dyn std::error::Erro
             }
         }
     }
-    Ok(rows)
+    rows
 }
 
 pub(super) fn get<'a>(row: &'a Row, key: &str) -> &'a str {
-    row.get(key).map(String::as_str).unwrap_or("")
+    row.get(key).map_or("", String::as_str)
 }
 
 pub(super) fn number(row: &Row, key: &str) -> u64 {
@@ -141,10 +141,10 @@ struct CBaseline {
     acsac_counts: BTreeMap<&'static str, u64>,
 }
 
-fn analyze_c_baseline(static_dir: &Path) -> Result<CBaseline, Box<dyn std::error::Error>> {
-    let functions = read_csv(&static_dir.join("functions.csv"))?;
-    let densities = read_csv(&static_dir.join("unsafe_density.csv"))?;
-    let commits = read_csv(&static_dir.join("commits.csv"))?;
+fn analyze_c_baseline(static_dir: &Path) -> CBaseline {
+    let functions = read_csv(&static_dir.join("functions.csv"));
+    let densities = read_csv(&static_dir.join("unsafe_density.csv"));
+    let commits = read_csv(&static_dir.join("commits.csv"));
 
     let total_lines: u64 = functions.iter().map(|row| number(row, "line_count")).sum();
 
@@ -203,7 +203,7 @@ fn analyze_c_baseline(static_dir: &Path) -> Result<CBaseline, Box<dyn std::error
         .collect::<serde_json::Map<String, serde_json::Value>>()
         .into();
 
-    Ok(CBaseline {
+    CBaseline {
         json: json!({
             "total_functions": functions.len(),
             "total_lines": total_lines,
@@ -217,7 +217,7 @@ fn analyze_c_baseline(static_dir: &Path) -> Result<CBaseline, Box<dyn std::error
             },
         }),
         acsac_counts,
-    })
+    }
 }
 
 struct RsCurrent {
@@ -226,10 +226,10 @@ struct RsCurrent {
     abstraction_unsafe: u64,
 }
 
-fn analyze_rs_current(static_dir: &Path) -> Result<RsCurrent, Box<dyn std::error::Error>> {
-    let functions = read_csv(&static_dir.join("functions.csv"))?;
-    let unsafe_sites = read_csv(&static_dir.join("unsafe_sites.csv"))?;
-    let densities = read_csv(&static_dir.join("unsafe_density.csv"))?;
+fn analyze_rs_current(static_dir: &Path) -> RsCurrent {
+    let functions = read_csv(&static_dir.join("functions.csv"));
+    let unsafe_sites = read_csv(&static_dir.join("unsafe_sites.csv"));
+    let densities = read_csv(&static_dir.join("unsafe_density.csv"));
 
     let total_functions = functions.len() as u64;
     let total_lines: u64 = functions.iter().map(|row| number(row, "line_count")).sum();
@@ -298,7 +298,7 @@ fn analyze_rs_current(static_dir: &Path) -> Result<RsCurrent, Box<dyn std::error
             0.0
         }
     };
-    Ok(RsCurrent {
+    RsCurrent {
         json: json!({
             "total_functions": total_functions,
             "total_lines": total_lines,
@@ -311,18 +311,18 @@ fn analyze_rs_current(static_dir: &Path) -> Result<RsCurrent, Box<dyn std::error
         }),
         driver_unsafe: split["driver"],
         abstraction_unsafe: split["abstraction"],
-    })
+    }
 }
 
 pub fn compare_safety(
     p1_static: &Path,
     p2_static: &Path,
-    opts: &Opts,
+    opts: &CompareOpts,
     outdir: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> anyhow::Result<()> {
     let threshold = opts.safety_threshold;
-    let c_baseline = analyze_c_baseline(p1_static)?;
-    let rs_current = analyze_rs_current(p2_static)?;
+    let c_baseline = analyze_c_baseline(p1_static);
+    let rs_current = analyze_rs_current(p2_static);
 
     let auto_eliminated = c_baseline.acsac_counts["auto_eliminated"];
     let total_classified: u64 = c_baseline.acsac_counts.values().sum();
@@ -339,7 +339,7 @@ pub fn compare_safety(
     };
     let passed = elimination_rate >= threshold / 100.0;
 
-    let commits = read_csv(&p1_static.join("commits.csv"))?;
+    let commits = read_csv(&p1_static.join("commits.csv"));
     let quality = if commits
         .iter()
         .any(|commit| !get(commit, "manual_cwe").trim().is_empty())
@@ -381,7 +381,7 @@ pub fn compare_safety(
         outdir.join("safety.json"),
         serde_json::to_string_pretty(&result)?,
     )?;
-    write_csv(&result, outdir)?;
+    fs::write(outdir.join("safety.csv"), safety_csv(&result))?;
 
     info!(
         "safety gate: elimination_rate={:.1}% threshold={threshold}% -> {}",
@@ -392,27 +392,27 @@ pub fn compare_safety(
 }
 
 /// v1 safety.csv: flat driver,metric,value rows for the appendix.
-fn write_csv(result: &serde_json::Value, outdir: &Path) -> Result<(), std::io::Error> {
+fn safety_csv(result: &serde_json::Value) -> String {
     let c = &result["c_baseline"];
     let rs = &result["rs_current"];
     let comparison = &result["comparison"];
     let vuln = &c["vulnerability_history"]["by_acsac_class"];
-    let mut rows: Vec<(&str, String, serde_json::Value)> = vec![
-        ("C", "total_functions".into(), c["total_functions"].clone()),
-        ("C", "total_lines".into(), c["total_lines"].clone()),
+    let mut rows: Vec<(&str, String, &serde_json::Value)> = vec![
+        ("C", "total_functions".into(), &c["total_functions"]),
+        ("C", "total_lines".into(), &c["total_lines"]),
         (
             "C",
             "safety_related_commits".into(),
-            c["safety_related_commits"].clone(),
+            &c["safety_related_commits"],
         ),
         (
             "C",
             "implicit_unsafe_operations".into(),
-            c["implicit_unsafe_operations"].clone(),
+            &c["implicit_unsafe_operations"],
         ),
     ];
     for class in ACSAC_CLASSES {
-        rows.push(("C", format!("acsac_{class}"), vuln[class]["count"].clone()));
+        rows.push(("C", format!("acsac_{class}"), &vuln[class]["count"]));
     }
     for metric in [
         "total_functions",
@@ -422,33 +422,30 @@ fn write_csv(result: &serde_json::Value, outdir: &Path) -> Result<(), std::io::E
         "unsafe_blocks",
         "unsafe_ratio",
     ] {
-        rows.push(("Rust", metric.into(), rs[metric].clone()));
+        rows.push(("Rust", metric.into(), &rs[metric]));
     }
     for source in ["driver", "abstraction"] {
         rows.push((
             "Rust",
             format!("unsafe_sites_{source}"),
-            rs["by_source"][source]["unsafe_sites"].clone(),
+            &rs["by_source"][source]["unsafe_sites"],
         ));
     }
     for metric in ["elimination_rate", "abstraction_ratio"] {
-        rows.push(("comparison", metric.into(), comparison[metric].clone()));
+        rows.push(("comparison", metric.into(), &comparison[metric]));
     }
 
-    let mut csv = String::from("driver,metric,value\n");
-    for (driver, metric, value) in rows {
-        let value = match value {
-            serde_json::Value::String(text) => text,
-            other => other.to_string(),
-        };
-        csv.push_str(&format!("{driver},{metric},{value}\n"));
-    }
-    fs::write(outdir.join("safety.csv"), csv)
-}
-
-fn round(value: f64, decimals: u32) -> f64 {
-    let factor = 10f64.powi(decimals as i32);
-    (value * factor).round() / factor
+    csv_text(|out| {
+        out.write_record(["driver", "metric", "value"])?;
+        for (driver, metric, value) in rows {
+            let value = match value {
+                serde_json::Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            out.write_record([driver, metric.as_str(), value.as_str()])?;
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -522,7 +519,7 @@ mod tests {
     #[test]
     fn safety_comparison_matches_v1_semantics() {
         let (c_dir, rs_dir) = fake_static_dirs();
-        let c_baseline = analyze_c_baseline(&c_dir).unwrap();
+        let c_baseline = analyze_c_baseline(&c_dir);
 
         // Validated CWE-416 (auto-eliminated) overrides auto CWE-401
         // (needs discipline): 2 auto_eliminated, 0 discipline, 1
@@ -534,7 +531,7 @@ mod tests {
         assert_eq!(c_baseline.json["implicit_unsafe_operations"], 120);
         assert_eq!(c_baseline.json["total_lines"], 30);
 
-        let rs_current = analyze_rs_current(&rs_dir).unwrap();
+        let rs_current = analyze_rs_current(&rs_dir);
         assert_eq!(rs_current.driver_unsafe, 1);
         assert_eq!(rs_current.abstraction_unsafe, 2);
         assert_eq!(rs_current.json["unsafe_blocks"], 3);
@@ -550,11 +547,55 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.csv");
         fs::write(&path, "a,b\n\"x, y\",\"say \"\"hi\"\"\"\nplain,2\n").unwrap();
-        let rows = read_csv(&path).unwrap();
+        let rows = read_csv(&path);
         assert_eq!(rows[0]["a"], "x, y");
         assert_eq!(rows[0]["b"], "say \"hi\"");
         assert_eq!(rows[1]["a"], "plain");
-        assert!(read_csv(&dir.join("missing.csv")).unwrap().is_empty());
+        assert!(read_csv(&dir.join("missing.csv")).is_empty());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// safety.csv is a v1 artifact shape: the appendix tables read
+    /// these rows in this order.
+    #[test]
+    fn safety_csv_pins_the_v1_rows() {
+        let result = json!({
+            "c_baseline": {
+                "total_functions": 2,
+                "total_lines": 30,
+                "safety_related_commits": 3,
+                "implicit_unsafe_operations": 120,
+                "vulnerability_history": {"by_acsac_class": {
+                    "auto_eliminated": {"count": 2},
+                    "needs_discipline": {"count": 0},
+                    "unaffected": {"count": 1},
+                }},
+            },
+            "rs_current": {
+                "total_functions": 2,
+                "total_lines": 25,
+                "unsafe_functions": 0,
+                "unsafe_fn_ratio": 0.0,
+                "unsafe_blocks": 3,
+                "unsafe_ratio": 1.5,
+                "by_source": {
+                    "driver": {"unsafe_sites": 1},
+                    "abstraction": {"unsafe_sites": 2},
+                },
+            },
+            "comparison": {"elimination_rate": 0.6667, "abstraction_ratio": 0.6667},
+        });
+        let csv = safety_csv(&result);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines[0], "driver,metric,value");
+        assert_eq!(lines[1], "C,total_functions,2");
+        assert_eq!(lines[4], "C,implicit_unsafe_operations,120");
+        assert_eq!(lines[5], "C,acsac_auto_eliminated,2");
+        assert_eq!(lines[8], "Rust,total_functions,2");
+        assert_eq!(lines[11], "Rust,unsafe_fn_ratio,0.0");
+        assert_eq!(lines[14], "Rust,unsafe_sites_driver,1");
+        assert_eq!(lines[16], "comparison,elimination_rate,0.6667");
+        assert_eq!(lines.len(), 18);
+        assert!(csv.ends_with('\n'));
     }
 }

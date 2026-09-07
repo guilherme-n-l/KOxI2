@@ -8,16 +8,18 @@
 //! + flatc only return if custom syscall descriptions land.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::thread;
 
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::cmd;
-use crate::fetch::{self, Ctx, CACHE_DIR};
+use crate::fetch::Ctx;
+use crate::home::CACHE_DIR;
 use crate::kernel::build::ARTIFACTS_DIR;
 use crate::lock::LockedSource;
+use crate::scratch::Scratch;
+use crate::util;
 use crate::virt::build::{probe_version, Error, Options};
 
 const SOURCE: &str = "syzkaller";
@@ -56,7 +58,11 @@ pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
     let commit = commit.clone();
 
     // The executor is C++ built by gcc; the rest is go.
-    let toolchain = format!("{}|{}", go_version(), probe_version("gcc"));
+    let toolchain = format!(
+        "{}|{}",
+        util::probe_version("go", &["version"], "unknown"),
+        probe_version("gcc")
+    );
     let expected = format!("r{RECIPE}:{commit}:{toolchain}");
 
     let all_harvested = || {
@@ -70,52 +76,10 @@ pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
     }
 
     let cache_repo = ctx.home.join(CACHE_DIR).join(SOURCE);
-    let tmp_root = ctx.home.join("tmp");
-    fs::create_dir_all(&tmp_root)?;
-    let scratch = tempfile::Builder::new()
-        .prefix("syzkaller-")
-        .tempdir_in(&tmp_root)?;
-    let repo = scratch.path().join(SOURCE);
-
-    let result = (|| -> Result<(), Error> {
-        info!("cloning pristine syzkaller at {}", &commit[..12]);
-        let mut clone = Command::new("git");
-        clone
-            .arg("clone")
-            .arg("-q")
-            .arg("--shared")
-            .arg(&cache_repo)
-            .arg(&repo);
-        cmd::status(clone, "git-clone", logs)?;
-        let mut checkout = Command::new("git");
-        checkout
-            .arg("-C")
-            .arg(&repo)
-            .arg("checkout")
-            .arg("-q")
-            .arg("--detach")
-            .arg(&commit);
-        cmd::status(checkout, "git-checkout", logs)?;
-
-        let jobs = thread::available_parallelism().map_or(1, |n| n.get());
-        info!(
-            "building syzkaller with {jobs} jobs (log: {})",
-            logs.join("make-syzkaller.log").display()
-        );
-        let mut make = Command::new("make");
-        make.arg("-C")
-            .arg(&repo)
-            .env("NIX_HARDENING_ENABLE", "")
-            .arg("-j")
-            .arg(jobs.to_string());
-        // Static libc for the executor's -static probe, scoped to
-        // this build only (globally it poisons host-tool links).
-        if let Ok(dir) = std::env::var("GLIBC_STATIC_LIB") {
-            let existing = std::env::var("NIX_LDFLAGS").unwrap_or_default();
-            make.env("NIX_LDFLAGS", format!("{existing} -L{dir}"));
-        }
-        cmd::status(make, "make-syzkaller", logs)?;
-
+    Scratch::new(ctx.home, "syzkaller-")?.run(|dir| {
+        let repo = dir.join(SOURCE);
+        clone_pristine(&cache_repo, &repo, &commit, logs)?;
+        compile(&repo, logs)?;
         for rel in BINARIES {
             let built = repo.join("bin").join(rel);
             if !built.is_file() {
@@ -128,30 +92,55 @@ pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
             fs::copy(&built, &dest)?;
             ctx.lock
                 .artifacts
-                .insert(format!("syzkaller/bin/{rel}"), fetch::sha256(&dest, logs)?);
+                .insert(format!("syzkaller/bin/{rel}"), util::sha256_file(&dest)?);
         }
-        ctx.lock.builds.insert(SOURCE.to_owned(), expected.clone());
+        ctx.lock.builds.insert(SOURCE.to_owned(), expected);
         Ok(())
-    })();
-
-    if let Err(err) = result {
-        let kept = scratch.keep();
-        warn!("build scratch kept for debugging at {}", kept.display());
-        return Err(err);
-    }
+    })?;
 
     info!("syzkaller at {}", harvest_root.display());
     Ok(harvest_root)
 }
 
-fn go_version() -> String {
-    let output = Command::new("go").arg("version").output();
-    match output {
-        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_owned(),
-        _ => "unknown".to_owned(),
+/// A shared local clone of the cache checkout, detached at `commit`.
+fn clone_pristine(cache_repo: &Path, repo: &Path, commit: &str, logs: &Path) -> Result<(), Error> {
+    info!("cloning pristine syzkaller at {}", &commit[..12]);
+    let mut clone = Command::new("git");
+    clone
+        .arg("clone")
+        .arg("-q")
+        .arg("--shared")
+        .arg(cache_repo)
+        .arg(repo);
+    cmd::status(clone, "git-clone", logs)?;
+    let mut checkout = Command::new("git");
+    checkout
+        .arg("-C")
+        .arg(repo)
+        .arg("checkout")
+        .arg("-q")
+        .arg("--detach")
+        .arg(commit);
+    Ok(cmd::status(checkout, "git-checkout", logs)?)
+}
+
+fn compile(repo: &Path, logs: &Path) -> Result<(), Error> {
+    let jobs = util::jobs();
+    info!(
+        "building syzkaller with {jobs} jobs (log: {})",
+        logs.join("make-syzkaller.log").display()
+    );
+    let mut make = Command::new("make");
+    make.arg("-C")
+        .arg(repo)
+        .env("NIX_HARDENING_ENABLE", "")
+        .arg("-j")
+        .arg(jobs.to_string());
+    // Static libc for the executor's -static probe, scoped to
+    // this build only (globally it poisons host-tool links).
+    if let Ok(dir) = std::env::var("GLIBC_STATIC_LIB") {
+        let existing = std::env::var("NIX_LDFLAGS").unwrap_or_default();
+        make.env("NIX_LDFLAGS", format!("{existing} -L{dir}"));
     }
+    Ok(cmd::status(make, "make-syzkaller", logs)?)
 }

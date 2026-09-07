@@ -18,12 +18,16 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
-use crate::fetch::{self, Ctx};
+use crate::assets::{self, Loaded};
+use crate::block::fio::FIO;
+use crate::cmd;
+use crate::fetch::Ctx;
 use crate::kernel::build::ARTIFACTS_DIR;
+use crate::scratch::Scratch;
+use crate::util;
 use crate::virt::build::{Error, Options, BUSYBOX, DROPBEARMULTI};
-use crate::{assets, cmd};
 
 /// Artifact name; also the lock artifact key.
 pub const INITRAMFS: &str = "initramfs.cpio.gz";
@@ -45,139 +49,169 @@ pub fn build(ctx: &mut Ctx, opts: &Options) -> Result<PathBuf, Error> {
     let artifacts = ctx.root.join(ARTIFACTS_DIR);
     let artifact = artifacts.join(INITRAMFS);
 
-    // Inputs: the three binaries (by locked sha), the init asset, and
-    // the client public key.
-    let ingredient_sha = |name: &str| -> Result<String, Error> {
-        ctx.lock
-            .artifacts
-            .get(name)
-            .cloned()
-            .ok_or_else(|| Error::MissingPrereq(name.to_owned()))
-    };
-    let busybox_sha = ingredient_sha(BUSYBOX)?;
-    let dropbear_sha = ingredient_sha(DROPBEARMULTI)?;
-    let fio_sha = ingredient_sha(crate::block::fio::FIO)?;
-    for name in [BUSYBOX, DROPBEARMULTI, crate::block::fio::FIO] {
-        if !artifacts.join(name).is_file() {
-            return Err(Error::MissingPrereq(name.to_owned()));
-        }
-    }
-    let init = assets::load_locked(ctx.root, ctx.config, "virt/init", ctx.lock)?;
-    let udhcpc = assets::load_locked(ctx.root, ctx.config, "virt/udhcpc-script", ctx.lock)?;
-    let pubkey = ensure_client_key(&artifacts, logs)?;
-    let pubkey_sha = fetch::sha256(&pubkey, logs)?;
-    let host_keys = ensure_host_keys(&artifacts, logs)?;
-    let mut host_keys_sha = String::new();
-    for key in &host_keys {
-        host_keys_sha.push_str(&fetch::sha256(key, logs)?);
-        host_keys_sha.push('+');
-    }
-
-    let expected = format!(
-        "r{RECIPE}:{busybox_sha}:{dropbear_sha}:{fio_sha}:{}:{}:{pubkey_sha}:{host_keys_sha}",
-        init.sha256, udhcpc.sha256
-    );
-    if artifact.is_file() && !opts.force && ctx.lock.builds.get(TARGET) == Some(&expected) {
+    let ingredients = Ingredients::gather(ctx, &artifacts)?;
+    if artifact.is_file()
+        && !opts.force
+        && ctx.lock.builds.get(TARGET) == Some(&ingredients.expected)
+    {
         debug!("initramfs cached at {}", artifact.display());
         return Ok(artifact);
     }
 
-    let tmp_root = ctx.home.join("tmp");
-    fs::create_dir_all(&tmp_root)?;
-    let scratch = tempfile::Builder::new()
-        .prefix("initramfs-")
-        .tempdir_in(&tmp_root)?;
-    let root = scratch.path().join("rootfs");
-
-    let result = (|| -> Result<(), Error> {
+    Scratch::new(ctx.home, "initramfs-")?.run(|dir| -> Result<(), Error> {
+        let root = dir.join("rootfs");
         info!("staging initramfs rootfs");
-        for dir in ["bin", "usr/bin", "etc/dropbear", "root/.ssh"] {
-            fs::create_dir_all(root.join(dir))?;
-        }
-        fs::set_permissions(root.join("root"), fs::Permissions::from_mode(0o700))?;
-        fs::set_permissions(root.join("root/.ssh"), fs::Permissions::from_mode(0o700))?;
-
-        install(&artifacts.join(BUSYBOX), &root.join("bin/busybox"), 0o755)?;
-        install(
-            &artifacts.join(DROPBEARMULTI),
-            &root.join("bin/dropbearmulti"),
-            0o755,
-        )?;
-        install(
-            &artifacts.join(crate::block::fio::FIO),
-            &root.join("usr/bin/fio"),
-            0o755,
-        )?;
-
-        // One symlink per busybox applet (v1 parity), asked of the
-        // binary itself so the list always matches the build.
-        let mut list = Command::new(root.join("bin/busybox"));
-        list.arg("--list");
-        let applets = cmd::stdout(list, "busybox-list", logs)?;
-        for applet in applets.lines().map(str::trim).filter(|a| !a.is_empty()) {
-            if applet == "busybox" {
-                continue;
-            }
-            std::os::unix::fs::symlink("/bin/busybox", root.join("bin").join(applet))?;
-        }
-        for tool in ["dropbear", "dropbearkey", "scp"] {
-            std::os::unix::fs::symlink("/bin/dropbearmulti", root.join("usr/bin").join(tool))?;
-        }
-
-        // Static identity baked at build time: dropbear needs
-        // getpwnam to resolve root for pubkey auth; password auth is
-        // disabled (-s), so no /etc/shadow exists at all. Host keys
-        // are pre-generated so init never touches key material.
-        fs::write(root.join("etc/passwd"), "root:x:0:0:root:/root:/bin/sh\n")?;
-        fs::write(root.join("etc/shells"), "/bin/sh\n")?;
-        for key in &host_keys {
-            let name = key.file_name().expect("host key file name");
-            install(key, &root.join("etc/dropbear").join(name), 0o600)?;
-        }
-
-        fs::write(root.join("init"), init.contents.as_bytes())?;
-        fs::set_permissions(root.join("init"), fs::Permissions::from_mode(0o755))?;
-        fs::write(root.join("etc/udhcpc.script"), udhcpc.contents.as_bytes())?;
-        fs::set_permissions(
-            root.join("etc/udhcpc.script"),
-            fs::Permissions::from_mode(0o755),
-        )?;
-
-        fs::copy(&pubkey, root.join("root/.ssh/authorized_keys"))?;
-        fs::set_permissions(
-            root.join("root/.ssh/authorized_keys"),
-            fs::Permissions::from_mode(0o600),
-        )?;
-
-        // Reproducible pack: sorted entries, epoch mtimes, no gzip
-        // timestamp — identical inputs give identical bytes.
-        info!("packing {}", artifact.display());
-        fs::create_dir_all(&artifacts)?;
-        let mut pack = Command::new("sh");
-        pack.arg("-c").arg(format!(
-            "cd '{root}' && find . -exec touch -h -d @0 {{}} + && \
-             find . | LC_ALL=C sort | cpio -o -H newc --owner 0:0 --reproducible | \
-             gzip -n > '{out}'",
-            root = root.display(),
-            out = artifact.display()
-        ));
-        cmd::status(pack, "pack-initramfs", logs)?;
-
+        stage_binaries(&root, &artifacts, logs)?;
+        stage_identity(&root, &ingredients)?;
+        pack(&root, &artifact, logs)?;
         ctx.lock
             .artifacts
-            .insert(INITRAMFS.to_owned(), fetch::sha256(&artifact, logs)?);
-        ctx.lock.builds.insert(TARGET.to_owned(), expected.clone());
+            .insert(INITRAMFS.to_owned(), util::sha256_file(&artifact)?);
+        ctx.lock
+            .builds
+            .insert(TARGET.to_owned(), ingredients.expected);
         Ok(())
-    })();
-
-    if let Err(err) = result {
-        let kept = scratch.keep();
-        warn!("staging scratch kept for debugging at {}", kept.display());
-        return Err(err);
-    }
+    })?;
 
     info!("initramfs at {}", artifact.display());
     Ok(artifact)
+}
+
+/// What the image is assembled from — the three binaries (by locked
+/// sha), the init and udhcpc assets, and the client + host keys —
+/// resolved up front so the fingerprint is checked before staging.
+struct Ingredients {
+    init: Loaded,
+    udhcpc: Loaded,
+    pubkey: PathBuf,
+    host_keys: Vec<PathBuf>,
+    expected: String,
+}
+
+impl Ingredients {
+    fn gather(ctx: &mut Ctx, artifacts: &Path) -> Result<Self, Error> {
+        let logs = ctx.logs;
+        let ingredient_sha = |name: &str| -> Result<String, Error> {
+            ctx.lock
+                .artifacts
+                .get(name)
+                .cloned()
+                .ok_or_else(|| Error::MissingPrereq(name.to_owned()))
+        };
+        let busybox_sha = ingredient_sha(BUSYBOX)?;
+        let dropbear_sha = ingredient_sha(DROPBEARMULTI)?;
+        let fio_sha = ingredient_sha(FIO)?;
+        for name in [BUSYBOX, DROPBEARMULTI, FIO] {
+            if !artifacts.join(name).is_file() {
+                return Err(Error::MissingPrereq(name.to_owned()));
+            }
+        }
+        let init = assets::load_locked(ctx.root, ctx.config, "virt/init", ctx.lock)?;
+        let udhcpc = assets::load_locked(ctx.root, ctx.config, "virt/udhcpc-script", ctx.lock)?;
+        let pubkey = ensure_client_key(artifacts, logs)?;
+        let pubkey_sha = util::sha256_file(&pubkey)?;
+        let host_keys = ensure_host_keys(artifacts, logs)?;
+        let mut host_keys_sha = String::new();
+        for key in &host_keys {
+            host_keys_sha.push_str(&util::sha256_file(key)?);
+            host_keys_sha.push('+');
+        }
+
+        let expected = format!(
+            "r{RECIPE}:{busybox_sha}:{dropbear_sha}:{fio_sha}:{}:{}:{pubkey_sha}:{host_keys_sha}",
+            init.sha256, udhcpc.sha256
+        );
+        Ok(Self {
+            init,
+            udhcpc,
+            pubkey,
+            host_keys,
+            expected,
+        })
+    }
+}
+
+/// The rootfs skeleton and its binaries: busybox with one symlink
+/// per applet (v1 parity, asked of the binary itself so the list
+/// always matches the build), dropbearmulti with its tool links, fio.
+fn stage_binaries(root: &Path, artifacts: &Path, logs: &Path) -> Result<(), Error> {
+    for dir in ["bin", "usr/bin", "etc/dropbear", "root/.ssh"] {
+        fs::create_dir_all(root.join(dir))?;
+    }
+    fs::set_permissions(root.join("root"), fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(root.join("root/.ssh"), fs::Permissions::from_mode(0o700))?;
+
+    install(&artifacts.join(BUSYBOX), &root.join("bin/busybox"), 0o755)?;
+    install(
+        &artifacts.join(DROPBEARMULTI),
+        &root.join("bin/dropbearmulti"),
+        0o755,
+    )?;
+    install(&artifacts.join(FIO), &root.join("usr/bin/fio"), 0o755)?;
+
+    let mut list = Command::new(root.join("bin/busybox"));
+    list.arg("--list");
+    let applets = cmd::stdout(list, "busybox-list", logs)?;
+    for applet in applets.lines().map(str::trim).filter(|a| !a.is_empty()) {
+        if applet == "busybox" {
+            continue;
+        }
+        std::os::unix::fs::symlink("/bin/busybox", root.join("bin").join(applet))?;
+    }
+    for tool in ["dropbear", "dropbearkey", "scp"] {
+        std::os::unix::fs::symlink("/bin/dropbearmulti", root.join("usr/bin").join(tool))?;
+    }
+    Ok(())
+}
+
+/// Static identity baked at build time: dropbear needs getpwnam to
+/// resolve root for pubkey auth; password auth is disabled (-s), so
+/// no /etc/shadow exists at all. Host keys are pre-generated so init
+/// never touches key material; /init, the udhcpc hook, and the
+/// client's authorized_keys land alongside.
+fn stage_identity(root: &Path, ingredients: &Ingredients) -> Result<(), Error> {
+    fs::write(root.join("etc/passwd"), "root:x:0:0:root:/root:/bin/sh\n")?;
+    fs::write(root.join("etc/shells"), "/bin/sh\n")?;
+    for key in &ingredients.host_keys {
+        let name = key.file_name().expect("host key file name");
+        install(key, &root.join("etc/dropbear").join(name), 0o600)?;
+    }
+
+    fs::write(root.join("init"), ingredients.init.contents.as_bytes())?;
+    fs::set_permissions(root.join("init"), fs::Permissions::from_mode(0o755))?;
+    fs::write(
+        root.join("etc/udhcpc.script"),
+        ingredients.udhcpc.contents.as_bytes(),
+    )?;
+    fs::set_permissions(
+        root.join("etc/udhcpc.script"),
+        fs::Permissions::from_mode(0o755),
+    )?;
+
+    fs::copy(&ingredients.pubkey, root.join("root/.ssh/authorized_keys"))?;
+    fs::set_permissions(
+        root.join("root/.ssh/authorized_keys"),
+        fs::Permissions::from_mode(0o600),
+    )?;
+    Ok(())
+}
+
+/// Reproducible pack: sorted entries, epoch mtimes, no gzip
+/// timestamp — identical inputs give identical bytes.
+fn pack(root: &Path, artifact: &Path, logs: &Path) -> Result<(), Error> {
+    info!("packing {}", artifact.display());
+    if let Some(parent) = artifact.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut pack = Command::new("sh");
+    pack.arg("-c").arg(format!(
+        "cd '{root}' && find . -exec touch -h -d @0 {{}} + && \
+         find . | LC_ALL=C sort | cpio -o -H newc --owner 0:0 --reproducible | \
+         gzip -n > '{out}'",
+        root = root.display(),
+        out = artifact.display()
+    ));
+    Ok(cmd::status(pack, "pack-initramfs", logs)?)
 }
 
 fn install(src: &Path, dest: &Path, mode: u32) -> Result<(), Error> {

@@ -12,40 +12,28 @@ pub mod safety;
 pub mod screen;
 pub mod verdict;
 
-use std::path::Path;
-use std::process::ExitCode;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
-use tracing::{error, info, warn};
+use anyhow::bail;
+use tracing::{info, warn};
 
-use crate::block::cli::Opts;
+use crate::block::cli::{CompareOpts, Scope};
 use crate::block::results::{self, Manifest};
 use crate::config::{anchored, Project};
 
-pub fn compare(opts: &Opts, logs: &Path) -> ExitCode {
-    match drive(opts, logs) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            error!("koxi block compare: {err}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-pub(crate) fn drive(opts: &Opts, _logs: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let campaign = opts
-        .campaign
-        .as_deref()
-        .ok_or("compare requires --campaign <name>")?;
+pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow::Result<()> {
     let project = Project::locate()?;
-    let results_root = anchored(&project.root, &opts.output);
+    let results_root = anchored(&project.root, &scope.output);
 
-    let pairs = super::driver_pairs(&project.config, &opts.only);
+    let pairs = super::driver_pairs(&project.config, &scope.only);
     if pairs.is_empty() {
-        return Err("no matching driver pairs in the [block.drivers] registry".into());
+        bail!("no matching driver pairs in the [block.drivers] registry");
     }
 
     let mut compared = 0;
-    for (rs_name, _, c_name, _) in pairs {
+    for pair in pairs {
+        let (c_name, rs_name) = (pair.c_name, pair.rs_name);
         let campaign_root = results_root
             .join("p2")
             .join(format!("{c_name}::{rs_name}"))
@@ -59,59 +47,57 @@ pub(crate) fn drive(opts: &Opts, _logs: &Path) -> Result<(), Box<dyn std::error:
         }
         let compare_dir = campaign_root.join("compare");
         std::fs::create_dir_all(&compare_dir)?;
-        let mut baselines = std::collections::BTreeMap::new();
-        let mut record =
-            |domain: &str,
-             manifest: &Manifest,
-             baselines: &mut std::collections::BTreeMap<_, _>| {
-                if let Some(p2) = &manifest.p2 {
-                    baselines.insert(domain.to_string(), p2.baseline.clone());
-                }
-            };
+        let mut baselines = BTreeMap::new();
+        let mut record = |domain: &str, manifest: &Manifest, baselines: &mut BTreeMap<_, _>| {
+            if let Some(p2) = &manifest.p2 {
+                baselines.insert(domain.to_owned(), p2.baseline.clone());
+            }
+            compared += 1;
+        };
 
         // Performance gate.
-        match load_domain(&results_root, &campaign_root, c_name, "perf")? {
-            Some((p2_dir, p1_dir, manifest)) => {
-                info!("compare perf: {} vs {}", p1_dir.display(), p2_dir.display());
-                perf::compare_perf(&p1_dir, &p2_dir, &manifest, opts, &compare_dir)?;
-                record("perf", &manifest, &mut baselines);
-                compared += 1;
-            }
-            None => info!("perf comparison: missing perf data; skipping"),
+        if let Some((p2_dir, p1_dir, manifest)) =
+            load_domain(&results_root, &campaign_root, c_name, "perf")?
+        {
+            info!("compare perf: {} vs {}", p1_dir.display(), p2_dir.display());
+            perf::compare_perf(&p1_dir, &p2_dir, &manifest, opts, &compare_dir)?;
+            record("perf", &manifest, &mut baselines);
+        } else {
+            info!("perf comparison: missing perf data; skipping");
         }
 
         // Fuzzing gate.
-        match load_domain(&results_root, &campaign_root, c_name, "fuzz")? {
-            Some((p2_dir, p1_dir, manifest)) => {
-                info!("compare fuzz: {} vs {}", p1_dir.display(), p2_dir.display());
-                fuzz::compare_fuzz(
-                    &p1_dir,
-                    &p2_dir,
-                    &manifest,
-                    opts,
-                    &compare_dir,
-                    c_name,
-                    rs_name,
-                )?;
-                record("fuzz", &manifest, &mut baselines);
-                compared += 1;
-            }
-            None => info!("fuzz comparison: missing fuzz data; skipping"),
+        if let Some((p2_dir, p1_dir, manifest)) =
+            load_domain(&results_root, &campaign_root, c_name, "fuzz")?
+        {
+            info!("compare fuzz: {} vs {}", p1_dir.display(), p2_dir.display());
+            fuzz::compare_fuzz(
+                &p1_dir,
+                &p2_dir,
+                &manifest,
+                opts,
+                &compare_dir,
+                c_name,
+                rs_name,
+            )?;
+            record("fuzz", &manifest, &mut baselines);
+        } else {
+            info!("fuzz comparison: missing fuzz data; skipping");
         }
 
         // Safety gate over the static analysis outputs.
-        match load_domain(&results_root, &campaign_root, c_name, "static")? {
-            Some((p2_dir, p1_dir, manifest)) => {
-                info!(
-                    "compare safety: {} vs {}",
-                    p1_dir.display(),
-                    p2_dir.display()
-                );
-                safety::compare_safety(&p1_dir, &p2_dir, opts, &compare_dir)?;
-                record("static", &manifest, &mut baselines);
-                compared += 1;
-            }
-            None => info!("safety comparison: missing static data; skipping"),
+        if let Some((p2_dir, p1_dir, manifest)) =
+            load_domain(&results_root, &campaign_root, c_name, "static")?
+        {
+            info!(
+                "compare safety: {} vs {}",
+                p1_dir.display(),
+                p2_dir.display()
+            );
+            safety::compare_safety(&p1_dir, &p2_dir, opts, &compare_dir)?;
+            record("static", &manifest, &mut baselines);
+        } else {
+            info!("safety comparison: missing static data; skipping");
         }
 
         // Fold whatever landed into the overall verdict.
@@ -125,11 +111,11 @@ pub(crate) fn drive(opts: &Opts, _logs: &Path) -> Result<(), Box<dyn std::error:
             &baselines,
             c_name,
             rs_name,
-            screening,
+            screening.as_ref(),
         )?;
     }
     if compared == 0 {
-        return Err("no domains available for comparison".into());
+        bail!("no domains available for comparison");
     }
     Ok(())
 }
@@ -142,47 +128,43 @@ fn load_domain(
     campaign_root: &Path,
     c_name: &str,
     domain: &str,
-) -> Result<Option<(std::path::PathBuf, std::path::PathBuf, Manifest)>, Box<dyn std::error::Error>>
-{
+) -> anyhow::Result<Option<(PathBuf, PathBuf, Manifest)>> {
     let p2_dir = campaign_root.join(domain);
     let Some(manifest) = Manifest::load(&p2_dir)? else {
         return Ok(None);
     };
     if !manifest.complete {
-        return Err(format!(
+        bail!(
             "{} is incomplete; re-run the {domain} phase",
             p2_dir.display()
-        )
-        .into());
+        );
     }
     let Some(p2) = &manifest.p2 else {
-        return Err(format!("{} has no campaign record", p2_dir.display()).into());
+        bail!("{} has no campaign record", p2_dir.display());
     };
     let p1_dir = results::p1_dir(results_root, c_name, domain, &p2.baseline);
     let Some(baseline) = Manifest::load(&p1_dir)? else {
-        return Err(format!(
+        bail!(
             "baseline {} missing for {} — re-run the {domain} phase",
             p1_dir.display(),
             p2_dir.display()
-        )
-        .into());
+        );
     };
     if !baseline.complete {
-        return Err(format!("baseline {} is incomplete", p1_dir.display()).into());
+        bail!("baseline {} is incomplete", p1_dir.display());
     }
     // Same-substrate guard: the identity carries host+accel exactly
     // so cross-machine or KVM-vs-TCG data can never be pooled.
     if baseline.identity.host != manifest.identity.host
         || baseline.identity.accel != manifest.identity.accel
     {
-        return Err(format!(
+        bail!(
             "baseline and campaign ran on different substrates ({}/{:?} vs {}/{:?})",
             baseline.identity.host,
             baseline.identity.accel,
             manifest.identity.host,
             manifest.identity.accel
-        )
-        .into());
+        );
     }
     Ok(Some((p2_dir, p1_dir, manifest)))
 }
