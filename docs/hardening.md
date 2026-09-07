@@ -31,34 +31,27 @@ held — eight racing sweeps produced exactly one removal and seven clean
 reads, and a sweep run mid-build correctly kept the running build's
 scratch.
 
-### What the two fronts each reach
+### What it reaches
 
-Unit tests alone cover 63% of regions; the pipeline run alone covers
-70%, and they cover different halves of the program. The pipeline is
-what makes the shell-out layer visible at all:
+**75% of regions, 79% of lines**, from a single instrumented binary driven
+through the unit tests, three complete pipeline runs (linux 6.19 under gcc and
+clang, linux 7.2 under clang), guest boots, and the whole command surface.
 
-| module                         | unit tests | pipeline run |
-| ------------------------------ | ---------- | ------------ |
-| `virt/initramfs.rs`            | 0%         | 84%          |
-| `virt/build.rs`                | 0%         | 89%          |
-| `virt/runner.rs`               | 22%        | 80%          |
-| `block/fio.rs`                 | 0%         | 93%          |
-| `block/static_analysis/mod.rs` | 0%         | 85%          |
-| `block/compare/mod.rs`         | 0%         | 74%          |
-| `fuzz/build.rs`                | 0%         | 73%          |
-| `clean.rs`                     | 15%        | 79%          |
+Getting one honest number took three attempts, and the failures are worth
+recording because they are easy to repeat. Measuring the two fronts separately
+(unit tests 63%, pipeline 70%) and reporting both is not the same claim, and the
+merge that would have combined them OOM-killed the host three times. Two
+mistakes of mine: the accumulated `.profraw` came from a binary the source had
+since moved past, so the profiles no longer matched the coverage map; and the
+memory guard was `ulimit -v`, which is _per process_, so `-j4` let four
+instrumented rustc processes each sit under the cap and still exhaust 30 GB
+together. A `systemd-run --user --scope -p MemoryMax=14G` cgroup around the
+whole job is the guard that actually holds.
 
-What neither reaches, and why: `metal.rs` (5%) needs a second physical
-machine to kexec; `kernel/build.rs` (14%) skips its body once a build
-is fingerprint-cached, so only a cold host exercises it.
-
-The two figures are reported separately on purpose. Merging them into one
-number needs an instrumented rebuild alongside the accumulated profiles,
-and that combination OOM-killed a 30 GB host twice -- taking the tmux
-server with it both times. Treat `.#coverage` as a shell that wants
-memory headroom, and take the two fronts' numbers as the useful pair:
-they measure different halves of the program, and the union would hide
-that.
+The pipeline is what makes the shell-out layer visible at all -- unit tests
+alone leave `virt/`, `kernel/`, `block/setup.rs` and `block/fio.rs` at zero.
+What still is not reached: `metal.rs` needs a second physical machine to kexec
+into.
 
 ## Confirmed and fixed
 
@@ -77,6 +70,7 @@ Each has a commit and a regression test.
 | 9   | `--toolchain llvm` produced the right make line but no kernel                       | high       |
 | 10  | `linux-meta` pulled 3.8 GB because the mirror ignores the clone filter              | medium     |
 | 11  | Screening's bottom surface band ignored the unsafe-operation census                 | low-medium |
+| 12  | Host tools linked against openssl got no RPATH under `LLVM=1`                       | medium     |
 
 Number 2 is the one that mattered most. `make olddefconfig` drops a
 symbol whose dependencies stopped holding, says nothing, and exits 0:
@@ -162,24 +156,64 @@ failure the toolchain selection exists to prevent.
   source has a mirror or fallback. Moving `linux-meta` to a mirror that honours
   the clone filter fixed the size problem, not this one.
 
-## Backlog
+## Portability
 
 ### Linux 7.2
 
-Point `[sources.linux]` and `[sources.linux-meta]` at 7.2 and change
-nothing else. The question is whether the instrument is version-portable
-or quietly pinned to 6.19:
+Pointing a fresh project at 7.2 and changing nothing else was the portability
+test, and the tree passed the parts that matter to the registry: `null_blk/` and
+`rnull/` are still where the registry says, both declared abstraction paths
+(`rust/kernel/block.rs`, `rust/kernel/block/`) still exist, and the static
+analysis ran unchanged -- 119 functions and 1,068 implicit unsafe operations for
+null_blk against 53 functions and 54 unsafe sites for rnull.
 
-- does `assets/linux/config` still apply across the gap, or does
-  olddefconfig drop symbols the run needs (now an error, not a silence)?
-- does the fuzz fragment survive — `CONFIG_KCOV_IRQ_AREA_SIZE` and the
-  fault-injection symbols are the fragile ones;
-- is `drivers/block/rnull/` still where the registry expects, and is the
-  module still `rnull_mod.ko`?
-- do the AST metrics and commit-mining rules still match a moved tree?
+The kernel build did not pass, and the reason is a real upstream change:
 
-A methodology claiming to apply across driver classes should survive one
-kernel bump; if it does not, that belongs in the limitations.
+```
+7.2:   depends on !KASAN || CC_IS_CLANG      <- new in 7.2
+6.19:  depends on !KASAN_SW_TAGS
+```
+
+`CONFIG_RUST` in 7.2 refuses to coexist with KASAN unless the compiler is clang.
+koxi's fuzz flavor sets `CONFIG_KASAN=y`, so under the default gnu toolchain the
+7.2 fuzz kernel silently loses Rust support -- **on 7.2, a Rust driver can only
+be fuzzed from a clang-built kernel.** The clean flavor is unaffected and built
+`rnull_mod.ko` normally.
+
+Two things fell out of this. The first is that the config assertion earned its
+place on a tree it was not written against: it stopped the run at configure
+time, named the symbol, and pointed at the toolchain, instead of building two
+kernels and failing later with a missing module. The second is that the
+toolchain selection is not a convenience -- on 7.2 it is the only way to fuzz
+the Rust side at all, which is why that project's `koxi.toml` carries
+`toolchain = "llvm"`.
+
+Switching that project to the llvm toolchain exposed a second, unrelated
+blocker: `certs/extract-cert` links against openssl and records no RPATH,
+because under `LLVM=1` kbuild links host programs with `clang -fuse-ld=lld` and
+that bypasses the nix `ld` wrapper which would otherwise add one. It links
+clean and dies at runtime with `libcrypto.so.3: cannot open shared object
+file`. 6.19 never hit it: its settled config does not build
+`certs/x509_certificate_list`. Fixed by giving host links an explicit rpath.
+
+With both addressed, **7.2 runs end to end** -- setup, static, perf, fuzzing,
+screening, all three gates, verdict:
+
+| gate        | 7.2 result                                                   |
+| ----------- | ------------------------------------------------------------ |
+| fuzzing     | pass (zero events both sides, reported as an exposure bound) |
+| safety      | pass (elimination rate 40.0% against a 34.2% threshold)      |
+| performance | fail                                                         |
+| overall     | fail -- "safety and fuzzing pass but performance regresses"  |
+
+**These are not publishable numbers.** The run used the `--quick` profile (one
+workload, three reps, five-second fio runs) and 0.06 hours of fuzzing per side,
+against a clang-built kernel. It demonstrates that the instrument produces a
+complete, well-formed verdict on a kernel it was not built against; it says
+nothing about how rnull performs on 7.2, and the -58.77% median delta should not
+be quoted.
+
+## Backlog
 
 ### A clang-built comparison
 

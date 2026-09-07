@@ -161,6 +161,14 @@
             # host tools do want the wrapper, and LLVM=1 takes that
             # from PATH.
             KOXI_LLVM_CC = "${krustPkgs.llvmPackages.clang-unwrapped}/bin/clang";
+            # Host tools that link against openssl -- certs/extract-cert is
+            # the one that bites -- record no RPATH under LLVM=1, because
+            # kbuild links them with clang -fuse-ld=lld and that bypasses
+            # the nix ld wrapper which would otherwise add one. They link
+            # clean and then die at runtime with "libcrypto.so.3: cannot
+            # open shared object file". Harmless under the GNU chain,
+            # where the wrapper already records it.
+            HOSTLDFLAGS = "-Wl,-rpath,${pkgs.openssl.out}/lib";
           };
 
           # Dev-only helpers; never needed to build or run koxi.
