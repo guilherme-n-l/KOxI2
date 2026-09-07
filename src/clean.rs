@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::process::ExitCode;
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use tracing::info;
 
@@ -96,7 +96,19 @@ pub fn run(matches: &ArgMatches, globals: &Globals) -> anyhow::Result<ExitCode> 
 fn collect_cache(home: &std::path::Path, assume_yes: bool) -> anyhow::Result<()> {
     let project =
         Project::locate().context("--cache needs a project (its koxi.lock says what to keep)")?;
-    let lock = Lock::load(&project.root.join(LOCK_PATH))?.unwrap_or_default();
+    // An absent lock is not an empty lock. Defaulting here would make
+    // "we have no record of what this project needs" indistinguishable
+    // from "this project needs nothing", and the sweep would then
+    // propose the entire cache -- which is shared with every other
+    // project under this KOXI_HOME, and goes without a prompt under
+    // --yes.
+    let Some(lock) = Lock::load(&project.root.join(LOCK_PATH))? else {
+        bail!(
+            "{} has no {LOCK_PATH}, so there is no record of which cache entries it needs; \
+             run `koxi block setup` first (the cache is shared across projects)",
+            project.root.display()
+        );
+    };
     let referenced: BTreeSet<String> = lock
         .sources
         .iter()
