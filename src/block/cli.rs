@@ -42,7 +42,6 @@ pub fn command() -> Command {
         .subcommand(
             Command::new("test")
                 .about("Verify system deps, user config, and setup state")
-                .arg(Arg::new("suite").num_args(0..).help("Test suites to run"))
                 .arg(BuildOpts::arg("cc")),
         )
         .subcommand(
@@ -413,6 +412,10 @@ mod tests {
         assert!(
             try_parse(&["test", "--fio-reps", "3"]).is_err(),
             "block test has no fio matrix"
+        );
+        assert!(
+            try_parse(&["test", "kernel"]).is_err(),
+            "block test takes no positional: a stray word must not be swallowed"
         );
         assert!(
             try_parse(&["screen", "--smp", "8"]).is_err(),
