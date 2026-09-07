@@ -15,13 +15,24 @@ pub mod verdict;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::bail;
+use anyhow::{bail, Context};
 use tracing::{info, warn};
 
 use crate::block::cli::{CompareOpts, Scope};
 use crate::block::results::{self, Manifest};
 use crate::config::{anchored, Project};
 use verdict::Substrate;
+
+/// Everything a compare writes under `<campaign>/compare/`.
+const GATE_ARTIFACTS: [&str; 7] = [
+    "perf_stats.json",
+    "perf.csv",
+    "fuzz_stats.json",
+    "fuzz.csv",
+    "safety.json",
+    "safety.csv",
+    "verdict.json",
+];
 
 pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow::Result<()> {
     let project = Project::locate()?;
@@ -48,6 +59,16 @@ pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow
         }
         let compare_dir = campaign_root.join("compare");
         std::fs::create_dir_all(&compare_dir)?;
+        // A previous run's artifacts do not survive into this one: a
+        // compare that fails halfway must not leave last time's
+        // verdict.json looking like this time's.
+        for stale in GATE_ARTIFACTS {
+            let path = compare_dir.join(stale);
+            if path.exists() {
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("removing stale {}", path.display()))?;
+            }
+        }
         let mut baselines = BTreeMap::new();
         let mut substrate: Option<Substrate> = None;
         let mut record = |domain: &str,
@@ -73,7 +94,8 @@ pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow
             load_domain(&results_root, &campaign_root, c_name, "perf")?
         {
             info!("compare perf: {} vs {}", p1_dir.display(), p2_dir.display());
-            perf::compare_perf(&p1_dir, &p2_dir, &manifest, opts, &compare_dir)?;
+            perf::compare_perf(&p1_dir, &p2_dir, &manifest, opts, &compare_dir)
+                .with_context(|| format!("performance gate under {}", compare_dir.display()))?;
             record("perf", &manifest, &mut baselines, &mut substrate);
         } else {
             info!("perf comparison: missing perf data; skipping");
@@ -93,7 +115,8 @@ pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow
                 c_name,
                 rs_name,
                 &pair.rs.abstractions,
-            )?;
+            )
+            .with_context(|| format!("fuzzing gate under {}", compare_dir.display()))?;
             record("fuzz", &manifest, &mut baselines, &mut substrate);
         } else {
             info!("fuzz comparison: missing fuzz data; skipping");
@@ -108,7 +131,8 @@ pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow
                 p1_dir.display(),
                 p2_dir.display()
             );
-            safety::compare_safety(&p1_dir, &p2_dir, opts, &compare_dir)?;
+            safety::compare_safety(&p1_dir, &p2_dir, opts, &compare_dir)
+                .with_context(|| format!("safety gate under {}", compare_dir.display()))?;
             record("static", &manifest, &mut baselines, &mut substrate);
         } else {
             info!("safety comparison: missing static data; skipping");

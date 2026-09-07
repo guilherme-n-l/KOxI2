@@ -151,11 +151,11 @@ pub fn compare_perf(
     )?;
 
     info!(
-        "perf gate: tost {}/{} median_delta={}% worst={}% margin={}% -> {}",
+        "perf gate: tost {}/{} median_delta={} worst={} margin={}% -> {}",
         aggregate.tost_passed,
         coverage.common,
-        aggregate.median_delta,
-        aggregate.worst_delta,
+        pct(aggregate.median_delta),
+        pct(aggregate.worst_delta),
         gates.threshold,
         if aggregate.tost_gate { "PASS" } else { "FAIL" }
     );
@@ -356,8 +356,10 @@ impl Coverage {
 /// the per-workload TOSTs. Every cell must pass, and every declared
 /// cell must have been testable.
 struct Aggregate {
-    median_delta: f64,
-    worst_delta: f64,
+    /// None when no workload produced a comparable delta: "0%" would
+    /// read as parity where there was no measurement.
+    median_delta: Option<f64>,
+    worst_delta: Option<f64>,
     ci_gate: bool,
     slower: usize,
     faster: usize,
@@ -378,16 +380,12 @@ impl Aggregate {
         let mut deltas: Vec<f64> = cells.iter().map(|cell| cell.delta_pct).collect();
         deltas.sort_by(f64::total_cmp);
         let median_delta = if deltas.is_empty() {
-            0.0
+            None
         } else {
-            round(stats::descriptive(&deltas)?.median, 2)
+            Some(round(stats::descriptive(&deltas)?.median, 2))
         };
         let worst = deltas.iter().copied().fold(f64::INFINITY, f64::min);
-        let worst_delta = if worst.is_finite() {
-            round(worst, 2)
-        } else {
-            0.0
-        };
+        let worst_delta = worst.is_finite().then(|| round(worst, 2));
         let ci_gate = !cells.is_empty() && cells.iter().all(|cell| cell.ci_lo > -threshold);
         let corrected = |direction: fn(f64) -> bool| {
             cells
@@ -493,8 +491,10 @@ fn perf_stats(
             "threshold": threshold,
             "actual_median_delta_pct": median_delta,
             "detail": format!(
-                "{common} workloads, {tost_passed} pass TOST, median delta {median_delta}%, \
-                 worst case {worst_delta}%{}",
+                "{common} workloads, {tost_passed} pass TOST, median delta {}, \
+                 worst case {}{}",
+                pct(median_delta),
+                pct(worst_delta),
                 if insufficient > 0 || missing_on_one_side > 0 {
                     format!(
                         ", {insufficient} with insufficient samples, {missing_on_one_side} \
@@ -1089,8 +1089,8 @@ mod tests {
             status: "inferred",
         };
         let aggregate = Aggregate {
-            median_delta: -1.5,
-            worst_delta: -3.0,
+            median_delta: Some(-1.5),
+            worst_delta: Some(-3.0),
             ci_gate: true,
             slower: 1,
             faster: 0,
