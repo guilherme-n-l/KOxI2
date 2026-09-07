@@ -1,21 +1,33 @@
 # KOxI v2
 
-**KOxI** (Kernel Oxidation Instrument) is a methodology and harness for
-deciding whether migrating a Linux kernel driver from C to Rust is
-supported by evidence.
+**KOxI** (Kernel Oxidation Instrument) is a methodology for deciding
+whether migrating a Linux kernel driver from C to Rust is supported by
+evidence, and a harness that carries it out.
 
 KOxI is not a C-to-Rust translator and it is not an automatic
 replacement decision. It is a diagnostic funnel: given a C driver, and
 optionally a Rust counterpart, it collects comparable evidence and
 emits a recommendation a maintainer can inspect and re-derive.
 
+The methodology is not specific to any one kind of driver. The
+evidence lenses, the two phases, the gate criteria and the verdict
+semantics are the same whatever the driver does; what changes between
+driver classes is the workload that exercises the driver, the registry
+that describes how to load it, and the thresholds each gate is tested
+at. A driver class is therefore an _instantiation_ of KOxI, and this
+repository currently contains one: the block-device harness in
+[`src/block/`](src/block/README.md), whose Phase-2 pair is `null_blk`
+(C) versus `rnull` (Rust).
+
+This README covers the methodology and what is shared across classes.
+Everything needed to actually run the block harness is in
+[`src/block/README.md`](src/block/README.md).
+
 This repository is the Rust rewrite of the
 [original shell/Python harness](https://github.com/guilherme-n-l/KOxI).
 The methodology is the same; the instrument is not. `koxi` is a single
 orchestrator binary that pins and builds its own subjects, drives qemu
-guests, and computes its own statistics. The current instantiation is
-the block-device harness (`koxi block …`), with `null_blk` (C) versus
-`rnull` (Rust) as the Phase-2 pair.
+guests, and computes its own statistics.
 
 ## Core idea
 
@@ -57,52 +69,53 @@ compare` produces the three gates and an overall verdict: `pass`,
 
 ```mermaid
 flowchart TD
-    A[koxi.toml: driver registry + pinned sources] --> B[koxi block setup]
+    A[Choose a driver class] --> B[Declare its registry and pinned sources]
     B --> B1[Fetch and verify sources into the shared cache]
-    B --> B2[Build clean + fuzz kernels, initramfs, fio, syzkaller]
+    B --> B2[Build the clean and instrumented kernels, guest, and tools]
     B1 --> C[Phase 1: C driver screening]
     B2 --> C
-    C --> C1[static: tree-sitter LOC, unsafe surface, commit mining]
-    C --> C2[fuzz: syzkaller campaigns, crash attribution]
-    C1 --> D[screen: candidacy band]
+    C --> C1[Static: LOC, unsafe surface, commit-history risk]
+    C --> C2[Fuzzing: campaigns and crash attribution]
+    C1 --> D[Screening: candidacy band]
     C2 --> D
 
     D --> E{Rust counterpart registered?}
     E -- No --> F[Stop at migration candidacy]
     E -- Yes --> G[Phase 2: replacement evaluation]
-    G --> G1[static: Rust unsafe, driver vs abstraction]
-    G --> G2[fuzz: matched campaigns]
-    G --> G3[perf: matched fio matrix]
-    G1 --> H[compare: safety, fuzzing, performance gates]
+    G --> G1[Static: Rust unsafe, driver vs abstraction]
+    G --> G2[Fuzzing: matched campaigns]
+    G --> G3[Performance: the class workload, matched]
+    G1 --> H[Compare: safety, fuzzing, performance gates]
     G2 --> H
     G3 --> H
     D --> H
-    H --> I[verdict.json: pass, fail, partial, or inconclusive]
+    H --> I[Verdict: pass, fail, partial, or inconclusive]
 ```
 
-## Verdict gates
+## Verdicts
 
-Each gate writes one JSON artifact under the campaign's `compare/`
-directory. The gated quantity is stated as a hypothesis test with an
-explicit margin, so "we found no significant difference" can never be
-mistaken for evidence of equivalence.
+| Verdict        | Meaning                                                                               |
+| -------------- | ------------------------------------------------------------------------------------- |
+| `pass`         | Evidence supports replacing the C driver with the Rust driver.                        |
+| `fail`         | Evidence supports leaving the C driver in place or redirecting migration effort.      |
+| `partial`      | Some evidence is useful, but missing or mixed dimensions require maintainer judgment. |
+| `inconclusive` | The run did not produce enough decisive data for a recommendation.                    |
 
-| Gate        | Artifact          | Gated quantity                                                                                                                                               |
-| ----------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Safety      | `safety.json`     | Elimination rate: the fraction of CWE-classified fix commits whose class Rust removes at compile time, against `--safety-threshold`.                         |
-| Fuzzing     | `fuzz_stats.json` | Non-inferiority of the target-attributable crash **rate ratio** (rs/c) via the exact conditional binomial, against `--fuzz-rate-margin`.                     |
-| Performance | `perf_stats.json` | Per-workload TOST non-inferiority on the Hodges-Lehmann log-IOPS ratio, combined across workloads as an intersection-union test, against `--perf-threshold`. |
-| Overall     | `verdict.json`    | Conservative aggregation over the three, with the Phase-1 screening folded in.                                                                               |
+A gate that produced no usable evidence never counts as a pass. The
+thresholds each gate is tested at are class-specific and live with the
+instantiation.
 
-Defaults:
+## How the gates decide
 
-| Knob                           | Default |
-| ------------------------------ | ------- |
-| Safety elimination threshold   | `34.2%` |
-| Performance overhead threshold | `5%`    |
-| Fuzz rate-ratio margin         | `2`     |
-| Significance alpha             | `0.05`  |
-| Bootstrap resamples            | `10000` |
+Each gate states its criterion as a hypothesis test with an explicit
+margin, so "we found no significant difference" can never be mistaken
+for evidence of equivalence.
+
+| Gate        | Gated quantity                                                                                                                   |
+| ----------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| Safety      | The elimination rate: the fraction of CWE-classified fix commits whose class Rust removes at compile time.                       |
+| Fuzzing     | Non-inferiority of the target-attributable crash rate ratio, rust over C, via the exact conditional binomial.                    |
+| Performance | Per-workload TOST non-inferiority on the Hodges-Lehmann log-IOPS ratio, combined across workloads as an intersection-union test. |
 
 The performance gate uses the (1 − 2α) order-statistic confidence
 interval on the Hodges-Lehmann shift of log IOPS: every workload's
@@ -119,6 +132,137 @@ gates keep v1's rank statistics (Mann-Whitney U, Vargha-Delaney A12
 with a DeLong interval, Holm-Bonferroni, the bootstrap median-delta
 interval) as descriptive evidence.
 
+## The model
+
+- **`koxi.toml`** — per-project declaration, found by walking up from
+  the working directory: pinned third-party sources, the `[build]`
+  toolchain, asset overrides, and the instantiation's driver registry
+  (`[block.drivers]` today).
+- **`koxi.lock`** — machine-written resolved state: tarball sha256s,
+  git commits, asset hashes, and build fingerprints. Committed like
+  `Cargo.lock`; a build is skipped only on a fingerprint match.
+- **`assets/`** — build inputs: the kernel configs, the fuzz kconfig
+  fragment, the VM init script, and the commit classification rules.
+  Defaults are embedded in the binary, a file under `assets/<name>`
+  overrides them, and `koxi assets dump` materializes one for editing.
+- **`artifacts/`** — build outputs: `bzImage`, the registered drivers'
+  modules, and any `[build].extra-artifacts` such as the `vmlinux`
+  syzkaller needs for symbolization, each sha256-locked. Two kernel
+  flavors are built from one base config: the clean kernel for
+  perf, `vm` and `metal`, and the fuzz kernel under `fuzz/` whose
+  instrumentation set lives in a kconfig fragment merged with the
+  kernel's own `merge_config.sh` and asserted against the final
+  `.config`, so a dropped dependency fails the build instead of
+  shipping an uninstrumented fuzz kernel.
+- **`results/`** (the `--output` root) — measurement data, outside the
+  lock and the home. `p1/<c>/<domain>/<hash>/` is a content-addressed
+  baseline cache and `p2/<c>::<rs>/<campaign>/` holds named runs.
+  Every result root carries a `manifest.toml` whose `[identity]` table
+  is the hash input: the locked artifact shas, the host and
+  acceleration tag, and the workload knobs. Directories are therefore
+  self-describing, resumable, and safe to `rsync`, because a campaign
+  records its baseline by hash rather than by symlink. The comparator
+  refuses to pool results whose identities disagree on host or
+  acceleration.
+- **Guest runs** — the locked initramfs stays generic. Each run packs
+  its driver module and setup spec into a small overlay cpio
+  concatenated onto it, which works for qemu and kexec alike, boots,
+  and talks to the guest over its baked-key dropbear.
+- **`$KOXI_HOME`** (default `~/.koxi`) — shared across projects:
+  `cache/` for sources, `tmp/` for build scratch, and
+  `log/<project>/<run-id>/` for the run log and per-task subprocess
+  logs.
+
+## Commands
+
+`koxi block …` is the block instantiation and has its own
+[README](src/block/README.md). The rest of the tree is
+class-independent:
+
+| Command       | Purpose                                                                                          |
+| ------------- | ------------------------------------------------------------------------------------------------ |
+| `koxi vm`     | Boot the built kernel with a registered driver loaded and run a command or an interactive shell. |
+| `koxi metal`  | Push artifacts to a bare-metal target, kexec into the test kernel, and reset it back.            |
+| `koxi clean`  | Sweep dead build scratch; optionally collect the cache and remove the project's artifacts.       |
+| `koxi assets` | List where each build input resolves from, and materialize defaults for editing.                 |
+| `koxi nix`    | Write the runtime flake and a starter `koxi.toml` into the current directory.                    |
+
+`--verbose`, `--debug`, `--logfile`, `--nologfile` and `--yes` are
+global to every subcommand. Measurement knobs also read an environment
+variable, with the command line winning over the environment and the
+environment over the default.
+
+## Bare metal (kexec)
+
+The same two artifacts boot real hardware for perf runs. On a target
+with Secure Boot off (`mokutil --sb-state`,
+`cat /sys/kernel/security/lockdown`) and kexec-tools installed:
+
+```sh
+koxi metal boot    # push artifacts, kexec, wait for the guest dropbear
+koxi metal reset   # reboot the target back into its resident OS
+```
+
+By hand, the equivalent is:
+
+```sh
+kexec -l bzImage --initrd=initramfs.cpio.gz \
+      --append="console=tty0 koxi.net=dhcp"
+kexec -e
+```
+
+`koxi.net=` selects guest networking: `dhcp`,
+`<addr>/<prefix>,<gateway>`, or omit it for the qemu slirp defaults.
+Wired Ethernet only, since the image carries no WiFi stack. Fuzzing
+stays qemu-only by design.
+
+## Housekeeping and concurrency
+
+- **Concurrent runs** sharing `$KOXI_HOME` serialize on a cache lock:
+  a run that fetches, extracts, or collects holds it for that work
+  while the others wait with a note on the console. The lock is
+  advisory and dies with the process, so a killed run never wedges
+  the cache.
+- **Build scratch** under `tmp/` carries a liveness lock for as long
+  as its build runs. `koxi clean` sweeps only the dead ones, so it is
+  safe to run beside a build; a scratch kept after a failed build is
+  swept once that process exits.
+- **`koxi clean --cache`** collects cache entries the project's
+  `koxi.lock` does not reference, and `--artifacts` removes the
+  build outputs. Results are never touched. `--nocache` clears the
+  whole cache before a run.
+
+## Instantiating a driver class
+
+Most of the harness does not know what a block device is. Source
+acquisition and pinning, the two kernel flavors, the guest userland
+and its overlay transport, the syzkaller integration, the shared home
+and its cache, the host fitness gate and the statistical core are all
+class-independent, and live outside the instantiation:
+
+| Shared                         | What it provides                                                  |
+| ------------------------------ | ----------------------------------------------------------------- |
+| `src/config.rs`, `src/lock.rs` | The project declaration and its resolved, pinned state.           |
+| `src/fetch.rs`, `src/home.rs`  | Verified acquisition into a cache shared across projects.         |
+| `src/kernel/`                  | The kernel tree and its clean and instrumented builds.            |
+| `src/virt/`                    | Guest userland, the reproducible initramfs, and the qemu runner.  |
+| `src/fuzz/`                    | Syzkaller acquisition and build.                                  |
+| `src/host.rs`                  | Whether this machine can produce trustworthy campaign numbers.    |
+| `src/stats.rs`                 | The tests the gates are stated in, validated against scipy and R. |
+
+An instantiation supplies what is genuinely class-specific: the
+registry entries that say how to load a driver and where its source
+lives, a workload generator that exercises it (fio, for block
+devices), the crash-attribution inputs for its fuzzing, and the
+threshold each gate is calibrated at. `src/block/` is that, and its
+README documents the shape.
+
+One caveat about the current state: the phase orchestration and the
+verdict aggregation live under `src/block/` rather than beside the
+shared modules, because there has only ever been one instantiation to
+generalize from. A second class would lift them out alongside
+`src/stats.rs`, which is already class-independent.
+
 ## What changed from v1
 
 The methodology is unchanged. The instrument was rebuilt because
@@ -134,6 +278,57 @@ measuring what they claimed.
 | Commit mining paged the GitHub API against a moving `HEAD` with a floating "4 years ago" window.                                      | History comes from a locked, blobless `git-meta` mirror at a pinned rev with an absolute `[block.static].since` bound. Offline and reproducible. |
 | The unsafe-surface scan globbed one directory level, silently skipping `rust/kernel/block/mq/*.rs` — where the unsafe actually lives. | The scan recurses, and counts `unsafe impl` alongside blocks and functions.                                                                      |
 | The bootstrap confidence interval was unseeded, so the verdict was not reproducible.                                                  | Seeded from the campaign manifest; the same results directory re-derives the same verdict.                                                       |
+
+**The statistics changed, and that is the substantive change.** v1
+asked each gate whether it could detect a difference. A rank test
+that fails to reject its null does not license the conclusion the
+gate wanted to draw, which is that the Rust driver is _not worse_;
+absence of a detected difference is not evidence of equivalence,
+especially at the sample sizes a fuzzing campaign affords. Both
+Phase-2 gates were rewritten around that distinction, and their v1
+statistics were kept as descriptive evidence rather than deleted.
+
+Removed as gate criteria:
+
+- **Performance.** A Mann-Whitney U per fio workload with
+  Holm-Bonferroni correction, gated on "no workload is significantly
+  slower". A workload with few reps or high variance passes this by
+  failing to reach significance, so the gate rewarded noisy data.
+- **Fuzzing.** Mann-Whitney U plus Vargha-Delaney A12 over
+  per-campaign crash counts, gated on "no significant large-effect
+  increase". Rank tests on sparse counts have almost no power, so
+  this passed essentially by default, and nothing reported how much
+  evidence the campaigns had actually bought.
+
+Added as gate criteria:
+
+- **Performance** is now a TOST non-inferiority test per workload on
+  the Hodges-Lehmann shift of log IOPS. The lower bound of the
+  order-statistic confidence interval must clear the margin ratio, so
+  the gate passes only on evidence of equivalence, not on absence of
+  evidence. Workloads combine as an intersection-union test, which
+  controls the family-wise error rate at alpha with no multiplicity
+  correction (Berger), and a cell with too little data to bound its
+  interval fails rather than passing quietly.
+- **Fuzzing** is now a non-inferiority bound on the
+  target-attributable crash _rate ratio_. Conditioning on the total
+  event count makes the Rust share binomial with a proportion fixed
+  by the exposure split, so Clopper-Pearson bounds transform directly
+  into rate-ratio bounds. Rates, not counts, is what lets campaigns
+  of unequal length be compared at all. With zero events on both
+  sides the ratio is unbounded, so the verdict falls back to the
+  per-side exact Poisson rate bound and labels itself as such, and
+  every run reports the minimum detectable ratio at 80% power, so a
+  pass on thin evidence is legible as one.
+
+Retained, as descriptive evidence only: Mann-Whitney U,
+Holm-Bonferroni, the percentile bootstrap interval on the median
+IOPS delta, and A12, which now carries a DeLong confidence interval.
+A global Wilcoxon signed-rank over per-workload log-median IOPS was
+added alongside them to summarize whether the grid shifts as a whole.
+
+The safety gate is unchanged: the elimination rate over CWE-classified
+fix commits against its threshold.
 
 **Reproducibility.** v1 fetched unpinned sources and rebuilt
 everything every run. v2 keeps a `koxi.lock` of tarball sha256s and
@@ -170,144 +365,6 @@ branch's `--help` is the truth about what that branch consumes. Env
 var names are unchanged from v1 `block/scripts/flags`, and precedence
 is CLI over environment over default.
 
-## Quick start
-
-```sh
-# runtime shell: koxi + every tool the pipeline shells out to, pinned
-nix develop .#koxi
-
-koxi block test    # preflight: tools, toolchain sanity, headers
-koxi block setup   # fetch + verify all sources, build everything
-
-# boot the built kernel in qemu with a registry driver loaded and
-# run a command (or omit it for an interactive shell)
-koxi vm --driver rnull ls -l /dev/rnullb0
-
-# the fio benchmark matrix: C baseline (cached by content hash) then
-# the Rust pair under a named campaign; see results/*/manifest.toml
-koxi block perf --quick --campaign trial
-
-# host-side static analysis: tree-sitter LOC/unsafe metrics over the
-# pinned tree, commit mining over the locked linux-meta mirror
-koxi block static --campaign trial
-
-# gate the campaign against its recorded baselines (results are
-# rsync-safe: compare runs anywhere the results/ tree lives)
-koxi block compare --campaign trial
-```
-
-Real campaigns need an x86_64 Linux host with `/dev/kvm` and enough
-RAM for the guests; `koxi block perf` and `koxi block fuzz` refuse a
-host that has neither. Development works anywhere nix does;
-`nix develop` (the default shell) adds the rust toolchain, LSPs, and
-git hooks.
-
-## Commands
-
-| Command              | Purpose                                                                                             |
-| -------------------- | --------------------------------------------------------------------------------------------------- |
-| `koxi block setup`   | Fetch and verify every source, build both kernel flavors and the guest userland.                    |
-| `koxi block test`    | Preflight the host: tools on PATH, a compiler that produces running binaries, kernel build headers. |
-| `koxi block static`  | Phase-1 and Phase-2 static analysis: AST metrics and commit mining.                                 |
-| `koxi block fuzz`    | Syzkaller campaigns for the C baseline and the Rust driver.                                         |
-| `koxi block perf`    | The fio benchmark matrix, one boot per driver.                                                      |
-| `koxi block screen`  | Synthesize the Phase-1 candidacy band from cached baselines.                                        |
-| `koxi block compare` | The three gates plus the overall verdict for a named campaign.                                      |
-| `koxi block all`     | Every phase in order, phase-aware, under one campaign name.                                         |
-| `koxi vm`            | Boot the built kernel with a registry driver and run a command or a shell.                          |
-| `koxi metal`         | Push artifacts to a bare-metal target and kexec into the test kernel.                               |
-| `koxi assets`        | List where each build input resolves from; materialize defaults for editing.                        |
-| `koxi clean`         | Sweep dead build scratch; optionally the cache and the project's artifacts.                         |
-| `koxi nix`           | Write the runtime flake and a starter `koxi.toml`.                                                  |
-
-`--verbose`, `--debug`, `--logfile`, `--nologfile`, and `--yes` are
-global. Every measurement knob also reads an environment variable,
-keeping the names v1 used, with the command line winning over the
-environment and the environment over the default.
-
-## The model
-
-- **`koxi.toml`** — per-project declaration (found by walking up from
-  the cwd, cargo-style): third-party sources (tarball / `git` /
-  `git-meta` history mirrors, all pinned), the `[build]` toolchain
-  (`cc`, `target`), asset overrides, and the block driver registry.
-- **`koxi.lock`** — machine-written resolved state: tarball sha256s,
-  git commits, asset hashes, and build fingerprints (recipe + source
-  sha + config sha + toolchain identity). Committed like `Cargo.lock`;
-  builds are skipped only on a fingerprint match.
-- **`assets/`** — build inputs (kconfigs, the VM init script, the
-  commit classification rules). Defaults are embedded in the binary; a
-  file under `assets/<name>` overrides them, and `[assets]` in
-  `koxi.toml` can point elsewhere. `koxi assets dump` materializes
-  defaults for editing.
-- **`artifacts/`** — per-project build outputs: `bzImage` plus the
-  registry drivers' kernel modules and any `[build].extra-artifacts`
-  (e.g. `vmlinux` for syzkaller symbolization), each sha256-locked
-  under the lock's `[artifacts]` table. The kernel is built in two
-  flavors: the clean kernel (`bzImage`, modules alongside) for
-  perf/vm/metal, and the fuzz kernel under `fuzz/` (`koxi vm --fuzz`
-  boots it) whose instrumentation set — KASAN, KCOV, DWARF5, fault
-  injection — lives in the `linux/fuzz.config` fragment asset, merged
-  with the kernel's own `merge_config.sh` and asserted against the
-  final `.config` so a dropped dependency fails the build instead of
-  shipping an uninstrumented fuzz kernel. `koxi clean --artifacts`
-  removes everything here.
-- **Guest runs** — the locked initramfs stays generic; each run packs
-  its driver module and setup spec into a small overlay cpio
-  concatenated onto it (works for qemu and kexec alike), boots, and
-  talks to the guest over its baked-key dropbear.
-- **`results/`** (the `--output` root) — measurement data, outside the
-  lock and the home. v1's p1/p2 skeleton:
-  `p1/<c>/<domain>/<hash>/` is a content-addressed baseline cache and
-  `p2/<c>::<rs>/<campaign>/` holds named runs. Every result root
-  carries a `manifest.toml` whose `[identity]` table is the hash input
-  — locked artifact shas, the host and acceleration tag, and the
-  workload knobs.
-- **`$KOXI_HOME`** (default `~/.koxi`) — shared across projects:
-  `cache/` (tarballs, source trees, git mirrors), `tmp/` (build
-  scratch, kept on failure for debugging), and
-  `log/<project>/<run-id>/` (run log plus per-task subprocess logs).
-
-Builds are deterministic by construction: every build re-extracts a
-pristine tree into scratch, applies the config asset, and records its
-input fingerprint in the lock.
-
-## Bare metal (kexec)
-
-The same two artifacts boot real hardware for perf runs. On a target
-with Secure Boot off (`mokutil --sb-state`,
-`cat /sys/kernel/security/lockdown`) and kexec-tools installed:
-
-```sh
-kexec -l bzImage --initrd=initramfs.cpio.gz \
-      --append="console=tty0 koxi.net=dhcp"
-kexec -e   # warm-boots into the test kernel immediately
-```
-
-`koxi metal boot` does this over ssh and waits for the test kernel's
-dropbear; `koxi metal reset` returns the target to its resident OS.
-`koxi.net=` selects guest networking: `dhcp`,
-`<addr>/<prefix>,<gateway>`, or omit it for the qemu slirp defaults.
-Wired Ethernet only (the image carries no WiFi stack); `reboot -f` in
-the guest falls back to the resident OS via the normal bootloader.
-Fuzzing stays qemu-only by design.
-
-## Housekeeping and concurrency
-
-- **Concurrent runs** sharing `$KOXI_HOME` serialize on a cache lock:
-  a run that fetches, extracts, or collects holds it for that work
-  while the others wait with a note on the console. The lock is
-  advisory and dies with the process, so a killed run never wedges the
-  cache.
-- **Build scratch** under `tmp/` carries a liveness lock for as long
-  as its build runs. `koxi clean` sweeps only the dead ones, so it is
-  safe to run beside a build; a scratch kept after a failed build is
-  swept once that process exits.
-- **`koxi clean --cache`** collects cache entries the current
-  project's `koxi.lock` does not reference, and `--artifacts` removes
-  the project's build outputs. Results are never touched.
-  `--nocache` still clears the whole cache before a run.
-
 ## Known limitations
 
 - The cache lock is one lock for the whole cache, not per source, and
@@ -318,48 +375,59 @@ Fuzzing stays qemu-only by design.
   projects sharing `$KOXI_HOME` keep working but re-fetch what they
   lose, which is the trade a shared cache always makes.
 - Older binaries still refuse a lock whose `version` is newer than
-  they understand. That is now the designed outcome rather than a
-  parse error: tables a binary does not know are preserved through
-  load and save, so the version only rises when an existing table
-  changes shape, and `tests/fixtures/lock_shape.toml` fails the build
-  if one does without a decision.
+  they understand. That is the designed outcome rather than a parse
+  error: unknown tables are preserved through load and save, so the
+  version only rises when an existing table changes shape, and
+  `tests/fixtures/lock_shape.toml` fails the build if one does
+  without a decision.
 - Real fuzz and perf campaigns need `/dev/kvm` and enough RAM for the
-  guests. Both phases refuse a host that has neither, naming what is
-  missing; `--quick` (a smoke run) and `--allow-unfit-host` proceed
-  anyway, and the resulting numbers are not data. The nixbox used for
-  pipeline validation is such a host: fine for builds and smoke tests.
+  guests. Both phases refuse a host that has neither; `--quick` and
+  `--allow-unfit-host` proceed anyway, and the resulting numbers are
+  not data.
 
 ## Repository layout
 
 ```text
 .
-|-- README.md          This file: methodology, model, and usage
-|-- koxi.toml          Driver registry, pinned sources, toolchain
-|-- koxi.lock          Machine-written resolved state
-|-- flake.nix          Dev shell, runtime shell, package, git hooks
-|-- assets/            Embedded build inputs (kconfigs, init, rules)
-|-- templates/         `koxi nix init` output
-|-- tests/fixtures/    Golden statistics fixtures and the lock shape
+|-- README.md              General KOxI methodology overview
+|-- koxi.toml              Driver registry, pinned sources, toolchain
+|-- koxi.lock              Machine-written resolved state
+|-- flake.nix              Dev shell, runtime shell, package, git hooks
+|-- assets/                Embedded build inputs (kconfigs, init, rules)
+|-- templates/             `koxi nix init` output
+|-- tests/fixtures/        Golden statistics fixtures and the lock shape
 `-- src/
-    |-- main.rs        Subcommand tree and one error path
-    |-- cli.rs         Option groups, env layer, the `knobs!` macro
-    |-- config.rs      koxi.toml
-    |-- lock.rs        koxi.lock
-    |-- assets.rs      Build-input resolution
-    |-- fetch.rs       Pinned acquisition into the shared cache
-    |-- home.rs        $KOXI_HOME layout, cache lock, cache GC
-    |-- scratch.rs     Build scratch with liveness marking
-    |-- host.rs        Host fitness gate (KVM, memory)
-    |-- cmd.rs         Subprocess execution with teed task logs
-    |-- stats.rs       The statistical core (scipy/R parity)
-    |-- kernel/        Kernel source and build, per flavor
-    |-- virt/          Guest userland, initramfs, qemu runner
-    |-- fuzz/          Syzkaller acquisition and build
-    `-- block/         The block-device instantiation
-        |-- cli.rs     Its option groups
-        |-- perf.rs    fio matrix
-        |-- fuzz.rs    Syzkaller campaigns
-        |-- results.rs Manifest-first results tree
+    |-- main.rs            Subcommand tree and one error path
+    |-- cli.rs             Option groups, env layer, the `knobs!` macro
+    |-- config.rs          koxi.toml
+    |-- lock.rs            koxi.lock
+    |-- assets.rs          Build-input resolution
+    |-- fetch.rs           Pinned acquisition into the shared cache
+    |-- home.rs            $KOXI_HOME layout, cache lock, cache GC
+    |-- scratch.rs         Build scratch with liveness marking
+    |-- host.rs            Host fitness gate (KVM, memory)
+    |-- cmd.rs             Subprocess execution with teed task logs
+    |-- stats.rs           The statistical core (scipy/R parity)
+    |-- kernel/            Kernel source and build, per flavor
+    |-- virt/              Guest userland, initramfs, qemu runner
+    |-- fuzz/              Syzkaller acquisition and build
+    |
+    `-- block/             Block-device-driver KOxI instantiation
+        |-- README.md      Block harness usage and implementation notes
+        |-- cli.rs         Its option groups
+        |-- perf.rs        fio matrix
+        |-- fuzz.rs        Syzkaller campaigns
+        |-- results.rs     Manifest-first results tree
         |-- static_analysis/  tree-sitter metrics, commit mining
-        `-- compare/   The gates and the verdict
+        `-- compare/       The gates and the verdict
 ```
+
+## Current instantiation
+
+The active instantiation is the block-device harness, `koxi block …`.
+Its main Phase-2 pair is `null_blk` (C) versus `rnull` (Rust);
+additional C block drivers are registered.
+
+See [`src/block/README.md`](src/block/README.md) for setup, commands,
+the driver registry, the results layout, gate thresholds, bare-metal
+runs, and the harness's own limitations.
