@@ -6,14 +6,13 @@
 //! are ported verbatim from v1 so the paper's counts reproduce; bump
 //! [`super::AST_RECIPE`] when they change.
 
-use std::fmt;
 use std::fs;
 use std::path::Path;
 
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Language, Node, Parser, Query, QueryCursor};
 
-const C_FUNC: &str = r#"
+const C_FUNC: &str = r"
 [
   (function_definition
     declarator: (function_declarator
@@ -23,7 +22,7 @@ const C_FUNC: &str = r#"
       declarator: (function_declarator
         declarator: (identifier) @name))) @func
 ]
-"#;
+";
 
 const C_ALLOC: &str = r#"
 (call_expression
@@ -46,7 +45,7 @@ const C_MEMOP: &str = r#"
 const C_CAST: &str = "(cast_expression) @cast";
 const C_DEREF: &str = "(pointer_expression) @deref";
 const C_ARROW: &str = r#"(field_expression operator: "->") @arrow"#;
-const C_BRANCH: &str = r#"
+const C_BRANCH: &str = r"
 [
   (if_statement)
   (for_statement)
@@ -55,7 +54,7 @@ const C_BRANCH: &str = r#"
   (case_statement)
   (conditional_expression)
 ] @branch
-"#;
+";
 const C_COMMENT: &str = "(comment) @comment";
 
 const RS_FUNC: &str = "(function_item name: (identifier) @name) @func";
@@ -71,7 +70,7 @@ const RS_UNSAFE_FN: &str = r#"
 // abstraction layer is full of it.
 const RS_UNSAFE_IMPL: &str = r#"(impl_item "unsafe") @impl"#;
 const RS_CALL: &str = "(call_expression function: (_) @callee)";
-const RS_BRANCH: &str = r#"
+const RS_BRANCH: &str = r"
 [
   (if_expression)
   (for_expression)
@@ -79,7 +78,7 @@ const RS_BRANCH: &str = r#"
   (loop_expression)
   (match_arm)
 ] @branch
-"#;
+";
 const RS_COMMENT: &str = "[(line_comment) (block_comment)] @comment";
 
 #[derive(Debug, Clone)]
@@ -203,7 +202,7 @@ impl Analyzer {
         let root = tree.root_node();
         let file = file_name(path);
 
-        let functions = self.functions(&self.c_func, &self.c_branch, root, &source, driver, &file);
+        let functions = functions(&self.c_func, &self.c_branch, root, &source, driver, &file);
         let total_functions = functions.len();
         results.functions.extend(functions);
         results.densities.push(Density {
@@ -211,17 +210,16 @@ impl Analyzer {
             file: file.clone(),
             language: "C",
             total_functions,
-            ptr_derefs: self.count(&self.c_deref, root, &source)
-                + self.count(&self.c_arrow, root, &source),
-            alloc_calls: self.count(&self.c_alloc, root, &source),
-            free_calls: self.count(&self.c_free, root, &source),
-            memop_calls: self.count(&self.c_memop, root, &source),
-            cast_exprs: self.count(&self.c_cast, root, &source),
+            ptr_derefs: count(&self.c_deref, root, &source) + count(&self.c_arrow, root, &source),
+            alloc_calls: count(&self.c_alloc, root, &source),
+            free_calls: count(&self.c_free, root, &source),
+            memop_calls: count(&self.c_memop, root, &source),
+            cast_exprs: count(&self.c_cast, root, &source),
             ..Default::default()
         });
         results
             .loc
-            .push(self.loc(&self.c_comment, root, &source, driver, &file, "C"));
+            .push(loc(&self.c_comment, root, &source, driver, &file, "C"));
         Ok(())
     }
 
@@ -241,70 +239,27 @@ impl Analyzer {
             path.display().to_string()
         };
 
-        let functions =
-            self.functions(&self.rs_func, &self.rs_branch, root, &source, driver, &file);
+        let functions = functions(&self.rs_func, &self.rs_branch, root, &source, driver, &file);
         let total_functions = functions.len();
         results.functions.extend(functions);
 
-        let mut unsafe_blocks = 0;
-        let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(&self.rs_unsafe_block, root, source.as_slice());
-        while let Some(found) = matches.next() {
-            let Some(node) = found.captures().first().map(|capture| capture.node) else {
-                continue;
-            };
-            unsafe_blocks += 1;
-            let text = node_text(node, &source);
-            results.sites.push(UnsafeSite {
-                source: source_tag.to_owned(),
-                file: file.clone(),
-                line: node.start_position().row + 1,
-                end_line: node.end_position().row + 1,
-                node_type: "unsafe_block",
-                preview: preview(&text),
-                purpose: self.classify_unsafe(node, &source),
-            });
-        }
-
-        let mut unsafe_impls = 0;
-        let mut matches = cursor.matches(&self.rs_unsafe_impl, root, source.as_slice());
-        while let Some(found) = matches.next() {
-            let Some(node) = found.captures().first().map(|capture| capture.node) else {
-                continue;
-            };
-            unsafe_impls += 1;
-            let text = node_text(node, &source);
-            results.sites.push(UnsafeSite {
-                source: source_tag.to_owned(),
-                file: file.clone(),
-                line: node.start_position().row + 1,
-                end_line: node.end_position().row + 1,
-                node_type: "unsafe_impl",
-                preview: preview(text.lines().next().unwrap_or_default()),
-                purpose: self.classify_unsafe(node, &source),
-            });
-        }
-
-        let mut unsafe_fns = 0;
-        let mut matches = cursor.matches(&self.rs_unsafe_fn, root, source.as_slice());
-        while let Some(found) = matches.next() {
-            let Some(func) = capture(&self.rs_unsafe_fn, found, "func") else {
-                continue;
-            };
-            let Some(name) = capture(&self.rs_unsafe_fn, found, "name") else {
-                continue;
-            };
-            unsafe_fns += 1;
-            results.sites.push(UnsafeSite {
-                source: source_tag.to_owned(),
-                file: file.clone(),
-                line: func.start_position().row + 1,
-                end_line: func.end_position().row + 1,
-                node_type: "unsafe_fn",
-                preview: format!("unsafe fn {}", node_text(name, &source)),
-                purpose: self.classify_unsafe(func, &source),
-            });
-        }
+        // Blocks, `unsafe impl`s and unsafe fns are the same record
+        // three times over; only the node and its preview differ.
+        let scan = Scan {
+            root,
+            source: &source,
+            tag: source_tag,
+            file: &file,
+        };
+        let mut collect = |query: &Query, shape: Shape| {
+            let sites = self.unsafe_sites(query, shape, &scan);
+            let found = sites.len();
+            results.sites.extend(sites);
+            found
+        };
+        let unsafe_blocks = collect(&self.rs_unsafe_block, Shape::Block);
+        let unsafe_impls = collect(&self.rs_unsafe_impl, Shape::Impl);
+        let unsafe_fns = collect(&self.rs_unsafe_fn, Shape::Fn);
 
         results.densities.push(Density {
             driver: driver.to_owned(),
@@ -318,53 +273,49 @@ impl Analyzer {
         });
         results
             .loc
-            .push(self.loc(&self.rs_comment, root, &source, driver, &file, "Rust"));
+            .push(loc(&self.rs_comment, root, &source, driver, &file, "Rust"));
         Ok(())
     }
 
-    fn functions(
-        &self,
-        func_query: &Query,
-        branch_query: &Query,
-        root: Node,
-        source: &[u8],
-        driver: &str,
-        file: &str,
-    ) -> Vec<FunctionInfo> {
-        let mut functions = Vec::new();
+    /// Every match of an unsafe-surface query as a classified site.
+    fn unsafe_sites(&self, query: &Query, shape: Shape, scan: &Scan) -> Vec<UnsafeSite> {
+        let mut sites = Vec::new();
         let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(func_query, root, source);
+        let mut matches = cursor.matches(query, scan.root, scan.source);
         while let Some(found) = matches.next() {
-            let (Some(func), Some(name)) = (
-                capture(func_query, found, "func"),
-                capture(func_query, found, "name"),
-            ) else {
-                continue;
+            let node = match shape {
+                // The fn query also captures @name, so the site node
+                // must be asked for by name rather than taken first.
+                Shape::Fn => capture(query, found, "func"),
+                Shape::Block | Shape::Impl => found.captures().first().map(|capture| capture.node),
             };
-            let start_line = func.start_position().row + 1;
-            let end_line = func.end_position().row + 1;
-            functions.push(FunctionInfo {
-                driver: driver.to_owned(),
-                file: file.to_owned(),
-                name: node_text(name, source),
-                start_line,
-                end_line,
-                line_count: end_line - start_line + 1,
-                // Cyclomatic complexity: 1 (base path) + branch nodes.
-                complexity: 1 + self.count(branch_query, func, source),
+            let Some(node) = node else { continue };
+            let shown = match shape {
+                Shape::Block => preview(&node_text(node, scan.source)),
+                Shape::Impl => preview(
+                    node_text(node, scan.source)
+                        .lines()
+                        .next()
+                        .unwrap_or_default(),
+                ),
+                Shape::Fn => {
+                    let Some(name) = capture(query, found, "name") else {
+                        continue;
+                    };
+                    format!("unsafe fn {}", node_text(name, scan.source))
+                }
+            };
+            sites.push(UnsafeSite {
+                source: scan.tag.to_owned(),
+                file: scan.file.to_owned(),
+                line: node.start_position().row + 1,
+                end_line: node.end_position().row + 1,
+                node_type: shape.node_type(),
+                preview: shown,
+                purpose: self.classify_unsafe(node, scan.source),
             });
         }
-        functions
-    }
-
-    fn count(&self, query: &Query, node: Node, source: &[u8]) -> usize {
-        let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(query, node, source);
-        let mut total = 0;
-        while matches.next().is_some() {
-            total += 1;
-        }
-        total
+        sites
     }
 
     /// Classify an unsafe block/fn by purpose (v1 classify_unsafe).
@@ -409,59 +360,129 @@ impl Analyzer {
         }
         "other"
     }
+}
 
-    /// tokei-style per-line classification from the AST: a line with
-    /// any non-comment token is code; otherwise comment if its
-    /// content sits inside comment nodes; otherwise blank.
-    fn loc(
-        &self,
-        comment_query: &Query,
-        root: Node,
-        source: &[u8],
-        driver: &str,
-        file: &str,
-        language: &'static str,
-    ) -> Loc {
-        let mut comment_ranges: Vec<(usize, usize)> = Vec::new();
-        let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(comment_query, root, source);
-        while let Some(found) = matches.next() {
-            if let Some(node) = found.captures().first().map(|capture| capture.node) {
-                comment_ranges.push((node.start_byte(), node.end_byte()));
-            }
+/// One parsed file plus where its records are attributed.
+struct Scan<'a> {
+    root: Node<'a>,
+    source: &'a [u8],
+    /// "driver" | "abstraction"
+    tag: &'a str,
+    file: &'a str,
+}
+
+/// The three shapes of explicit Rust unsafe surface.
+#[derive(Debug, Clone, Copy)]
+enum Shape {
+    Block,
+    Impl,
+    Fn,
+}
+
+impl Shape {
+    fn node_type(self) -> &'static str {
+        match self {
+            Shape::Block => "unsafe_block",
+            Shape::Impl => "unsafe_impl",
+            Shape::Fn => "unsafe_fn",
         }
-        let in_comment = |offset: usize| {
-            comment_ranges
-                .iter()
-                .any(|&(lo, hi)| offset >= lo && offset < hi)
+    }
+}
+
+fn functions(
+    func_query: &Query,
+    branch_query: &Query,
+    root: Node,
+    source: &[u8],
+    driver: &str,
+    file: &str,
+) -> Vec<FunctionInfo> {
+    let mut functions = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(func_query, root, source);
+    while let Some(found) = matches.next() {
+        let (Some(func), Some(name)) = (
+            capture(func_query, found, "func"),
+            capture(func_query, found, "name"),
+        ) else {
+            continue;
         };
-
-        let (mut blank, mut comment, mut code) = (0, 0, 0);
-        let mut offset = 0;
-        for line in source.split_inclusive(|&byte| byte == b'\n') {
-            let content: Vec<usize> = line
-                .iter()
-                .enumerate()
-                .filter(|(_, byte)| !byte.is_ascii_whitespace())
-                .map(|(at, _)| offset + at)
-                .collect();
-            if content.is_empty() {
-                blank += 1;
-            } else if content.iter().all(|&at| in_comment(at)) {
-                comment += 1;
-            } else {
-                code += 1;
-            }
-            offset += line.len();
-        }
-        Loc {
+        let start_line = func.start_position().row + 1;
+        let end_line = func.end_position().row + 1;
+        functions.push(FunctionInfo {
             driver: driver.to_owned(),
             file: file.to_owned(),
-            language,
-            blank,
-            comment,
-            code,
+            name: node_text(name, source),
+            start_line,
+            end_line,
+            line_count: end_line - start_line + 1,
+            // Cyclomatic complexity: 1 (base path) + branch nodes.
+            complexity: 1 + count(branch_query, func, source),
+        });
+    }
+    functions
+}
+
+fn count(query: &Query, node: Node, source: &[u8]) -> usize {
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, node, source);
+    let mut total = 0;
+    while matches.next().is_some() {
+        total += 1;
+    }
+    total
+}
+
+/// tokei-style per-line classification from the AST: a line with
+/// any non-comment token is code; otherwise comment if its
+/// content sits inside comment nodes; otherwise blank.
+fn loc(
+    comment_query: &Query,
+    root: Node,
+    source: &[u8],
+    driver: &str,
+    file: &str,
+    language: &'static str,
+) -> Loc {
+    let mut comment_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(comment_query, root, source);
+    while let Some(found) = matches.next() {
+        if let Some(node) = found.captures().first().map(|capture| capture.node) {
+            comment_ranges.push((node.start_byte(), node.end_byte()));
         }
+    }
+    let in_comment = |offset: usize| {
+        comment_ranges
+            .iter()
+            .any(|&(lo, hi)| offset >= lo && offset < hi)
+    };
+
+    let (mut blank, mut comment, mut code) = (0, 0, 0);
+    let mut offset = 0;
+    for line in source.split_inclusive(|&byte| byte == b'\n') {
+        let content: Vec<usize> = line
+            .iter()
+            .enumerate()
+            .filter(|(_, byte)| !byte.is_ascii_whitespace())
+            .map(|(at, _)| offset + at)
+            .collect();
+        if content.is_empty() {
+            blank += 1;
+        } else if content.iter().all(|&at| in_comment(at)) {
+            comment += 1;
+        } else {
+            code += 1;
+        }
+        offset += line.len();
+    }
+    Loc {
+        driver: driver.to_owned(),
+        file: file.to_owned(),
+        language,
+        blank,
+        comment,
+        code,
     }
 }
 
@@ -503,29 +524,21 @@ fn preview(text: &str) -> String {
 }
 
 fn file_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string())
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
-    Io(String, std::io::Error),
+    #[error("reading {0}: {1}")]
+    Io(String, #[source] std::io::Error),
+    #[error("tree-sitter query: {0}")]
     Query(String),
+    #[error("tree-sitter could not parse {0}")]
     Parse(String),
 }
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Io(path, err) => write!(f, "reading {path}: {err}"),
-            Error::Query(err) => write!(f, "tree-sitter query: {err}"),
-            Error::Parse(path) => write!(f, "tree-sitter could not parse {path}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {
@@ -545,7 +558,7 @@ mod tests {
     fn c_metrics_match_the_fixture() {
         let path = write_tmp(
             "fixture.c",
-            r#"/* header comment
+            r"/* header comment
    spanning two lines */
 static int touch(struct thing *t, int n)
 {
@@ -558,7 +571,7 @@ static int touch(struct thing *t, int n)
 	kfree(p);
 	return n > 0 ? 1 : 0;
 }
-"#,
+",
         );
         let analyzer = Analyzer::new().unwrap();
         let mut results = Results::default();
@@ -591,7 +604,7 @@ static int touch(struct thing *t, int n)
     fn rust_unsafe_sites_are_found_and_classified() {
         let path = write_tmp(
             "fixture.rs",
-            r#"// driver body
+            r"// driver body
 fn safe_one(x: u32) -> u32 {
     if x > 0 { x } else { 0 }
 }
@@ -606,7 +619,7 @@ unsafe fn raw_read(p: *const u8) -> u8 {
 
 struct Wrapper(u32);
 unsafe impl Send for Wrapper {}
-"#,
+",
         );
         let analyzer = Analyzer::new().unwrap();
         let mut results = Results::default();
