@@ -86,6 +86,7 @@ fn summarize(name: &str, data: Option<&serde_json::Value>) -> serde_json::Value 
                     "p_value": metrics[metric_name]["test"]["p_value"],
                     "a12": metrics[metric_name]["effect_size"]["value"],
                     "rate_ratio_upper": data["rate_ratio"]["ratio"]["ci"]["hi"],
+                    "outcome": data["verdict"]["outcome"],
                     "gate_basis": data["verdict"]["gate_basis"],
                 },
             })

@@ -449,18 +449,24 @@ fn zero_event_sensitivity(
         "ratio": serde_json::Value::Null,
         "mde_ratio_80pct_power": serde_json::Value::Null,
     });
+    // No ratio can be bounded, so nothing has been shown either way.
+    // `pass: null` keeps the verdict honest: the aggregate reads it as
+    // undecided rather than as a pass bought with no evidence. The
+    // per-side bound is what the exposure did establish.
     let verdict = json!({
-        "pass": true,
+        "pass": serde_json::Value::Null,
+        "outcome": OUTCOME_INCONCLUSIVE,
         "gate_basis": "zero_event_sensitivity",
         "criterion": format!(
             "one-sided {:.0}% exact upper bound on the rs/c attributable crash \
-             rate ratio <= {margin}; with zero events on both sides the per-side \
-             exact Poisson rate bound stands in",
+             rate ratio <= {margin}; with zero events on both sides the ratio is \
+             unbounded, so the gate is inconclusive and reports the per-side \
+             exact Poisson rate bound instead",
             one_sided * 100.0
         ),
         "detail": format!(
-            "0 target-attributable crashes over {t_c:.2}h (C) and {t_rs:.2}h (Rust); \
-             {:.0}% per-side rate bound {:.4}/h (C), {:.4}/h (Rust)",
+            "0 target-attributable crashes over {t_c:.2}h (C) and {t_rs:.2}h (Rust): \
+             inconclusive; {:.0}% per-side rate bound {:.4}/h (C), {:.4}/h (Rust)",
             one_sided * 100.0,
             bound_c,
             bound_rs
@@ -468,6 +474,10 @@ fn zero_event_sensitivity(
     });
     (block, verdict)
 }
+
+const OUTCOME_NON_INFERIOR: &str = "non_inferior";
+const OUTCOME_INFERIOR: &str = "inferior";
+const OUTCOME_INCONCLUSIVE: &str = "inconclusive";
 
 /// Events on at least one side: conditional on the total, the rs
 /// share is binomial with p0 fixed by the exposure split, so the
@@ -525,18 +535,34 @@ fn conditional_rate_ratio(
         },
         "mde_ratio_80pct_power": mde.map(|value| round(value, 3)),
     });
+    // Three outcomes, not two. Non-inferiority is shown when the upper
+    // bound clears the margin; inferiority when the lower bound sits
+    // above 1 (the Rust rate is higher, and significantly so); and
+    // anything else is evidence of neither. Collapsing the third case
+    // into "fail" made one C crash against zero Rust crashes fail the
+    // Rust side, while zero against zero passed it.
+    let (pass, outcome) = if ratio_hi <= margin {
+        (json!(true), OUTCOME_NON_INFERIOR)
+    } else if ratio_lo > 1.0 {
+        (json!(false), OUTCOME_INFERIOR)
+    } else {
+        (serde_json::Value::Null, OUTCOME_INCONCLUSIVE)
+    };
     let verdict = json!({
-        "pass": ratio_hi <= margin,
+        "pass": pass,
+        "outcome": outcome,
         "gate_basis": "rate_ratio_ci",
         "criterion": format!(
             "one-sided {:.0}% exact upper bound on the rs/c attributable crash rate \
-             ratio <= {margin} (exact conditional binomial)",
+             ratio <= {margin} passes; lower bound > 1 fails; otherwise inconclusive \
+             (exact conditional binomial)",
             one_sided * 100.0
         ),
         "detail": format!(
             "target-attributable totals c={c_total} rs={rs_total} over \
-             {t_c:.2}h/{t_rs:.2}h; ratio upper bound {}, margin {margin}, one-sided \
-             p={p_one_sided:.4}{}",
+             {t_c:.2}h/{t_rs:.2}h; ratio bounds [{:.3}, {}], margin {margin}: {outcome}; \
+             one-sided p={p_one_sided:.4}{}",
+            ratio_lo,
             if ratio_hi.is_finite() {
                 format!("{ratio_hi:.3}")
             } else {
@@ -582,7 +608,11 @@ pub fn compare_fuzz(
     let c_total: u64 = c_campaigns.iter().map(|c| c.counts.target).sum();
     let rs_total: u64 = rs_campaigns.iter().map(|c| c.counts.target).sum();
     let (rate_ratio, verdict) = rate_ratio_gate(c_total, rs_total, t_c, t_rs, alpha, margin);
-    let passed = verdict["pass"].as_bool() == Some(true);
+    let outcome = match verdict["pass"].as_bool() {
+        Some(true) => "PASS",
+        Some(false) => "FAIL",
+        None => "INCONCLUSIVE",
+    };
 
     let result = json!({
         "methodology": "Klees et al. CCS 2018 + Schloegel et al. S&P 2024 campaign \
@@ -626,8 +656,7 @@ pub fn compare_fuzz(
     )?;
 
     info!(
-        "fuzz gate: attributable c={c_total} rs={rs_total} over {t_c:.2}h/{t_rs:.2}h -> {}",
-        if passed { "PASS" } else { "FAIL" }
+        "fuzz gate: attributable c={c_total} rs={rs_total} over {t_c:.2}h/{t_rs:.2}h -> {outcome}"
     );
     Ok(())
 }
@@ -809,14 +838,36 @@ mod tests {
         // Infrastructure signature anywhere.
         assert_eq!(classifier.classify("no output from test machine"), INFRA);
         assert_eq!(classifier.classify("unrelated splat"), UNKNOWN);
+        // A crash in the abstraction layer the Rust driver leans on,
+        // with no driver frame at all (completion from softirq
+        // context): the safety gate charges that layer to the driver,
+        // so attribution does too. Both symbol spellings.
+        let report =
+            "Call Trace:\n _RNvMNtNtNtCs5678_6kernel5block2mq7requestNtB2_7Request6end_ok+0x22\n \
+                      blk_done_softirq+0x9d\n\nModules linked in: rnull_mod\n";
+        assert_eq!(classifier.classify(report), TARGET);
+        let report = "Call Trace:\n <kernel::block::mq::request::Request>::end_ok+0x22\n\n";
+        assert_eq!(classifier.classify(report), TARGET);
+        // The driver name only in Modules linked in: still says nothing.
+        let report = "Call Trace:\n do_syscall_64+0x3d\n\nModules linked in: rnull_mod null_blk\n";
+        assert_eq!(classifier.classify(report), UNKNOWN);
+        assert_eq!(
+            abstraction_patterns(&[
+                PathBuf::from("rust/kernel/block/"),
+                PathBuf::from("drivers/x")
+            ]),
+            vec!["kernel::block".to_string(), "6kernel5block".to_string()]
+        );
     }
 
     #[test]
     fn rate_ratio_gate_bounds_and_zero_events() {
-        // Zero events on both sides: pass on sensitivity, rule of
-        // three per side (2.9957 / exposure).
+        // Zero events on both sides: nothing shown either way, so the
+        // gate is undecided and reports the rule of three per side
+        // (2.9957 / exposure) as what the exposure did establish.
         let (block, verdict) = rate_ratio_gate(0, 0, 1.5, 1.5, 0.05, 2.0);
-        assert_eq!(verdict["pass"], true);
+        assert!(verdict["pass"].is_null());
+        assert_eq!(verdict["outcome"], OUTCOME_INCONCLUSIVE);
         assert_eq!(verdict["gate_basis"], "zero_event_sensitivity");
         let bound = block["max_undetected_rate_per_hour"]["rs"]
             .as_f64()
@@ -824,13 +875,22 @@ mod tests {
         assert!((bound - 2.9957 / 1.5).abs() < 1e-3);
 
         // One crash in C, none in Rust: the ratio cannot be bounded
-        // below the margin with one event — honest FAIL with an MDE
-        // explanation.
+        // below the margin with one event, and its lower bound is 0,
+        // so nothing is shown: inconclusive, with an MDE explanation.
+        // (Calling this a fail made more evidence against C count
+        // against Rust.)
         let (block, verdict) = rate_ratio_gate(1, 0, 10.0, 10.0, 0.05, 2.0);
-        assert_eq!(verdict["pass"], false);
+        assert!(verdict["pass"].is_null());
+        assert_eq!(verdict["outcome"], OUTCOME_INCONCLUSIVE);
         assert_eq!(verdict["gate_basis"], "rate_ratio_ci");
         assert!(block["ratio"]["ci"]["hi"].as_f64().unwrap() > 2.0);
         assert!(block["mde_ratio_80pct_power"].is_null());
+
+        // Comparable counts, too few to bound: still inconclusive.
+        let (block, verdict) = rate_ratio_gate(10, 12, 10.0, 10.0, 0.05, 2.0);
+        assert!(verdict["pass"].is_null());
+        assert!(block["ratio"]["ci"]["lo"].as_f64().unwrap() < 1.0);
+        assert!(block["ratio"]["ci"]["hi"].as_f64().unwrap() > 2.0);
 
         // Plenty of events, Rust clearly not worse: bound clears the
         // margin and the gate passes.
@@ -840,9 +900,11 @@ mod tests {
         assert!(hi < 2.0 && hi > 0.5, "upper bound {hi}");
         assert!(block["mde_ratio_80pct_power"].as_f64().unwrap() > 1.0);
 
-        // Rust much worse: fails with a finite bound above margin.
-        let (_, verdict) = rate_ratio_gate(5, 50, 10.0, 10.0, 0.05, 2.0);
+        // Rust much worse: the lower bound clears 1, a real regression.
+        let (block, verdict) = rate_ratio_gate(5, 50, 10.0, 10.0, 0.05, 2.0);
         assert_eq!(verdict["pass"], false);
+        assert_eq!(verdict["outcome"], OUTCOME_INFERIOR);
+        assert!(block["ratio"]["ci"]["lo"].as_f64().unwrap() > 1.0);
     }
 
     #[test]
