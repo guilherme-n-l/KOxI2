@@ -272,6 +272,23 @@ impl FioOpts {
         } else if profile.longrun && unset(matches, "fio-reps", "FIO_REPS") {
             opts.reps = 50;
         }
+        // Rep 1 of every workload is annotated as a warmup and the
+        // comparator drops warmups, so a single rep benchmarks for as
+        // long as the matrix takes and then yields nothing to compare.
+        // Checked here rather than with a clap value_parser because
+        // the env fallback is this crate's own layer and never reaches
+        // clap's parser (see cli::opt, which does not call .env()).
+        if opts.reps < 2 {
+            return Err(Error::Invalid {
+                env: "FIO_REPS",
+                arg: "fio-reps",
+                value: opts.reps.to_string(),
+                why: "needs at least 2: rep 1 of every workload is a warmup and \
+                      warmups are excluded from the comparison, so one rep \
+                      benchmarks the whole matrix and compares nothing"
+                    .to_owned(),
+            });
+        }
         Ok(opts)
     }
 }
@@ -446,6 +463,26 @@ mod tests {
 
             assert_eq!(fuzz(&["fuzz", "--longrun"]).hours, 24.0);
             assert_eq!(fio(&["perf", "--longrun"]).reps, 50);
+        });
+    }
+
+    /// Rep 1 of every workload is annotated as a warmup and the
+    /// comparator drops warmups, so a single rep runs the whole matrix
+    /// and leaves nothing to compare. Rejected up front rather than
+    /// discovered after the benchmark.
+    #[test]
+    fn one_fio_rep_is_all_warmup_and_is_refused() {
+        let one_rep = |args: &[&str]| {
+            let matches = parse(args);
+            let profile = Profile::from_matches(&matches).expect("profile");
+            FioOpts::with_profile(&matches, profile)
+        };
+        assert!(one_rep(&["perf", "--fio-reps", "1"]).is_err());
+        assert!(one_rep(&["perf", "--fio-reps", "2"]).is_ok());
+        // The env fallback is this crate's own layer, so it has to be
+        // caught by the same check rather than by clap.
+        with_env(&[("FIO_REPS", "1")], || {
+            assert!(one_rep(&["perf"]).is_err(), "env path is guarded too");
         });
     }
 
