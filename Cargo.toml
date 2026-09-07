@@ -4,16 +4,38 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = "1"
 clap = { version = "4.6.6", features = ["env"] }
+csv = "1"
 regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.145"
+sha2 = "0.10"
 statrs = "0.19.1"
 streaming-iterator = "0.1.9"
 tempfile = "3.27.0"
+thiserror = "2"
 toml = "1.1.5"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 tree-sitter = "0.27.0"
 tree-sitter-c = "0.24.2"
 tree-sitter-rust = "0.24.2"
+
+# Clippy policy: pedantic on, with the lints that fight this codebase's
+# nature switched off (numeric casts on counts, exact float checks
+# against golden fixtures, backtick policing of prose, doc sections
+# for a binary crate). Function length is capped by clippy.toml.
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+doc_markdown = "allow"
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+float_cmp = "allow"
+struct_excessive_bools = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
