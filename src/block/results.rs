@@ -14,6 +14,7 @@
 //! separate .done marker. Results are project data under the
 //! `--output` root — they belong to neither the lock nor $KOXI_HOME.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -40,6 +41,14 @@ pub struct Manifest {
     pub identity: Identity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub p2: Option<Campaign>,
+    /// What the guest actually presented (perf domain): the block
+    /// queue limits and the driver's configfs attributes, read after
+    /// the device appeared. Recorded rather than identity-bearing, so
+    /// the comparator can say the two sides differ instead of
+    /// silently pooling a 64-deep softirq device with a 256-deep
+    /// inline one.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub device: BTreeMap<String, String>,
 }
 
 /// Everything that makes two measurement sets comparable. Any change
@@ -304,6 +313,7 @@ mod tests {
             created: 1,
             seed: 42,
             koxi: "test".to_owned(),
+            device: std::collections::BTreeMap::new(),
             identity: identity(),
             p2: Some(Campaign {
                 campaign: "trial".to_owned(),

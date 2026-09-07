@@ -7,6 +7,7 @@
 //! concurrent runs measure contention, not the driver (Mytkowicz et
 //! al., ASPLOS 2009).
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -169,6 +170,7 @@ fn measure_pair(ctx: &MatrixCtx, ids: &Ids, plan: &Plan, pair: &DriverPair) -> a
         created: plan.now,
         seed: plan.seed,
         koxi: env!("CARGO_PKG_VERSION").to_owned(),
+        device: std::collections::BTreeMap::new(),
         identity,
         p2,
     };
@@ -304,6 +306,20 @@ fn run_matrix(
     if !check.status.success() {
         bail!("driver {name} setup ran but {device} is absent");
     }
+    let geometry = device_geometry(&vm, driver);
+    if manifest.device.is_empty() {
+        manifest.device = geometry;
+        manifest.save(outdir)?;
+    } else if manifest.device != geometry {
+        bail!(
+            "{name}: the device came up with a different geometry than the reps already \
+             in {} were measured on ({:?} now, {:?} recorded); a resumed matrix must be one \
+             measurement",
+            outdir.display(),
+            geometry,
+            manifest.device
+        );
+    }
 
     let mut failures = 0u32;
     for (index, workload) in order.iter().enumerate() {
@@ -392,6 +408,41 @@ impl Workload {
             rw = runner::shell_quote(&self.rw),
             size = runner::shell_quote(&self.size),
         )
+    }
+}
+
+/// What the guest actually presents for the device under test: the
+/// block queue limits and, when the driver is configured through
+/// configfs, the attributes that shape its data path. The registry
+/// asks for a configuration; this records what it got, so two sides
+/// measured on different geometries are visibly different.
+fn device_geometry(vm: &Vm, driver: &Driver) -> BTreeMap<String, String> {
+    let device = driver.device.display().to_string();
+    let queue = format!(
+        "dev=$(basename $(readlink -f {device})); \
+         for f in logical_block_size max_sectors_kb max_hw_sectors_kb nr_requests scheduler \
+         rotational; do [ -r /sys/block/$dev/queue/$f ] && \
+         printf 'queue.%s=%s\\n' $f \"$(cat /sys/block/$dev/queue/$f)\"; done; \
+         [ -r /sys/block/$dev/size ] && printf 'size_sectors=%s\\n' \"$(cat /sys/block/$dev/size)\";"
+    );
+    let configfs = driver.configfs.as_ref().map(|configfs| {
+        format!(
+            " for f in blocksize size irqmode hw_queue_depth submit_queues queue_mode \
+             memory_backed rotational; do [ -r /sys/kernel/config/{configfs}/$f ] && \
+             printf 'configfs.%s=%s\\n' $f \"$(cat /sys/kernel/config/{configfs}/$f)\"; done;"
+        )
+    });
+    let script = queue + configfs.as_deref().unwrap_or("");
+    match vm.exec(&script) {
+        Ok(output) => String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(key, value)| (key.trim().to_owned(), value.trim().to_owned()))
+            .collect(),
+        Err(err) => {
+            warn!("could not read the device geometry for {device}: {err}");
+            BTreeMap::new()
+        }
     }
 }
 

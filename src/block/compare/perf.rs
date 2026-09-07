@@ -123,6 +123,7 @@ pub fn compare_perf(
     }
     holm_annotate(&mut outcomes, gates.alpha);
 
+    let geometry = device_geometry_report(p1_dir, manifest)?;
     let coverage = Coverage::measure(
         &c_workloads,
         &rs_workloads,
@@ -132,7 +133,13 @@ pub fn compare_perf(
         &rs_stats,
     );
     let aggregate = Aggregate::fold(&outcomes, &coverage, gates.threshold)?;
-    let result = perf_stats(&outcomes, &coverage, &aggregate, &gates);
+    let mut result = perf_stats(&outcomes, &coverage, &aggregate, &gates);
+    // Two devices on different geometries measure configuration as
+    // much as implementation: never better than inferred.
+    if geometry["matched"].as_bool() == Some(false) {
+        result["data_quality"]["status"] = json!("inferred");
+    }
+    result["data_quality"]["device_geometry"] = geometry;
 
     fs::write(
         outdir.join("perf_stats.json"),
@@ -240,6 +247,58 @@ fn holm_annotate(outcomes: &mut [WorkloadOutcome], alpha: f64) {
 /// block). The two zero-counts matter beyond reporting: a cell that
 /// never produced comparable evidence is an untested cell, and the
 /// IUT cannot claim equivalence for it.
+/// Whether the C and Rust devices presented the same geometry. Older
+/// roots recorded none, which is reported as unrecorded rather than
+/// as matched.
+fn device_geometry_report(
+    p1_dir: &Path,
+    rs_manifest: &Manifest,
+) -> anyhow::Result<serde_json::Value> {
+    let c = Manifest::load(p1_dir)?
+        .map(|manifest| manifest.device)
+        .unwrap_or_default();
+    let rs = &rs_manifest.device;
+    let recorded = !c.is_empty() && !rs.is_empty();
+    // Only an attribute both devices expose can disagree. null_blk has
+    // configfs knobs (queue depth, submit queues, memory backing) that
+    // rnull does not, and their absence on one side is not a mismatch
+    // of the same thing; it is listed, not counted.
+    let differing: Vec<&String> = c
+        .iter()
+        .filter(|(key, value)| rs.get(*key).is_some_and(|other| other != *value))
+        .map(|(key, _)| key)
+        .collect();
+    let one_sided: Vec<&String> = c
+        .keys()
+        .filter(|key| !rs.contains_key(*key))
+        .chain(rs.keys().filter(|key| !c.contains_key(*key)))
+        .collect();
+    if recorded && !differing.is_empty() {
+        warn!(
+            "the C and Rust devices differ in geometry ({}); the performance comparison \
+             is confounded by device configuration",
+            differing
+                .iter()
+                .map(|key| format!("{key}: {:?} vs {:?}", c[*key], rs[*key]))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(json!({
+        "recorded": recorded,
+        "matched": if recorded { json!(differing.is_empty()) } else { serde_json::Value::Null },
+        "differing": differing,
+        "one_sided": one_sided,
+        "c": c,
+        "rs": rs,
+    }))
+}
+
+/// A percentage delta for prose, or "n/a" where none was measured.
+fn pct(value: Option<f64>) -> String {
+    value.map_or_else(|| "n/a".to_owned(), |value| format!("{value}%"))
+}
+
 struct Coverage {
     common: usize,
     declared: usize,
@@ -769,12 +828,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn geometry_disagrees_only_on_attributes_both_devices_expose() {
+        let dir = std::env::temp_dir().join(format!("koxi-geom-{}", std::process::id()));
+        let p1 = dir.join("p1");
+        fs::create_dir_all(&p1).unwrap();
+        let mut c = manifest();
+        c.device = [
+            ("queue.nr_requests", "256"),
+            ("configfs.hw_queue_depth", "256"),
+            ("queue.scheduler", "[none] mq-deadline"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        c.save(&p1).unwrap();
+        let mut rs = manifest();
+        rs.device = [
+            ("queue.nr_requests", "256"),
+            ("queue.scheduler", "[none] mq-deadline"),
+            ("configfs.rotational", "0"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        let report = device_geometry_report(&p1, &rs).unwrap();
+        assert_eq!(report["matched"], true, "{report}");
+        assert_eq!(report["differing"].as_array().unwrap().len(), 0);
+        assert_eq!(report["one_sided"].as_array().unwrap().len(), 2);
+
+        rs.device
+            .insert("queue.nr_requests".to_owned(), "64".to_owned());
+        let report = device_geometry_report(&p1, &rs).unwrap();
+        assert_eq!(report["matched"], false);
+        assert_eq!(report["differing"][0], "queue.nr_requests");
+
+        // Nothing recorded on one side: unknown, not matched.
+        rs.device.clear();
+        assert!(device_geometry_report(&p1, &rs).unwrap()["matched"].is_null());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     fn manifest() -> Manifest {
         Manifest {
             complete: true,
             created: 0,
             seed: 42,
             koxi: "test".to_owned(),
+            device: std::collections::BTreeMap::new(),
             identity: Identity {
                 domain: "perf".to_owned(),
                 driver: "null_blk".to_owned(),

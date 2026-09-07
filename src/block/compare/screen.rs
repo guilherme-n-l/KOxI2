@@ -345,6 +345,7 @@ mod tests {
             created,
             seed: 1,
             koxi: "test".to_owned(),
+            device: std::collections::BTreeMap::new(),
             identity: Identity {
                 domain: "static".to_owned(),
                 driver: "null_blk".to_owned(),

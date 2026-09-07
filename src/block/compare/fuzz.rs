@@ -910,6 +910,7 @@ mod tests {
             created: 0,
             seed: 42,
             koxi: "test".to_owned(),
+            device: std::collections::BTreeMap::new(),
             identity: Identity {
                 domain: "fuzz".to_owned(),
                 driver: "null_blk".to_owned(),

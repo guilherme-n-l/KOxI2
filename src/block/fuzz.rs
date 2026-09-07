@@ -207,6 +207,7 @@ fn fuzz_subject(
         created: plan.now,
         seed: plan.now,
         koxi: env!("CARGO_PKG_VERSION").to_owned(),
+        device: std::collections::BTreeMap::new(),
         identity,
         p2,
     };
