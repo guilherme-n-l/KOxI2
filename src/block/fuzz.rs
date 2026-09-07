@@ -20,7 +20,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail};
+use anyhow::{anyhow, bail, Context};
 use tracing::{info, warn};
 
 use crate::assets;
@@ -173,7 +173,9 @@ impl Ids<'_> {
             artifacts: Some(ArtifactShas {
                 kernel: self.kernel_sha.clone(),
                 initrd: self.initrd_sha.clone(),
-                module: util::sha256_file(&self.fuzz_dir.join(&driver.ko))?,
+                module: util::sha256_file(&self.fuzz_dir.join(&driver.ko)).with_context(|| {
+                    format!("hashing {}", self.fuzz_dir.join(&driver.ko).display())
+                })?,
                 kconfig: self.kconfig_sha.clone(),
                 syzkaller: Some(self.syz_sha.clone()),
                 syz_template: Some(base.sha256.clone()),
@@ -216,6 +218,30 @@ fn fuzz_subject(
         identity,
         p2,
     };
+
+    // A registry entry whose module the kernel config did not build
+    // is skipped, not fatal: one unbuilt driver at the end of the
+    // registry used to fail a run after every other campaign had
+    // already been spent.
+    let unbuilt = |name: &str, driver: &Driver| {
+        let missing = !shared.fuzz_dir.join(&driver.ko).is_file();
+        if missing {
+            warn!(
+                "{name}: {} is not among the built fuzz artifacts (is its Kconfig symbol \
+                 enabled?); skipping",
+                driver.ko
+            );
+        }
+        missing
+    };
+    if unbuilt(subject.c_name, subject.c) {
+        return Ok(());
+    }
+    if let Some(pair) = subject.pair() {
+        if unbuilt(pair.rs_name, pair.rs) {
+            return Ok(());
+        }
+    }
 
     let c_cfg = base_cfg(shared, subject.c_name)?;
     let c_identity = ids.identity(subject.c_name, subject.c, &c_cfg)?;

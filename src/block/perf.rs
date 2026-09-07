@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use anyhow::{anyhow, bail};
+use anyhow::{anyhow, bail, Context};
 use tracing::{info, warn};
 
 use crate::block::cli::{FioOpts, Profile, RunOpts};
@@ -139,7 +139,9 @@ impl Ids<'_> {
             artifacts: Some(ArtifactShas {
                 kernel: self.kernel_sha.clone(),
                 initrd: self.initrd_sha.clone(),
-                module: util::sha256_file(&self.module_dir.join(&driver.ko))?,
+                module: util::sha256_file(&self.module_dir.join(&driver.ko)).with_context(
+                    || format!("hashing {}", self.module_dir.join(&driver.ko).display()),
+                )?,
                 kconfig: self.kconfig_sha.clone(),
                 syzkaller: None,
                 syz_template: None,
@@ -176,6 +178,16 @@ fn measure_pair(ctx: &MatrixCtx, ids: &Ids, plan: &Plan, pair: &DriverPair) -> a
         p2,
     };
 
+    for (name, driver) in [(pair.c_name, pair.c), (pair.rs_name, pair.rs)] {
+        if !ctx.module_dir.join(&driver.ko).is_file() {
+            warn!(
+                "{name}: {} is not among the built artifacts (is its Kconfig symbol enabled?); \
+                 skipping the pair",
+                driver.ko
+            );
+            return Ok(());
+        }
+    }
     let c_identity = ids.identity(pair.c_name, pair.c)?;
     let c_hash = results::identity_hash(&c_identity)?;
     let p1_dir = results::p1_dir(&plan.results_root, pair.c_name, "perf", &c_hash);
