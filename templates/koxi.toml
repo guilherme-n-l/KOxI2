@@ -1,0 +1,154 @@
+# KOxI project configuration.
+#
+# This file declares what to study and what to build it from. Resolved
+# state — exact tarball hashes and git commits — is recorded next to
+# it in koxi.lock by `koxi block setup`. Commit both, like Cargo.toml
+# and Cargo.lock: the lock is what makes a result reproducible.
+#
+# Everything below is either a working default or a commented example.
+# Start by replacing the [block.drivers] entries with the driver you
+# actually care about, then run `koxi block test` and
+# `koxi block setup`.
+
+# ---------------------------------------------------------------------
+# Toolchain
+# ---------------------------------------------------------------------
+# cc is the C compiler for the kernel build; --cc or the CC env var
+# override it for one-off runs. target uses kbuild vocabulary (only
+# x86_64 today). extra-artifacts are kernel-tree-relative files
+# harvested out of the fuzz-flavor build and sha-locked, because the
+# build scratch is deleted afterwards; vmlinux is what syzkaller needs
+# for coverage symbolization and crash decoding, so leave it in if you
+# intend to fuzz.
+[build]
+# cc = "clang"
+# target = "x86_64"
+extra-artifacts = ["vmlinux"]
+
+# ---------------------------------------------------------------------
+# Build-input overrides
+# ---------------------------------------------------------------------
+# Assets (kernel configs, the VM init script, the commit
+# classification rules) are embedded in the koxi binary. A file at
+# assets/<name> next to this config overrides one; [assets] points
+# elsewhere. Materialize a default to edit it:
+#
+#     koxi assets list
+#     koxi assets dump linux/config
+#
+# [assets]
+# "linux/config" = "my-configs/tuned.config"
+
+# ---------------------------------------------------------------------
+# Bare-metal target
+# ---------------------------------------------------------------------
+# `koxi metal boot` pushes the built kernel and initramfs to this host
+# and kexecs into them; `koxi metal reset` puts it back. The resident
+# OS needs kexec-tools and passwordless sudo for kexec, with Secure
+# Boot and lockdown off.
+#
+# [baremetal]
+# host = "user@testbox.local"
+# net = "dhcp"
+
+# ---------------------------------------------------------------------
+# Sources
+# ---------------------------------------------------------------------
+# Every third-party input, pinned. Tarballs are verified against the
+# sha256 recorded in koxi.lock on first fetch; git sources require a
+# rev (a commit or tag) that resolves to an exact commit. They are
+# cached under $KOXI_HOME and shared across projects.
+[sources.linux]
+version = "6.19"
+url = "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.19.tar.xz"
+
+# git-meta is a bare, blob-filtered history mirror used for commit
+# mining. It is never checked out or built, so it stays small.
+[sources.linux-meta]
+git-meta = "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
+rev = "v6.19"
+
+[sources.busybox]
+version = "1.36.1"
+url = "https://busybox.net/downloads/busybox-1.36.1.tar.bz2"
+
+[sources.dropbear]
+version = "2025.89"
+url = "https://matt.ucc.asn.au/dropbear/releases/dropbear-2025.89.tar.bz2"
+
+[sources.fio]
+version = "3.41"
+url = "https://git.kernel.org/pub/scm/linux/kernel/git/axboe/fio.git/snapshot/fio-3.41.tar.gz"
+
+[sources.syzkaller]
+git = "https://github.com/google/syzkaller.git"
+rev = "4f7b22a0cea479ab522e99815d78a4ad5784b1da"
+
+# ---------------------------------------------------------------------
+# Commit mining window
+# ---------------------------------------------------------------------
+# An absolute lower bound for mined history, so the window does not
+# drift with the calendar. Omit it to mine everything the pinned rev
+# reaches.
+#
+# [block.static]
+# since = "2020-01-01"
+
+# ---------------------------------------------------------------------
+# Driver registry
+# ---------------------------------------------------------------------
+# One table per driver. A C driver alone is a phase-1 subject: KOxI
+# screens it and stops at a migration-candidacy result. Give a Rust
+# driver a `pair` and phase 2 compares the two.
+#
+# Required fields, whatever the role:
+#   role     "c" or "rs"
+#   ko       the module file name the build produces
+#   ko-dir   where in the kernel tree it is built
+#   device   the device node the guest must end up with
+#   gitpath  the source path, for AST metrics and commit mining
+#
+# Optional:
+#   insmod           module parameters
+#   prep             a shell line the guest runs before the device appears
+#   configfs         configfs dir under /sys/kernel/config
+#   configfs-params  what to write into it
+#   pair             (Rust only) the C driver this replaces
+#   abstractions     (Rust only) kernel-tree paths whose unsafe surface
+#                    is counted separately, so a driver body with no
+#                    `unsafe` cannot hide unsafe one layer down
+#
+# The pair below is a working example: replace it, or add yours
+# alongside it.
+[block.drivers.null_blk]
+role = "c"
+ko = "null_blk.ko"
+ko-dir = "drivers/block/null_blk/"
+device = "/dev/nullb0"
+gitpath = "drivers/block/null_blk/"
+insmod = "nr_devices=0"
+configfs = "nullb/nullb0"
+configfs-params = "power=1"
+
+[block.drivers.rnull]
+role = "rs"
+ko = "rnull_mod.ko"
+ko-dir = "drivers/block/rnull/"
+device = "/dev/rnullb0"
+gitpath = "drivers/block/rnull/"
+configfs = "rnull/rnullb0"
+configfs-params = "power=1"
+pair = "null_blk"
+abstractions = ["rust/kernel/block.rs", "rust/kernel/block/"]
+
+# A C driver with no Rust counterpart still screens. Uncomment to see
+# `koxi block static --p1 --only loop` and `koxi block screen` work on
+# one:
+#
+# [block.drivers.loop]
+# role = "c"
+# ko = "loop.ko"
+# ko-dir = "drivers/block/"
+# device = "/dev/loop0"
+# gitpath = "drivers/block/loop.c"
+# prep = "truncate -s 2G /tmp/loop0.img && losetup /dev/loop0 /tmp/loop0.img"

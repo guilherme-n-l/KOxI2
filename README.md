@@ -132,6 +132,25 @@ gates keep v1's rank statistics (Mann-Whitney U, Vargha-Delaney A12
 with a DeLong interval, Holm-Bonferroni, the bootstrap median-delta
 interval) as descriptive evidence.
 
+## Starting a project
+
+A KOxI project is a directory holding a `koxi.toml`; the lock, the
+artifacts and the results are all generated from it.
+
+```sh
+koxi new drivers-study --nix   # make the directory and fill it
+cd drivers-study
+nix develop                    # koxi plus every tool the pipeline needs
+```
+
+`koxi init` does the same in a directory you already have. Both write
+a commented `koxi.toml` carrying the pinned sources, a worked driver
+pair to replace, and a `.gitignore` that keeps the artifacts out of
+your history and the lock in it. `--nix` adds a flake pinning this
+harness's runtime shell, which is the supported way to get the tools
+at the versions the pipeline was tested against. Neither overwrites a
+file that already exists unless you pass `--force`.
+
 ## The model
 
 - **`koxi.toml`** — per-project declaration, found by walking up from
@@ -185,7 +204,8 @@ class-independent:
 | `koxi metal`  | Push artifacts to a bare-metal target, kexec into the test kernel, and reset it back.            |
 | `koxi clean`  | Sweep dead build scratch; optionally collect the cache and remove the project's artifacts.       |
 | `koxi assets` | List where each build input resolves from, and materialize defaults for editing.                 |
-| `koxi nix`    | Write the runtime flake and a starter `koxi.toml` into the current directory.                    |
+| `koxi init`   | Write a starter `koxi.toml` into the current directory; `--nix` adds the runtime flake.          |
+| `koxi new`    | Create a project directory with the same starting files.                                         |
 
 `--verbose`, `--debug`, `--logfile`, `--nologfile` and `--yes` are
 global to every subcommand. Measurement knobs also read an environment
@@ -421,7 +441,7 @@ knowing before quoting a number.
 |-- koxi.lock              Machine-written resolved state
 |-- flake.nix              Dev shell, runtime shell, package, git hooks
 |-- assets/                Embedded build inputs (kconfigs, init, rules)
-|-- templates/             `koxi nix init` output
+|-- templates/             Starting files for `koxi init` and `koxi new`
 |-- tests/fixtures/        Golden statistics fixtures and the lock shape
 `-- src/
     |-- main.rs            Subcommand tree and one error path
@@ -434,6 +454,7 @@ knowing before quoting a number.
     |-- scratch.rs         Build scratch with liveness marking
     |-- host.rs            Host fitness gate (KVM, memory)
     |-- cmd.rs             Subprocess execution with teed task logs
+    |-- scaffold.rs        `koxi init` and `koxi new`
     |-- stats.rs           The statistical core (scipy/R parity)
     |-- kernel/            Kernel source and build, per flavor
     |-- virt/              Guest userland, initramfs, qemu runner

@@ -25,6 +25,10 @@ rewrite has not restored.
 
 ## Quick start
 
+In an existing checkout of this repository, `koxi.toml` is already
+here. For a project of your own, `koxi new <path> --nix` writes one;
+see [starting a project](../../README.md#starting-a-project).
+
 ```sh
 # runtime shell: koxi + every tool the pipeline shells out to, pinned
 nix develop .#koxi

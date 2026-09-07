@@ -12,7 +12,7 @@ mod kernel;
 mod lock;
 mod logging;
 mod metal;
-mod nix;
+mod scaffold;
 mod scratch;
 mod stats;
 mod util;
@@ -35,8 +35,9 @@ fn command() -> Command {
         .subcommand(block::cli::command())
         .subcommand(assets::command())
         .subcommand(clean::command())
+        .subcommand(scaffold::init_command())
+        .subcommand(scaffold::new_command())
         .subcommand(metal::command())
-        .subcommand(nix::command())
         .subcommand(vm::command())
 }
 
@@ -106,8 +107,9 @@ fn dispatch(
         "block" => block::run(sub, globals, logs),
         "assets" => assets::run(sub),
         "clean" => clean::run(sub, globals),
+        "init" => scaffold::init(sub),
+        "new" => scaffold::new(sub),
         "metal" => metal::run(sub, globals),
-        "nix" => nix::run(sub),
         "vm" => vm::run(sub, logs),
         other => unreachable!("unknown subcommand {other}"),
     }

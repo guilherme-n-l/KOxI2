@@ -1,0 +1,11 @@
+# Built kernel, guest userland and harvested modules. Large, and
+# reproducible from koxi.toml + koxi.lock.
+/artifacts
+# Measurement data. Keep it if you want to; it is outside the build,
+# and `koxi clean` never touches it.
+/results
+# nix build output symlink.
+/result
+
+# koxi.toml and koxi.lock belong in the repository: the lock is what
+# makes a result reproducible.
