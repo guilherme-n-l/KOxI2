@@ -136,6 +136,24 @@ fn compile(repo: &Path, logs: &Path) -> Result<(), Error> {
         .env("NIX_HARDENING_ENABLE", "")
         .arg("-j")
         .arg(jobs.to_string());
+    // syzkaller wants cgo off ("we don't need cgo and it is known to
+    // cause problems"), and its Makefile says so with
+    // `CGO_ENABLED ?= 0; export CGO_ENABLED`. But the Makefile also
+    // runs `go run tools/syz-make/make.go` while it is still being
+    // parsed, above that line, so that one invocation inherits the
+    // ambient default of 1 -- and under this dev shell's gcc it dies
+    // in "relocation target getgrgid_r not defined" before a single
+    // target is built.
+    //
+    // The link failure is the shell's, not syzkaller's: a bare
+    // `os/user` import fails the same way, the same go 1.26.7 with
+    // /usr/bin/gcc builds it fine, and inside the shell only
+    // CC=/usr/bin/gcc fixes it (no NIX_* variable does). So the
+    // nixpkgs gcc wrapper is breaking go's cgo external linking.
+    // Stating syzkaller's own default is both what it asks for and
+    // enough to keep koxi off that path; targets that genuinely need
+    // cgo (syz-agent) re-enable it themselves.
+    make.env("CGO_ENABLED", "0");
     // Static libc for the executor's -static probe, scoped to
     // this build only (globally it poisons host-tool links).
     if let Ok(dir) = std::env::var("GLIBC_STATIC_LIB") {
