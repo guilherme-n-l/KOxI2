@@ -17,6 +17,7 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::block::cli::CompareOpts;
+use crate::stats;
 use crate::util::{csv_text, round};
 
 /// ACSAC 2024 taxonomy: CWE -> what Rust does about it.
@@ -401,12 +402,33 @@ pub fn compare_safety(
         0.0
     };
     let passed = elimination_rate >= threshold / 100.0;
+    // The gate is a threshold rule on a point estimate, and the
+    // denominator is small (eleven commits, for the published pair),
+    // so the estimate travels with its exact 95% interval and its n.
+    // The rule is not changed: whether an interval that straddles the
+    // threshold should count is a calibration question, and the
+    // verdict now shows enough to ask it.
+    let (ci_lo, ci_hi) = if total_classified > 0 {
+        stats::clopper_pearson(auto_eliminated, total_classified, 0.95)
+    } else {
+        (0.0, 1.0)
+    };
+    let threshold_inside_ci = ci_lo <= threshold / 100.0 && threshold / 100.0 <= ci_hi;
 
     let commits = read_csv(&p1_static.join("commits.csv"));
-    let quality = if commits
+    // "manually_validated" means every commit in the denominator was
+    // reviewed by a person, not that one row was. A validator who
+    // agrees with the automatic CWE leaves manual_cwe empty and signs
+    // the validator column, so that column is the record of review.
+    let classified: Vec<&Row> = commits
         .iter()
-        .any(|commit| !get(commit, "manual_cwe").trim().is_empty())
-    {
+        .filter(|commit| !effective_cwe(commit).is_empty())
+        .collect();
+    let validated = classified
+        .iter()
+        .filter(|commit| !get(commit, "validator").trim().is_empty())
+        .count();
+    let quality = if !classified.is_empty() && validated == classified.len() {
         "manually_validated"
     } else {
         "inferred"
@@ -414,9 +436,19 @@ pub fn compare_safety(
 
     let comparison = json!({
         "elimination_rate": round(elimination_rate, 4),
+        "elimination_ci95": [round(ci_lo, 4), round(ci_hi, 4)],
+        "n_classified": total_classified,
+        "threshold_inside_ci": threshold_inside_ci,
         "elimination_detail": format!(
             "{auto_eliminated} of {total_classified} CWE-classified fix commits \
-             eliminated by Rust type system"
+             eliminated by Rust type system (95% CI {:.1}%-{:.1}%{})",
+            ci_lo * 100.0,
+            ci_hi * 100.0,
+            if threshold_inside_ci {
+                ", threshold inside the interval"
+            } else {
+                ""
+            }
         ),
         "abstraction_ratio": round(abstraction_ratio, 4),
         "abstraction_detail": format!(
@@ -430,15 +462,23 @@ pub fn compare_safety(
         "methodology": "ACSAC 2024 (Li et al.) super-classes over a CWE encoding of our \
                         own + Evans et al. density metrics + USENIX ATC 2024 abstraction \
                         accounting",
-        "data_quality": {"status": quality},
+        "data_quality": {
+            "status": quality,
+            "validation": {"classified": classified.len(), "validated": validated},
+        },
         "c_baseline": c_baseline.json,
         "rs_current": rs_current.json,
         "comparison": comparison,
         "verdict": {
             "pass": passed,
-            "criterion": format!("elimination_rate >= {threshold}%"),
+            "criterion": format!(
+                "elimination_rate >= {threshold}% (threshold rule on the point estimate; \
+                 the exact interval is reported, not tested)"
+            ),
             "threshold": threshold,
             "actual": round(elimination_rate, 4),
+            "n_classified": total_classified,
+            "ci95": [round(ci_lo, 4), round(ci_hi, 4)],
         },
     });
     fs::write(
@@ -448,8 +488,11 @@ pub fn compare_safety(
     fs::write(outdir.join("safety.csv"), safety_csv(&result))?;
 
     info!(
-        "safety gate: elimination_rate={:.1}% threshold={threshold}% -> {}",
+        "safety gate: elimination_rate={:.1}% (n={total_classified}, 95% CI {:.1}%-{:.1}%) \
+         threshold={threshold}% -> {}",
         elimination_rate * 100.0,
+        ci_lo * 100.0,
+        ci_hi * 100.0,
         if passed { "PASS" } else { "FAIL" }
     );
     Ok(())

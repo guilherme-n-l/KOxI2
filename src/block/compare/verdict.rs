@@ -66,6 +66,8 @@ fn summarize(name: &str, data: Option<&serde_json::Value>) -> serde_json::Value 
             "summary": data["comparison"]["elimination_detail"].as_str().unwrap_or(""),
             "key_numbers": {
                 "elimination_rate": data["comparison"]["elimination_rate"],
+                "elimination_ci95": data["comparison"]["elimination_ci95"],
+                "n_classified": data["comparison"]["n_classified"],
                 "threshold": data["verdict"]["threshold"],
             },
         }),
