@@ -111,7 +111,8 @@ The two measured gates state their criterion as a one-sided
 non-inferiority test with an explicit margin, so "we found no
 significant difference" can never be mistaken for evidence of
 equivalence. The safety gate is a threshold rule on a point estimate,
-and says so.
+and says so. [docs/statistics.md](docs/statistics.md) draws the whole
+path from raw fio JSON and crash buckets to the verdict.
 
 | Gate        | Gated quantity                                                                                                                                                                    |
 | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
