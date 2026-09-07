@@ -17,7 +17,8 @@ flowchart TD
         P5{"lo >= 0.95 ?<br>margin 5%, alpha 0.05 one-sided"}
         P6["workload passes"]
         P7["workload fails<br>(too few samples to bound = fail)"]
-        P8["Descriptive only:<br>Mann-Whitney U, Holm across workloads<br>A12 with DeLong CI<br>seeded bootstrap 95% CI on median delta, B = 10000"]
+        P8["v1 statistics, descriptive only:<br>Mann-Whitney U, Holm across workloads<br>A12 with DeLong CI<br>seeded bootstrap 95% CI on median delta, B = 10000"]
+        P8G["v1 gate, removed:<br>PASS when no workload is significantly slower<br>(p >= 0.05 after Holm read as parity)"]
         P9{"every workload passed?"}
         PP["performance PASS<br>FWER <= alpha, no correction (Berger)"]
         PF["performance FAIL"]
@@ -27,6 +28,7 @@ flowchart TD
         P1 --> P10
         P2 --> P3
         P2 --> P8
+        P8 -.-> P8G
         P3 --> P4
         P4 --> P5
         P5 -->|yes| P6
@@ -50,11 +52,13 @@ flowchart TD
         F9{"lower bound > 1 ?"}
         FP["fuzzing PASS: non-inferior"]
         FF["fuzzing FAIL: inferior"]
-        F10["Descriptive only:<br>Mann-Whitney U and A12 over per-campaign counts"]
+        F10["v1 statistics, descriptive only:<br>Mann-Whitney U and A12 over per-campaign counts"]
+        F10G["v1 gate, removed:<br>FAIL only when p < 0.05 and A12 >= 0.71<br>(zero events passed by default)"]
         F0 --> F1
         F0 --> F2
         F1 --> F3
         F1 --> F10
+        F10 -.-> F10G
         F2 --> F4
         F3 --> F4
         F4 -->|yes| F5
@@ -92,7 +96,25 @@ flowchart TD
         VI --> V3
         VX --> V3
     end
+
+    subgraph LEGEND["Legend"]
+        L1["v2: gates the verdict"]
+        L2["v1 statistics kept as descriptive evidence"]
+        L3["v1 gate rule, no longer applied"]
+    end
+
+    classDef v1kept fill:#f3efe4,stroke:#8a8980,stroke-width:1.5px,stroke-dasharray:6 4,color:#716e61
+    classDef v1gone fill:#fbe9ec,stroke:#c84053,stroke-width:1.5px,stroke-dasharray:3 4,color:#8a2a3a
+    classDef v2new fill:#e9f0e2,stroke:#6f894e,stroke-width:2px,color:#33421f
+    class P8,F10,L2 v1kept
+    class P8G,F10G,L3 v1gone
+    class P3,P4,P5,P9,F2,F4,F6,F7,F8,F9,F5,P10,V1,V2,L1 v2new
 ```
+
+Green is what v2 adds and gates on; grey dashed is v1's statistics,
+still computed and reported but gating nothing; red dotted is v1's gate
+rule, shown where it used to sit and no longer applied. Unstyled boxes
+are data handling common to both.
 
 Two things the picture cannot show:
 
