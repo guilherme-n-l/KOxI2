@@ -85,6 +85,12 @@ pub(super) type Row = BTreeMap<String, String>;
 /// Quote-aware CSV reader over the whole file (fields may embed
 /// commas, doubled quotes, and newlines). Missing file = no rows,
 /// matching v1 read_csv.
+/// A line that held nothing at all: one field, empty, never quoted.
+/// `""` on its own line is a real record of one empty field.
+fn blank(record: &[String], quoted_seen: bool) -> bool {
+    !quoted_seen && record.len() == 1 && record[0].is_empty()
+}
+
 pub(super) fn read_csv(path: &Path) -> Vec<Row> {
     let Ok(content) = fs::read_to_string(path) else {
         return Vec::new();
@@ -93,6 +99,9 @@ pub(super) fn read_csv(path: &Path) -> Vec<Row> {
     let mut record: Vec<String> = Vec::new();
     let mut field = String::new();
     let mut quoted = false;
+    // Whether this record ever opened a quote, which is what separates
+    // a line holding one explicitly empty field ("") from a blank line.
+    let mut quoted_seen = false;
     let mut chars = content.chars().peekable();
     while let Some(ch) = chars.next() {
         if quoted {
@@ -106,11 +115,24 @@ pub(super) fn read_csv(path: &Path) -> Vec<Row> {
             }
         } else {
             match ch {
-                '"' => quoted = true,
+                '"' => {
+                    quoted = true;
+                    quoted_seen = true;
+                }
                 ',' => record.push(std::mem::take(&mut field)),
                 '\n' => {
                     record.push(std::mem::take(&mut field));
-                    records.push(std::mem::take(&mut record));
+                    // The csv crate that writes these files skips empty
+                    // lines; the reader has to agree, or an editor's
+                    // stray blank line in a hand-validated artifact
+                    // becomes a row of empty fields and inflates every
+                    // count derived from row totals.
+                    if blank(&record, quoted_seen) {
+                        record.clear();
+                    } else {
+                        records.push(std::mem::take(&mut record));
+                    }
+                    quoted_seen = false;
                 }
                 '\r' => {}
                 other => field.push(other),
@@ -119,7 +141,9 @@ pub(super) fn read_csv(path: &Path) -> Vec<Row> {
     }
     if !field.is_empty() || !record.is_empty() {
         record.push(field);
-        records.push(record);
+        if !blank(&record, quoted_seen) {
+            records.push(record);
+        }
     }
 
     let mut rows = Vec::new();
@@ -622,5 +646,56 @@ mod tests {
         assert_eq!(lines[16], "comparison,elimination_rate,0.6667");
         assert_eq!(lines.len(), 18);
         assert!(csv.ends_with('\n'));
+    }
+
+    /// The artifacts are written with the `csv` crate (`util::csv_text`)
+    /// and read back by the hand-rolled reader above. commits.csv
+    /// carries free-text commit subjects and unsafe_sites.csv carries
+    /// source snippets, so the two have to agree on quoting for every
+    /// byte a kernel commit can contain.
+    #[test]
+    fn csv_round_trips_through_the_writer_the_artifacts_use() {
+        let nasty = [
+            "plain",
+            "with, comma",
+            "with \"quotes\"",
+            "with\nembedded newline",
+            "trailing space ",
+            "",
+            "unicode \u{2713} accent",
+            "semi;colon\ttab",
+            "unsafe { a, b }",
+        ];
+        let text = crate::util::csv_text(|out| {
+            out.write_record(["idx", "value"])?;
+            for (index, value) in nasty.iter().enumerate() {
+                out.write_record([index.to_string().as_str(), value])?;
+            }
+            Ok(())
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("round.csv");
+        fs::write(&path, &text).unwrap();
+
+        let rows = read_csv(&path);
+        assert_eq!(rows.len(), nasty.len(), "one row per written record");
+        for (index, value) in nasty.iter().enumerate() {
+            assert_eq!(rows[index]["value"], *value, "field {index} round-tripped");
+            assert_eq!(rows[index]["idx"], index.to_string());
+        }
+    }
+
+    /// A hand-edited artifact (manual_cwe review) can pick up a blank
+    /// line. It must not become a phantom row: row counts feed
+    /// total_functions and the commit totals.
+    #[test]
+    fn blank_lines_are_not_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blank.csv");
+        fs::write(&path, "a,b\n1,2\n\n3,4\n\n").unwrap();
+        let rows = read_csv(&path);
+        assert_eq!(rows.len(), 2, "blank lines are not records");
+        assert_eq!(rows[0]["a"], "1");
+        assert_eq!(rows[1]["a"], "3");
     }
 }
