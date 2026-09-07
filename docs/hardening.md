@@ -52,6 +52,14 @@ What neither reaches, and why: `metal.rs` (5%) needs a second physical
 machine to kexec; `kernel/build.rs` (14%) skips its body once a build
 is fingerprint-cached, so only a cold host exercises it.
 
+The two figures are reported separately on purpose. Merging them into one
+number needs an instrumented rebuild alongside the accumulated profiles,
+and that combination OOM-killed a 30 GB host twice -- taking the tmux
+server with it both times. Treat `.#coverage` as a shell that wants
+memory headroom, and take the two fronts' numbers as the useful pair:
+they measure different halves of the program, and the union would hide
+that.
+
 ## Confirmed and fixed
 
 Each has a commit and a regression test.
