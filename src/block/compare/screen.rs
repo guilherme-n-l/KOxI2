@@ -233,12 +233,17 @@ fn static_surface(static_dir: &Path) -> serde_json::Value {
         })
         .sum();
 
+    // The two upper bands read either measure, so the bottom one does
+    // too. Keying it on lines alone scored a driver whose function
+    // table came back empty at 0 -- below a one-line driver -- while
+    // its unsafe-operation census sat there measured and ignored.
+    // This is a deliberate divergence from v1's rubric.
     let score = if total_lines >= 2000 || unsafe_ops >= 500 {
         3
     } else if total_lines >= 800 || unsafe_ops >= 150 {
         2
     } else {
-        u8::from(total_lines > 0)
+        u8::from(total_lines > 0 || unsafe_ops > 0)
     };
     json!({
         "score": score,
@@ -479,24 +484,27 @@ mod tests {
         assert_eq!(score(&lines(0), &ops(0)), 0, "an empty surface does not");
     }
 
-    /// KNOWN ASYMMETRY, pinned deliberately. The top two bands read
-    /// either lines *or* unsafe operations, but the bottom band keys on
-    /// lines alone. A driver whose function table came back empty while
-    /// its unsafe-operation census did not therefore scores 0 -- below
-    /// a one-line driver -- despite carrying 140 measured operations.
-    /// Left as-is because these bands reproduce v1's rubric and moving
-    /// one re-rates every published candidate; see the findings note.
+    /// The bottom band reads both measures, like the two above it. A
+    /// driver whose function table came back empty but whose
+    /// unsafe-operation census did not is measured surface, not absent
+    /// surface, and must not rank below a one-line driver.
     #[test]
-    fn static_surface_bottom_band_ignores_unsafe_ops() {
+    fn static_surface_bottom_band_counts_unsafe_ops_too() {
         let dir = surface_dir(
             "name,line_count\n",
             "language,ptr_derefs,alloc_calls,free_calls,memop_calls,cast_exprs\nC,140,0,0,0,0\n",
         );
         assert_eq!(
             static_surface(dir.path())["score"].as_u64().unwrap(),
-            0,
-            "current v1-faithful behaviour: the bottom band sees lines only"
+            1,
+            "140 measured operations is surface"
         );
+        // Nothing measured on either axis still scores nothing.
+        let empty = surface_dir(
+            "name,line_count\nf,0\n",
+            "language,ptr_derefs,alloc_calls,free_calls,memop_calls,cast_exprs\nC,0,0,0,0,0\n",
+        );
+        assert_eq!(static_surface(empty.path())["score"].as_u64().unwrap(), 0);
     }
 
     #[test]
