@@ -21,6 +21,7 @@ use tracing::{info, warn};
 use crate::block::cli::{CompareOpts, Scope};
 use crate::block::results::{self, Manifest};
 use crate::config::{anchored, Project};
+use verdict::Substrate;
 
 pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow::Result<()> {
     let project = Project::locate()?;
@@ -48,9 +49,21 @@ pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow
         let compare_dir = campaign_root.join("compare");
         std::fs::create_dir_all(&compare_dir)?;
         let mut baselines = BTreeMap::new();
-        let mut record = |domain: &str, manifest: &Manifest, baselines: &mut BTreeMap<_, _>| {
+        let mut substrate: Option<Substrate> = None;
+        let mut record = |domain: &str,
+                          manifest: &Manifest,
+                          baselines: &mut BTreeMap<_, _>,
+                          substrate: &mut Option<Substrate>| {
             if let Some(p2) = &manifest.p2 {
                 baselines.insert(domain.to_owned(), p2.baseline.clone());
+            }
+            // The guest-side domains say where they ran; static is
+            // host-side and says nothing about the substrate.
+            if manifest.identity.accel.is_some() && substrate.is_none() {
+                *substrate = Some(Substrate {
+                    host: manifest.identity.host.clone(),
+                    accel: manifest.identity.accel.clone(),
+                });
             }
             compared += 1;
         };
@@ -61,7 +74,7 @@ pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow
         {
             info!("compare perf: {} vs {}", p1_dir.display(), p2_dir.display());
             perf::compare_perf(&p1_dir, &p2_dir, &manifest, opts, &compare_dir)?;
-            record("perf", &manifest, &mut baselines);
+            record("perf", &manifest, &mut baselines, &mut substrate);
         } else {
             info!("perf comparison: missing perf data; skipping");
         }
@@ -80,7 +93,7 @@ pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow
                 c_name,
                 rs_name,
             )?;
-            record("fuzz", &manifest, &mut baselines);
+            record("fuzz", &manifest, &mut baselines, &mut substrate);
         } else {
             info!("fuzz comparison: missing fuzz data; skipping");
         }
@@ -95,7 +108,7 @@ pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow
                 p2_dir.display()
             );
             safety::compare_safety(&p1_dir, &p2_dir, opts, &compare_dir)?;
-            record("static", &manifest, &mut baselines);
+            record("static", &manifest, &mut baselines, &mut substrate);
         } else {
             info!("safety comparison: missing static data; skipping");
         }
@@ -132,6 +145,7 @@ pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow
             c_name,
             rs_name,
             screening.as_ref(),
+            substrate.as_ref(),
         )?;
     }
     if compared == 0 {

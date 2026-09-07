@@ -137,7 +137,8 @@ fn decide(dimensions: &serde_json::Map<String, serde_json::Value>) -> Outcome {
     }
 
     let all_present = missing.is_empty();
-    let passes: Vec<Option<bool>> = ["safety", "fuzzing", "performance"]
+    let names = ["safety", "fuzzing", "performance"];
+    let passes: Vec<Option<bool>> = names
         .iter()
         .map(|name| dimensions[*name]["pass"].as_bool())
         .collect();
@@ -148,14 +149,7 @@ fn decide(dimensions: &serde_json::Map<String, serde_json::Value>) -> Outcome {
         .iter()
         .all(|summary| summary["pass"].as_bool().is_none());
 
-    if none_decidable {
-        Outcome {
-            overall: "inconclusive",
-            recommendation: "Inconclusive: available dimensions did not yield usable verdicts"
-                .to_string(),
-            caveat: None,
-        }
-    } else if all_decidable {
+    if all_decidable {
         let key = (passes[0].unwrap(), passes[1].unwrap(), passes[2].unwrap());
         Outcome {
             overall: if any_fail {
@@ -166,6 +160,42 @@ fn decide(dimensions: &serde_json::Map<String, serde_json::Value>) -> Outcome {
                 "inconclusive"
             },
             recommendation: recommendation(key).to_string(),
+            caveat: None,
+        }
+    } else if any_fail {
+        // One clear failure decides, whatever the other gates could
+        // not: an undecided or unmeasured dimension does not soften a
+        // measured regression into "inconclusive". The recommendation
+        // says which legs it stands on.
+        let describe = |wanted: Option<bool>| {
+            names
+                .iter()
+                .zip(&passes)
+                .filter(|(name, pass)| **pass == wanted && !missing.contains(name))
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>()
+        };
+        let failed = describe(Some(false));
+        let undecided = describe(None);
+        let mut parts = vec![format!("{} fail", failed.join(" and "))];
+        if !undecided.is_empty() {
+            parts.push(format!("{} undecided", undecided.join(" and ")));
+        }
+        if !missing.is_empty() {
+            parts.push(format!("{} not measured", missing.join(" and ")));
+        }
+        let text = format!("Do not replace: {}", parts.join("; "));
+        Outcome {
+            overall: "fail",
+            recommendation: text,
+            caveat: (!missing.is_empty())
+                .then(|| format!("missing dimensions: {}", missing.join(", "))),
+        }
+    } else if none_decidable {
+        Outcome {
+            overall: "inconclusive",
+            recommendation: "Inconclusive: available dimensions did not yield usable verdicts"
+                .to_string(),
             caveat: None,
         }
     } else if missing.is_empty() {
@@ -188,6 +218,23 @@ fn decide(dimensions: &serde_json::Map<String, serde_json::Value>) -> Outcome {
     }
 }
 
+/// Where the guest-side campaigns ran, from their manifests. Carried
+/// into the verdict so a report says what it was measured on, and so
+/// TCG numbers cannot travel as "measured": without KVM the timing is
+/// the emulator's, and the README already calls those numbers not
+/// data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Substrate {
+    pub host: String,
+    pub accel: Option<String>,
+}
+
+impl Substrate {
+    fn emulated(&self) -> bool {
+        self.accel.as_deref() == Some("tcg")
+    }
+}
+
 pub fn write_verdict(
     compare_dir: &Path,
     campaign: &str,
@@ -195,6 +242,7 @@ pub fn write_verdict(
     c_name: &str,
     rs_name: &str,
     screening: Option<&serde_json::Value>,
+    substrate: Option<&Substrate>,
 ) -> anyhow::Result<()> {
     let files = [
         ("safety", "safety.json"),
@@ -208,7 +256,17 @@ pub fn write_verdict(
         if data.is_none() {
             caveats.push(format!("{name}: not available (data missing)"));
         }
-        dimensions.insert(name.to_string(), summarize(name, data.as_ref()));
+        let mut summary = summarize(name, data.as_ref());
+        if name != "safety"
+            && summary["available"] == true
+            && substrate.is_some_and(Substrate::emulated)
+        {
+            summary["data_quality"] = json!("inferred");
+            caveats.push(format!(
+                "{name}: measured under TCG, not KVM; timing is the emulator's"
+            ));
+        }
+        dimensions.insert(name.to_string(), summary);
     }
 
     let Outcome {
@@ -230,6 +288,7 @@ pub fn write_verdict(
         "campaign": campaign,
         "baselines": baselines,
         "drivers": {"c": c_name, "rs": rs_name},
+        "substrate": substrate.map(|s| json!({"host": s.host, "accel": s.accel})),
         "data_quality": {
             "status": overall_status,
             "dimensions": dimensions
@@ -309,7 +368,7 @@ mod tests {
         );
         let mut baselines = BTreeMap::new();
         baselines.insert("perf".to_string(), "abc123".to_string());
-        write_verdict(&dir, "trial", &baselines, "null_blk", "rnull", None).unwrap();
+        write_verdict(&dir, "trial", &baselines, "null_blk", "rnull", None, None).unwrap();
         let verdict = verdict_in(&dir);
         assert_eq!(verdict["overall"], "fail");
         assert_eq!(
@@ -323,9 +382,78 @@ mod tests {
             19.0
         );
 
+        // An undecided fuzzing gate (zero events) next to a failed
+        // performance gate: the failure decides, and the text says
+        // which leg is undecided.
+        write(
+            "fuzz_stats.json",
+            json!({"verdict": {"pass": null, "outcome": "inconclusive",
+                               "detail": "0 events", "gate_basis": "zero_event_sensitivity"},
+                   "metrics": {"target_attributable_crashes": {
+                       "test": {"p_value": 1.0}, "effect_size": {"value": 0.5}}},
+                   "rate_ratio": {"ratio": null},
+                   "data_quality": {"status": "measured"}}),
+        );
+        write(
+            "perf_stats.json",
+            json!({"verdict": {"pass": false, "detail": "slower", "threshold": 5.0},
+                   "aggregate": {"median_delta_pct": -14.0, "workloads_passing_tost": "0/18"},
+                   "data_quality": {"status": "measured"}}),
+        );
+        write_verdict(&dir, "trial", &baselines, "null_blk", "rnull", None, None).unwrap();
+        let verdict = verdict_in(&dir);
+        assert_eq!(verdict["overall"], "fail");
+        assert_eq!(
+            verdict["recommendation"],
+            "Do not replace: performance fail; fuzzing undecided"
+        );
+        assert_eq!(
+            verdict["dimensions"]["fuzzing"]["key_numbers"]["outcome"],
+            "inconclusive"
+        );
+
+        // The same undecided gate with everything else passing is an
+        // inconclusive overall, never a pass.
+        write(
+            "perf_stats.json",
+            json!({"verdict": {"pass": true, "detail": "ok", "threshold": 5.0},
+                   "aggregate": {"median_delta_pct": -1.0, "workloads_passing_tost": "18/18"},
+                   "data_quality": {"status": "measured"}}),
+        );
+        write_verdict(&dir, "trial", &baselines, "null_blk", "rnull", None, None).unwrap();
+        assert_eq!(verdict_in(&dir)["overall"], "inconclusive");
+
+        // TCG numbers are inferred at best, and the verdict says where
+        // it was measured.
+        let tcg = Substrate {
+            host: "laptop".into(),
+            accel: Some("tcg".into()),
+        };
+        write_verdict(
+            &dir,
+            "trial",
+            &baselines,
+            "null_blk",
+            "rnull",
+            None,
+            Some(&tcg),
+        )
+        .unwrap();
+        let verdict = verdict_in(&dir);
+        assert_eq!(verdict["substrate"]["accel"], "tcg");
+        assert_eq!(
+            verdict["dimensions"]["performance"]["data_quality"],
+            "inferred"
+        );
+        assert_eq!(
+            verdict["dimensions"]["safety"]["data_quality"],
+            "manually_validated"
+        );
+        assert_eq!(verdict["data_quality"]["status"], "inferred");
+
         // Missing a dimension -> partial with a caveat.
         fs::remove_file(dir.join("fuzz_stats.json")).unwrap();
-        write_verdict(&dir, "trial", &baselines, "null_blk", "rnull", None).unwrap();
+        write_verdict(&dir, "trial", &baselines, "null_blk", "rnull", None, None).unwrap();
         let verdict = verdict_in(&dir);
         assert_eq!(verdict["overall"], "partial");
         assert!(verdict["caveats"]
@@ -333,6 +461,22 @@ mod tests {
             .unwrap()
             .iter()
             .any(|caveat| caveat.as_str().unwrap().contains("fuzzing")));
+
+        // A failure with a dimension missing is still a failure, on
+        // the legs it has.
+        write(
+            "perf_stats.json",
+            json!({"verdict": {"pass": false, "detail": "slower", "threshold": 5.0},
+                   "aggregate": {"median_delta_pct": -14.0, "workloads_passing_tost": "0/18"},
+                   "data_quality": {"status": "measured"}}),
+        );
+        write_verdict(&dir, "trial", &baselines, "null_blk", "rnull", None, None).unwrap();
+        let verdict = verdict_in(&dir);
+        assert_eq!(verdict["overall"], "fail");
+        assert_eq!(
+            verdict["recommendation"],
+            "Do not replace: performance fail; fuzzing not measured"
+        );
 
         fs::remove_dir_all(&dir).unwrap();
     }
