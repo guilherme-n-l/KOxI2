@@ -331,8 +331,78 @@ impl FioOpts {
                     .to_owned(),
             });
         }
+        // The rest of the matrix is checked here too, so a typo fails
+        // before a guest boots rather than as "3 fio runs failed"
+        // after one.
+        let invalid =
+            |env: &'static str, arg: &'static str, value: String, why: &str| Error::Invalid {
+                env,
+                arg,
+                value,
+                why: why.to_owned(),
+            };
+        if opts.runtime == 0 {
+            return Err(invalid(
+                "FIO_RUNTIME",
+                "fio-runtime",
+                "0".to_owned(),
+                "needs at least 1 second per run",
+            ));
+        }
+        if let Some(depth) = opts.qd.iter().find(|depth| **depth == 0) {
+            return Err(invalid(
+                "FIO_QDS",
+                "fio-qd",
+                depth.to_string(),
+                "queue depths start at 1",
+            ));
+        }
+        if let Some(bs) = opts.bs.iter().find(|bs| !fio_size(bs)) {
+            return Err(invalid(
+                "FIO_BSIZES",
+                "fio-bs",
+                bs.clone(),
+                "block sizes are a positive integer with an optional k, m or g suffix (4k, 1M)",
+            ));
+        }
+        if let Some(rw) = opts
+            .rw
+            .iter()
+            .find(|rw| !FIO_PATTERNS.contains(&rw.as_str()))
+        {
+            return Err(invalid(
+                "FIO_RWS",
+                "fio-rw",
+                rw.clone(),
+                "not a fio I/O pattern (read, write, randread, randwrite, rw, randrw, \
+                 trim, randtrim, trimwrite)",
+            ));
+        }
         Ok(opts)
     }
+}
+
+/// fio's `--rw` vocabulary.
+const FIO_PATTERNS: [&str; 10] = [
+    "read",
+    "write",
+    "randread",
+    "randwrite",
+    "rw",
+    "readwrite",
+    "randrw",
+    "trim",
+    "randtrim",
+    "trimwrite",
+];
+
+/// A fio size: digits with an optional k/m/g suffix, and not zero.
+fn fio_size(text: &str) -> bool {
+    let digits = text.trim_end_matches(|c: char| "kKmMgG".contains(c));
+    digits.len() + 1 >= text.len()
+        && !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && digits.bytes().any(|b| b != b'0')
 }
 
 knobs! {
@@ -401,21 +471,84 @@ knobs! {
     #[derive(Debug, Clone)]
     pub struct CompareOpts(COMPARE) {
         /// Statistical significance threshold.
-        req alpha: f64 = "alpha" / "ALPHA", "x", default "0.05";
+        req alpha: f64 = "alpha" / "ALPHA", "x", default "0.05"
+            => { .allow_negative_numbers(true) };
         /// Max allowed overhead %.
-        req perf_threshold: f64 = "perf-threshold" / "PERF_THRESHOLD", "pct", default "5";
+        req perf_threshold: f64 = "perf-threshold" / "PERF_THRESHOLD", "pct", default "5"
+            => { .allow_negative_numbers(true) };
         /// Bootstrap resamples for performance CIs.
         req bootstrap_resamples: u64 = "bootstrap-resamples" / "BOOTSTRAP_RESAMPLES", "n",
             default "10000";
         /// Non-inferiority margin on the rs/c attributable crash rate ratio.
-        req fuzz_rate_margin: f64 = "fuzz-rate-margin" / "FUZZ_RATE_MARGIN", "x", default "2";
+        req fuzz_rate_margin: f64 = "fuzz-rate-margin" / "FUZZ_RATE_MARGIN", "x", default "2"
+            => { .allow_negative_numbers(true) };
         /// Elimination rate threshold.
         req safety_threshold: f64 = "safety-threshold" / "SAFETY_THRESHOLD", "pct",
-            default "34.2";
+            default "34.2" => { .allow_negative_numbers(true) };
         /// Deterministic workload shuffle seed (default: unix time).
         opt seed: u64 = "seed" / "WORKLOAD_SEED", "n";
         /// Manual crash adjudication the fuzz gate honors.
         group screen: ScreenOpts;
+    }
+}
+
+impl CompareOpts {
+    /// `from_matches` plus the ranges the statistics are defined on.
+    /// Out-of-range values used to reach the tests themselves: an
+    /// alpha above 0.5 panicked inside the Hodges-Lehmann interval,
+    /// zero resamples panicked inside the bootstrap, and a negative
+    /// threshold was refused by clap as an unknown flag.
+    pub fn checked(matches: &ArgMatches) -> Result<Self, Error> {
+        let opts = Self::from_matches(matches)?;
+        let invalid =
+            |env: &'static str, arg: &'static str, value: String, why: &str| Error::Invalid {
+                env,
+                arg,
+                value,
+                why: why.to_owned(),
+            };
+        if !(opts.alpha > 0.0 && opts.alpha < 0.5) {
+            return Err(invalid(
+                "ALPHA",
+                "alpha",
+                opts.alpha.to_string(),
+                "must lie strictly between 0 and 0.5: it is a one-sided significance level",
+            ));
+        }
+        if !(opts.perf_threshold > 0.0 && opts.perf_threshold < 100.0) {
+            return Err(invalid(
+                "PERF_THRESHOLD",
+                "perf-threshold",
+                opts.perf_threshold.to_string(),
+                "must lie strictly between 0 and 100: it is the allowed overhead in percent",
+            ));
+        }
+        if !(0.0..=100.0).contains(&opts.safety_threshold) {
+            return Err(invalid(
+                "SAFETY_THRESHOLD",
+                "safety-threshold",
+                opts.safety_threshold.to_string(),
+                "must lie between 0 and 100: it is an elimination rate in percent",
+            ));
+        }
+        if opts.fuzz_rate_margin < 1.0 {
+            return Err(invalid(
+                "FUZZ_RATE_MARGIN",
+                "fuzz-rate-margin",
+                opts.fuzz_rate_margin.to_string(),
+                "must be at least 1: a margin below 1 asks the Rust driver to crash less \
+                 than the C driver, which is superiority, not non-inferiority",
+            ));
+        }
+        if opts.bootstrap_resamples < 100 {
+            return Err(invalid(
+                "BOOTSTRAP_RESAMPLES",
+                "bootstrap-resamples",
+                opts.bootstrap_resamples.to_string(),
+                "needs at least 100: a percentile interval from fewer resamples is noise",
+            ));
+        }
+        Ok(opts)
     }
 }
 
@@ -459,6 +592,61 @@ mod tests {
         let matches = parse(args);
         let profile = Profile::from_matches(&matches).expect("profile");
         FuzzOpts::with_profile(&matches, profile).expect("fuzz")
+    }
+
+    fn try_fio(args: &[&str]) -> Result<FioOpts, Error> {
+        let matches = parse(args);
+        let profile = Profile::from_matches(&matches).expect("profile");
+        FioOpts::with_profile(&matches, profile)
+    }
+
+    #[test]
+    fn compare_knobs_are_range_checked_not_panicked_on() {
+        let checked = |args: &[&str]| CompareOpts::checked(&parse(&[&["compare"], args].concat()));
+        assert!(checked(&[]).is_ok());
+        // Negative numbers reach the range check instead of being
+        // read by clap as unknown flags.
+        for bad in [
+            ["--alpha", "0"],
+            ["--alpha", "1.5"],
+            ["--alpha", "-0.1"],
+            ["--perf-threshold", "-5"],
+            ["--perf-threshold", "500"],
+            ["--safety-threshold", "150"],
+            ["--fuzz-rate-margin", "0.5"],
+            ["--fuzz-rate-margin", "-2"],
+            ["--bootstrap-resamples", "0"],
+        ] {
+            let err = checked(&bad).expect_err(&bad.join(" "));
+            assert!(
+                matches!(err, Error::Invalid { .. }),
+                "{}: {err}",
+                bad.join(" ")
+            );
+        }
+        assert!(checked(&["--alpha", "0.2", "--fuzz-rate-margin", "1"]).is_ok());
+    }
+
+    #[test]
+    fn fio_plan_typos_fail_before_a_guest_boots() {
+        for bad in [
+            ["--fio-runtime", "0"],
+            ["--fio-qd", "0"],
+            ["--fio-bs", "0k"],
+            ["--fio-bs", "4x"],
+            ["--fio-rw", "randfoo"],
+        ] {
+            let err =
+                try_fio(&[&["perf", "--quick"], &bad[..]].concat()).expect_err(&bad.join(" "));
+            assert!(
+                matches!(err, Error::Invalid { .. }),
+                "{}: {err}",
+                bad.join(" ")
+            );
+        }
+        assert!(try_fio(&["perf", "--fio-bs", "4k 64k 1M", "--fio-rw", "randrw"]).is_ok());
+        assert!(fio_size("512") && fio_size("4k") && fio_size("1M") && fio_size("2G"));
+        assert!(!fio_size("0") && !fio_size("k") && !fio_size("4kk") && !fio_size("00k"));
     }
 
     #[test]

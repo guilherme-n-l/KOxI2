@@ -78,7 +78,7 @@ pub fn run(matches: &ArgMatches, globals: &Globals, logs: &Path) -> anyhow::Resu
         "compare" => compare::drive(
             &Scope::from_matches(sub)?,
             &cli::require_campaign(sub)?,
-            &CompareOpts::from_matches(sub)?,
+            &CompareOpts::checked(sub)?,
         )?,
         "all" => all(sub, globals, logs)?,
         other => unreachable!("unknown block subcommand {other}"),
@@ -100,7 +100,7 @@ fn all(matches: &ArgMatches, globals: &Globals, logs: &Path) -> anyhow::Result<(
     let fio = FioOpts::with_profile(matches, profile)?;
     let fuzz_opts = FuzzOpts::with_profile(matches, profile)?;
     let static_opts = StaticOpts::from_matches(matches)?;
-    let compare_opts = CompareOpts::from_matches(matches)?;
+    let compare_opts = CompareOpts::checked(matches)?;
 
     let phase = |name: &str| info!("=== koxi block {name} ===");
     phase("static");
