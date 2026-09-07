@@ -456,6 +456,7 @@ fn run_campaign(
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
         .process_group(0);
+    crate::virt::runner::die_with_parent(&mut manager);
     let mut child = manager.spawn()?;
 
     let started = Instant::now();

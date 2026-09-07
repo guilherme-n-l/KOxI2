@@ -183,6 +183,31 @@ pub fn hostname() -> String {
         })
 }
 
+/// Make a child die when koxi does. Drop kills the guest on every
+/// path Rust unwinds through, but a SIGTERM from a parent or a
+/// SIGKILL unwinds nothing, and a perf run stopped that way left its
+/// qemu running with the ssh port; a fuzz run left syz-manager and
+/// four guests. Linux delivers the parent-death signal to the child
+/// itself, whatever killed the parent.
+pub fn die_with_parent(command: &mut Command) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: prctl only touches the calling process's own state
+        // and is async-signal-safe, which is all a pre_exec hook may do.
+        unsafe {
+            command.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = command;
+    }
+}
+
 /// A launched qemu guest; killed on drop (the guest is stateless).
 pub struct Vm {
     child: Child,
@@ -233,6 +258,7 @@ impl Vm {
         qemu.stdin(Stdio::null())
             .stdout(Stdio::from(sink.try_clone()?))
             .stderr(Stdio::from(sink));
+        die_with_parent(&mut qemu);
         debug!("running {qemu:?} (console: {})", console.display());
         info!(
             "launching qemu (mem {}, smp {}, ssh port {})",
