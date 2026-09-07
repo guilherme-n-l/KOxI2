@@ -100,6 +100,9 @@ pub struct SourceIds {
 pub struct StaticKnobs {
     /// Kernel-tree-relative driver source path.
     pub gitpath: String,
+    /// Earlier paths the driver's history lived at, mined alongside.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history_paths: Vec<String>,
     /// Abstraction-layer paths counted separately.
     pub abstractions: Vec<String>,
     /// Absolute lower bound for mined commits ("" = unbounded).

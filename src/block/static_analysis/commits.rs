@@ -55,6 +55,22 @@ impl Rules {
         })
     }
 
+    /// Whether a subject is safety-related and, if so, its CWE, with
+    /// the driver's own name blanked first: it is not a signal,
+    /// whichever way it is spelled. "null_blk:" never matched the
+    /// bare-word rules, but "null-blk:" did, through the hyphen's word
+    /// boundary.
+    fn judge(&self, own_name: &regex::Regex, subject: &str) -> (bool, String) {
+        let scrubbed = own_name.replace_all(subject, "");
+        let safety_related = self.safety.is_match(&scrubbed);
+        let cwe = if safety_related {
+            self.classify(&scrubbed)
+        } else {
+            String::new()
+        };
+        (safety_related, cwe)
+    }
+
     /// First matching CWE rule for a safety-related subject.
     fn classify(&self, subject: &str) -> String {
         for (pattern, cwe) in &self.cwe {
@@ -97,12 +113,23 @@ const COLUMNS: [&str; 10] = [
     "validation_date",
 ];
 
-/// `git log` over the blobless linux-meta mirror at the pinned rev.
+/// The driver's name as it appears in subjects, underscore or hyphen.
+fn own_name(driver: &str) -> Result<regex::Regex, Error> {
+    RegexBuilder::new(&regex::escape(driver).replace('_', "[-_]"))
+        .case_insensitive(true)
+        .build()
+        .map_err(|err| Error::Regex(driver.to_owned(), err))
+}
+
+/// `git log` over the blobless linux-meta mirror at the pinned rev,
+/// across every path the driver has lived at: a commit touching any
+/// of them counts once. Mining the current directory alone stops at
+/// the move that created it.
 pub fn mine(
     mirror: &Path,
     rev: &str,
     since: Option<&str>,
-    gitpath: &Path,
+    paths: &[&Path],
     driver: &str,
     rules: &Rules,
 ) -> Result<Vec<CommitRow>, Error> {
@@ -114,7 +141,8 @@ pub fn mine(
     if let Some(since) = since {
         git.arg(format!("--since={since}"));
     }
-    git.arg(rev).arg("--").arg(gitpath);
+    git.arg(rev).arg("--").args(paths);
+    let own_name = own_name(driver)?;
     let output = git.output().map_err(Error::Git)?;
     if !output.status.success() {
         return Err(Error::GitFailed(
@@ -131,7 +159,7 @@ pub fn mine(
         else {
             continue;
         };
-        let safety_related = rules.safety.is_match(subject);
+        let (safety_related, auto_cwe) = rules.judge(&own_name, subject);
         rows.push(CommitRow {
             hash: hash.to_owned(),
             date: date.to_owned(),
@@ -139,11 +167,7 @@ pub fn mine(
             subject: subject.to_owned(),
             driver: driver.to_owned(),
             safety_related,
-            auto_cwe: if safety_related {
-                rules.classify(subject)
-            } else {
-                String::new()
-            },
+            auto_cwe,
             manual_cwe: String::new(),
             validator: String::new(),
             validation_date: String::new(),
@@ -205,6 +229,21 @@ pub fn commits_csv(rows: &[CommitRow]) -> String {
     })
 }
 
+/// The dates the mined history spans, so a count is always read
+/// next to the window it came from ("139 commits" means something
+/// different over five years than over twelve).
+pub fn history_window(rows: &[CommitRow]) -> (String, String) {
+    let mut days: Vec<&str> = rows
+        .iter()
+        .map(|row| row.date.get(..10).unwrap_or(&row.date))
+        .collect();
+    days.sort_unstable();
+    match (days.first(), days.last()) {
+        (Some(first), Some(last)) => ((*first).to_owned(), (*last).to_owned()),
+        _ => (String::new(), String::new()),
+    }
+}
+
 /// commits_summary.csv (v1 shape: totals then per-CWE counts, with
 /// manual classifications taking precedence).
 pub fn summary_csv(rows: &[CommitRow]) -> String {
@@ -226,9 +265,12 @@ pub fn summary_csv(rows: &[CommitRow]) -> String {
             *counts.entry(cwe.clone()).or_insert(0u32) += 1;
         }
     }
+    let (from, to) = history_window(rows);
     util::csv_text(|out| {
         out.write_record(["metric", "value"])?;
         out.write_record(["total_commits", &total.to_string()])?;
+        out.write_record(["history_from", &from])?;
+        out.write_record(["history_to", &to])?;
         out.write_record(["safety_related", &safety.to_string()])?;
         out.write_record(["safety_pct", &safety_pct])?;
         for (cwe, count) in &counts {
@@ -263,7 +305,7 @@ mod tests {
     }
 
     fn row(hash: &str, subject: &str, rules: &Rules) -> CommitRow {
-        let safety_related = rules.safety.is_match(subject);
+        let (safety_related, auto_cwe) = rules.judge(&own_name("null_blk").unwrap(), subject);
         CommitRow {
             hash: hash.to_owned(),
             date: "2024-01-01T00:00:00+00:00".to_owned(),
@@ -271,15 +313,27 @@ mod tests {
             subject: subject.to_owned(),
             driver: "null_blk".to_owned(),
             safety_related,
-            auto_cwe: if safety_related {
-                rules.classify(subject)
-            } else {
-                String::new()
-            },
+            auto_cwe,
             manual_cwe: String::new(),
             validator: String::new(),
             validation_date: String::new(),
         }
+    }
+
+    #[test]
+    fn history_window_spans_the_mined_dates() {
+        let rules = rules();
+        let mut rows = vec![
+            row("a1", "null_blk: fix use-after-free in timer path", &rules),
+            row("a2", "null_blk: plug memory leak on configfs error", &rules),
+        ];
+        rows[0].date = "2020-11-20T10:55:19+09:00".to_owned();
+        rows[1].date = "2013-10-25T11:52:25+01:00".to_owned();
+        assert_eq!(
+            history_window(&rows),
+            ("2013-10-25".to_owned(), "2020-11-20".to_owned())
+        );
+        assert!(summary_csv(&rows).contains("history_from,2013-10-25\nhistory_to,2020-11-20\n"));
     }
 
     #[test]
@@ -309,6 +363,31 @@ mod tests {
         // use-after-free is tested first.
         let both = row("a4", "fix leak and use-after-free", &rules);
         assert_eq!(both.auto_cwe, "CWE-416");
+
+        // The hyphenated spelling of the driver's name is scrubbed
+        // too: "null-blk" gave \bnull\b a word boundary to match at.
+        let hyphen = row("a8", "null-blk: save memory footprint", &rules);
+        assert!(
+            !hyphen.safety_related,
+            "the driver's own name is not a signal"
+        );
+        // ...while a real null-pointer fix still classifies, in the
+        // spellings commit subjects actually use.
+        let ptr = row(
+            "a9",
+            "null_blk: fix null-ptr-dereference while configuring 'power'",
+            &rules,
+        );
+        assert_eq!(ptr.auto_cwe, "CWE-476");
+        let oob = row(
+            "a10",
+            "null_blk: fix zone read length beyond write pointer",
+            &rules,
+        );
+        assert_eq!(
+            oob.auto_cwe, "CWE-125",
+            "a read past a bound is not an OOB write"
+        );
     }
 
     #[test]
@@ -366,7 +445,8 @@ mod tests {
 
         assert_eq!(
             summary_csv(&[]),
-            "metric,value\ntotal_commits,0\nsafety_related,0\nsafety_pct,N/A\n"
+            "metric,value\ntotal_commits,0\nhistory_from,\nhistory_to,\nsafety_related,0\n\
+             safety_pct,N/A\n"
         );
     }
 }

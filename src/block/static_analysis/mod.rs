@@ -168,6 +168,11 @@ impl Run<'_> {
             fuzz: None,
             static_: Some(StaticKnobs {
                 gitpath: driver.gitpath.display().to_string(),
+                history_paths: driver
+                    .history_paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect(),
                 abstractions: driver
                     .abstractions
                     .iter()
@@ -300,14 +305,23 @@ impl Run<'_> {
         }
         write_ast_csvs(outdir, &results)?;
 
+        let paths: Vec<&Path> = std::iter::once(driver.gitpath.as_path())
+            .chain(driver.history_paths.iter().map(PathBuf::as_path))
+            .collect();
         let mut rows = commits::mine(
             self.mirror,
             &self.meta_commit,
             self.since.as_deref(),
-            &driver.gitpath,
+            &paths,
             name,
             self.rules,
         )?;
+        let (from, to) = commits::history_window(&rows);
+        info!(
+            "{name}: {} commits over {} path(s), {from}..{to}",
+            rows.len(),
+            paths.len()
+        );
         if let Some(csv) = &self.validated_cwe {
             let contents = fs::read_to_string(csv)
                 .map_err(|err| anyhow!("reading --validated-cwe {}: {err}", csv.display()))?;
