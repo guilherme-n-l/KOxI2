@@ -3,7 +3,6 @@
 //! per-class tables (`[block]`, ...).
 
 use std::collections::BTreeMap;
-use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -150,12 +149,12 @@ pub enum Role {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self, Error> {
-        let text = fs::read_to_string(path).map_err(Error::Io)?;
+        let text = fs::read_to_string(path)?;
         Self::parse(&text)
     }
 
     pub fn parse(text: &str) -> Result<Self, Error> {
-        let config: Self = toml::from_str(text).map_err(Error::Parse)?;
+        let config: Self = toml::from_str(text)?;
         config.validate()?;
         Ok(config)
     }
@@ -211,7 +210,7 @@ impl Project {
     /// cargo-style. Artifacts do not live here — see
     /// `fetch::koxi_home` for the global cache.
     pub fn locate() -> Result<Self, Error> {
-        let cwd = std::env::current_dir().map_err(Error::Io)?;
+        let cwd = std::env::current_dir()?;
         for dir in cwd.ancestors() {
             if let Some(project) = Self::at(dir)? {
                 return Ok(project);
@@ -232,30 +231,17 @@ impl Project {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
-    Io(std::io::Error),
-    Parse(toml::de::Error),
+    #[error("reading config: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("parsing config: {0}")]
+    Parse(#[from] toml::de::Error),
+    #[error("invalid config: {0}")]
     Invalid(String),
+    #[error("no {config} found (searched from {} upward)", .0.display(), config = CONFIG_PATH)]
     NoProject(PathBuf),
 }
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Io(err) => write!(f, "reading config: {err}"),
-            Error::Parse(err) => write!(f, "parsing config: {err}"),
-            Error::Invalid(msg) => write!(f, "invalid config: {msg}"),
-            Error::NoProject(cwd) => write!(
-                f,
-                "no {CONFIG_PATH} found (searched from {} upward)",
-                cwd.display()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {

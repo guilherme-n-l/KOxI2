@@ -2,7 +2,6 @@
 //! files under `<logs>/<label>.log` — the console stays quiet, the
 //! logs keep everything.
 
-use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -53,29 +52,18 @@ pub fn stdout(mut cmd: Command, label: &'static str, logs: &Path) -> Result<Stri
     Ok(stdout)
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
-    Log(std::io::Error),
-    Spawn(&'static str, std::io::Error),
+    #[error("opening task log: {0}")]
+    Log(#[source] std::io::Error),
+    #[error("running {0}: {1}")]
+    Spawn(&'static str, #[source] std::io::Error),
+    #[error("{label} failed: {status} (see {})", log.display())]
     Failed {
         label: &'static str,
         status: ExitStatus,
         log: PathBuf,
     },
+    #[error("unexpected {0} output")]
     Malformed(&'static str),
 }
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Log(err) => write!(f, "opening task log: {err}"),
-            Error::Spawn(label, err) => write!(f, "running {label}: {err}"),
-            Error::Failed { label, status, log } => {
-                write!(f, "{label} failed: {status} (see {})", log.display())
-            }
-            Error::Malformed(label) => write!(f, "unexpected {label} output"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
