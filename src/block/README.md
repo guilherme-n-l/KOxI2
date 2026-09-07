@@ -116,7 +116,7 @@ the guest, and where its source lives in the kernel tree.
 | `rnull`    | Rust | `null_blk` | Declares the `rust/kernel/` abstractions it leans on.        |
 | `loop`     | C    |            | Boots; needs a file-backed `/dev/loop0` (`prep`).            |
 | `brd`      | C    |            | Boots; RAM disk.                                             |
-| `zram`     | C    |            | Built as a module; needs a configured disk size (`prep`).    |
+| `zram`     | C    |            | Boots; carries `deps` (zsmalloc) and a disk-size `prep`.     |
 | `nbd`      | C    |            | Boots; needs an in-guest connector before it is usable.      |
 | `dm-zero`  | C    |            | Built as a module; needs `dmsetup`, which BusyBox lacks.     |
 
@@ -370,7 +370,8 @@ harness adds two of its own:
 1. Add a `[block.drivers.<name>]` table to `koxi.toml`.
 2. Set at least `role`, `ko`, `ko-dir`, `device`, and `gitpath`.
 3. Add `insmod`, `configfs`, `configfs-params`, or `prep` when the
-   guest must do more before the device node appears.
+   guest must do more before the device node appears, and `deps` (kernel-tree-relative module paths) when the driver cannot load
+   without another module first.
 4. For a Rust driver, set `pair` to the C driver it replaces and
    `abstractions` to the kernel-tree paths whose unsafe surface
    should be counted separately from the driver body. Configure both

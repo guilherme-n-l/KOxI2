@@ -258,6 +258,21 @@ and `CONFIG_DM_ZERO` built in, so two of the seven registry entries
 could never have been booted. Both are modules now, and an unbuilt
 module skips its driver with a warning instead of ending the run.
 
+Number 18 had a second half. With both modules built, `koxi vm --driver
+zram` still died in the guest: `zram: Unknown symbol zs_malloc`, eleven
+times over, because zram's allocator is its own module (`zsmalloc.ko`)
+and the registry loads exactly one. Building the allocator in does not
+work either: kconfig caps a symbol's prompt at the visibility of what
+selects it, so with `CONFIG_ZRAM=m` an explicit `CONFIG_ZSMALLOC=y`
+comes back as `=m` from `olddefconfig`, silently, and a rebuild proved
+it. The registry now carries `deps`, kernel-tree paths of modules a
+driver needs first; they are harvested beside the driver's own module,
+shipped in the overlay under `deps/` with an ordinal prefix, inserted
+in order by the guest script, and folded into the driver's module
+identity so a rebuilt allocator re-baselines the driver that runs on
+it. With that, `koxi vm --driver zram` boots to `/dev/zram0` with a
+2 GiB disk and `lsmod` showing zsmalloc held by zram.
+
 Number 25 came from reading the queue limits back from the guest,
 which the pass did for the 1 MiB question (`max_sectors_kb` is 127, so
 a 1 MiB request is eight or nine): `nr_requests` was 64 on the C device
