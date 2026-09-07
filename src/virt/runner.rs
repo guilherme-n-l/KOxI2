@@ -70,10 +70,26 @@ pub fn stage_overlay(
     if !ko.is_file() {
         return Err(Error::MissingInput(ko));
     }
-    for dir in ["koxi/modules", "koxi/scripts", "koxi/driver_setup"] {
+    for dir in [
+        "koxi/modules",
+        "koxi/modules/deps",
+        "koxi/scripts",
+        "koxi/driver_setup",
+    ] {
         fs::create_dir_all(staging.join(dir))?;
     }
     fs::copy(&ko, staging.join("koxi/modules").join(&driver.ko))?;
+    // Dependencies go under deps/ with an ordinal prefix, so the guest
+    // script's sorted glob inserts them in registry order.
+    for (index, dep) in dep_modules(module_dir, driver)?.iter().enumerate() {
+        let file = dep.file_name().unwrap_or_default().to_string_lossy();
+        fs::copy(
+            dep,
+            staging
+                .join("koxi/modules/deps")
+                .join(format!("{index:02}-{file}")),
+        )?;
+    }
     let script = assets::load(&project.root, &project.config, "virt/vm-driver-setup")
         .map_err(Error::Overlay)?;
     let script_path = staging.join("koxi/scripts/vm_driver_setup");
@@ -105,6 +121,44 @@ pub fn driver_initrd(
     let initrd = scratch.join("initrd.cpio.gz");
     overlay_initrd(base_initrd, &staging, &initrd, logs)?;
     Ok(initrd)
+}
+
+/// The driver's dependency modules as harvested files under
+/// `module_dir`, in registry order; a missing one is an error, since
+/// the driver would fail to load in the guest anyway.
+pub fn dep_modules(module_dir: &Path, driver: &Driver) -> Result<Vec<PathBuf>, Error> {
+    driver
+        .deps
+        .iter()
+        .map(|dep| {
+            let file = dep
+                .file_name()
+                .ok_or_else(|| Error::MissingInput(dep.clone()))?;
+            let path = module_dir.join(file);
+            if path.is_file() {
+                Ok(path)
+            } else {
+                Err(Error::MissingInput(path))
+            }
+        })
+        .collect()
+}
+
+/// What identifies the loaded driver code: the module's sha alone
+/// when it stands by itself, and the sha over its own sha and its
+/// dependencies' shas when it does not, so a rebuilt allocator
+/// re-baselines a driver that runs on it.
+pub fn module_identity(module_dir: &Path, driver: &Driver) -> Result<String, Error> {
+    let own = crate::util::sha256_file(&module_dir.join(&driver.ko))?;
+    if driver.deps.is_empty() {
+        return Ok(own);
+    }
+    let mut text = own;
+    for dep in dep_modules(module_dir, driver)? {
+        text.push('\n');
+        text.push_str(&crate::util::sha256_file(&dep)?);
+    }
+    Ok(crate::util::sha256_bytes(text.as_bytes()))
 }
 
 /// v1 spec line: role:name:ko:device:insmod_params:configfs_dir:configfs_params.

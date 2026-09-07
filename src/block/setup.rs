@@ -65,17 +65,26 @@ fn build_all(ctx: &mut Ctx, opts: &BuildOpts) -> anyhow::Result<()> {
     // (missing ones fail) ride the fuzz flavor only — they exist for
     // syzkaller symbolization, and a DWARF-laden vmlinux is dead
     // weight next to the clean kernel.
-    let modules: Vec<kernel::build::Module> = ctx
-        .config
-        .block
-        .drivers
-        .values()
-        .map(|driver| kernel::build::Module {
-            file: driver.ko.clone(),
-            tree_path: driver.ko_dir.join(&driver.ko),
-            required: false,
-        })
-        .collect();
+    let mut modules: Vec<kernel::build::Module> = Vec::new();
+    for driver in ctx.config.block.drivers.values() {
+        let own = std::iter::once(driver.ko_dir.join(&driver.ko));
+        for tree_path in own.chain(driver.deps.iter().cloned()) {
+            let file = tree_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| anyhow!("module path {} has no file name", tree_path.display()))?
+                .to_owned();
+            // Two drivers may share a dependency; harvest it once.
+            if modules.iter().any(|module| module.file == file) {
+                continue;
+            }
+            modules.push(kernel::build::Module {
+                file,
+                tree_path,
+                required: false,
+            });
+        }
+    }
     // What the registry implies about the kernel config. A Rust
     // driver cannot be built without CONFIG_RUST, and a driver that
     // creates its device through configfs cannot be set up without

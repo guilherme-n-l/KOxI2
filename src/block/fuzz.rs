@@ -173,8 +173,11 @@ impl Ids<'_> {
             artifacts: Some(ArtifactShas {
                 kernel: self.kernel_sha.clone(),
                 initrd: self.initrd_sha.clone(),
-                module: util::sha256_file(&self.fuzz_dir.join(&driver.ko)).with_context(|| {
-                    format!("hashing {}", self.fuzz_dir.join(&driver.ko).display())
+                module: runner::module_identity(self.fuzz_dir, driver).with_context(|| {
+                    format!(
+                        "hashing the modules of {name} under {}",
+                        self.fuzz_dir.display()
+                    )
                 })?,
                 kconfig: self.kconfig_sha.clone(),
                 syzkaller: Some(self.syz_sha.clone()),

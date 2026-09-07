@@ -149,6 +149,14 @@ pub struct Driver {
     /// directory silently drops those seven years and 225 commits.
     #[serde(default)]
     pub history_paths: Vec<PathBuf>,
+    /// Modules the driver needs loaded first, as kernel-tree-relative
+    /// paths (`mm/zsmalloc.ko`). Harvested beside the driver's own
+    /// module and inserted in this order before it; a driver whose
+    /// allocator or transport is a separate module cannot load without
+    /// them, and kconfig will not build a selected dependency into
+    /// the kernel while the driver that selects it is a module.
+    #[serde(default)]
+    pub deps: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

@@ -123,6 +123,9 @@ ko = "zram.ko"
 ko-dir = "drivers/block/zram/"
 device = "/dev/zram0"
 gitpath = "drivers/block/zram/"
+# zram's allocator is its own module, and kconfig keeps a dependency
+# selected by a module at =m, so it rides along and loads first.
+deps = ["mm/zsmalloc.ko"]
 insmod = "num_devices=1"
 prep = "echo 2G > /sys/block/zram0/disksize"
 

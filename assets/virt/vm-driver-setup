@@ -14,6 +14,14 @@ IFS=: read -r _role DRIVER KO _device INSMOD_PARAMS CONFIGFS_DIR CONFIGFS_PARAMS
 $DRIVER_SPEC
 EOF
 
+# Dependencies first, in the order the registry listed them (the
+# overlay prefixes each with its ordinal).
+for dep in /koxi/modules/deps/*.ko; do
+	[ -e "$dep" ] || continue
+	echo "Loading dependency $(basename "$dep")..."
+	insmod "$dep"
+done
+
 echo "Loading $DRIVER ($KO)..."
 if [ -n "$INSMOD_PARAMS" ]; then
 	# shellcheck disable=SC2086

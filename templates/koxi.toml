@@ -127,7 +127,11 @@ rev = "4f7b22a0cea479ab522e99815d78a4ad5784b1da"
 #   insmod           module parameters
 #   prep             a shell line the guest runs before the device appears
 #   configfs         configfs dir under /sys/kernel/config
-#   configfs-params  what to write into it
+#   configfs-params  what to write into it, comma-separated, in order
+#   deps             kernel-tree paths of modules to load first
+#                    (mm/zsmalloc.ko for zram), harvested alongside
+#   history-paths    where the source lived before gitpath, so commit
+#                    mining is not cut off at a move
 #   pair             (Rust only) the C driver this replaces
 #   abstractions     (Rust only) kernel-tree paths whose unsafe surface
 #                    is counted separately, so a driver body with no
