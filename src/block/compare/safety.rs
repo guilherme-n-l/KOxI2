@@ -20,6 +20,30 @@ use crate::block::cli::CompareOpts;
 use crate::util::{csv_text, round};
 
 /// ACSAC 2024 taxonomy: CWE -> what Rust does about it.
+/// CWE to what Rust does about it.
+///
+/// The three super-classes are the ACSAC 2024 (Li et al.) labels:
+/// auto_eliminated is their "Yes", needs_discipline their "Yes+P",
+/// unaffected their "No". The CWE encoding is *ours*: the string
+/// "CWE" appears nowhere in that paper, which classifies by named bug
+/// class. CWE is what a commit history yields mechanically and a
+/// named-class taxonomy is not, so the translation is deliberate —
+/// but it is a translation, with judgement in it, and it diverges
+/// from their labels in both directions:
+///
+/// - More generous than they are: they put null dereference (0/17/0),
+///   integer arithmetic (0/6/0) and buffer overflow (0/44/1) in
+///   "Yes+P", needing the programmer to reach for the checked
+///   operation; this table eliminates them outright.
+/// - More conservative: they eliminate 41 of 42 race conditions
+///   outright, their largest "Yes" group and the bulk of the 34.2%
+///   threshold, while CWE-362 here is unaffected. Likewise missing
+///   return value check (15/0/0), which they eliminate.
+/// - Anything unlisted falls to unaffected, which is the conservative
+///   direction: it can only lower the elimination rate.
+///
+/// Changing any of this moves the gate, so it is stated rather than
+/// silently corrected.
 const ACSAC_TAXONOMY: [(&str, &str); 9] = [
     ("CWE-787", "auto_eliminated"),  // out-of-bounds write
     ("CWE-416", "auto_eliminated"),  // use-after-free
@@ -364,8 +388,9 @@ pub fn compare_safety(
         "residual_unsafe_total": total_rs_unsafe,
     });
     let result = json!({
-        "methodology": "ACSAC 2024 taxonomy (Li et al.) + Evans et al. density metrics \
-                        + USENIX ATC 2024 abstraction accounting",
+        "methodology": "ACSAC 2024 (Li et al.) super-classes over a CWE encoding of our \
+                        own + Evans et al. density metrics + USENIX ATC 2024 abstraction \
+                        accounting",
         "data_quality": {"status": quality},
         "c_baseline": c_baseline.json,
         "rs_current": rs_current.json,

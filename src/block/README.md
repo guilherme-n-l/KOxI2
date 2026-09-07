@@ -53,6 +53,15 @@ Real campaigns need an x86_64 Linux host with `/dev/kvm` and enough
 RAM for the guests. `koxi block perf` and `koxi block fuzz` refuse a
 host that has neither, naming what is missing.
 
+`--longrun` is a long-run profile, not the published dataset's plan.
+That dataset was 10 fuzzing campaigns of 24 hours and 50 fio
+repetitions per cell, so reproducing it takes the campaign count
+explicitly:
+
+```sh
+koxi block all --longrun --fuzz-campaigns 10 --campaign paper
+```
+
 ## Commands
 
 | Command              | Purpose                                                                                 |

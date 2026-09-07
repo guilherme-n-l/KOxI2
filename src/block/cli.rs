@@ -171,7 +171,9 @@ knobs! {
     pub struct Profile(PROFILE) custom {
         /// Fast defaults for dev/CI.
         flag quick = "quick" / "QUICK";
-        /// Paper dataset defaults (30x24h fuzz campaigns).
+        /// Long-run defaults: 30 campaigns of 24h, 50 fio reps. Not
+        /// the published dataset's plan, which was 10 campaigns of
+        /// 24h; pass --fuzz-campaigns 10 to reproduce that.
         flag longrun = "longrun" / "LONGRUN";
         /// Run even on a host without KVM or memory for the guests
         /// (the numbers are then the user's problem, not data).

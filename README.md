@@ -271,13 +271,13 @@ measuring what they claimed.
 
 **Measurement defects fixed.** These changed numbers, not just code:
 
-| Defect in v1                                                                                                                          | v2                                                                                                                                               |
-| ------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| fio ran with the implicit `psync` engine, which silently caps iodepth at 1, so the queue-depth axis of the matrix measured nothing.   | `--fio-engine` defaults to `io_uring` and is identity-bearing, so an engine change re-baselines rather than pools.                               |
-| The safety-signal regex matched a bare `null` token, so every `null_blk:` commit subject counted as safety-related.                   | Classification rules live in the `static/classify.toml` asset, whose sha is part of the result identity; the driver's own name is not a signal.  |
-| Commit mining paged the GitHub API against a moving `HEAD` with a floating "4 years ago" window.                                      | History comes from a locked, blobless `git-meta` mirror at a pinned rev with an absolute `[block.static].since` bound. Offline and reproducible. |
-| The unsafe-surface scan globbed one directory level, silently skipping `rust/kernel/block/mq/*.rs` — where the unsafe actually lives. | The scan recurses, and counts `unsafe impl` alongside blocks and functions.                                                                      |
-| The bootstrap confidence interval was unseeded, so the verdict was not reproducible.                                                  | Seeded from the campaign manifest; the same results directory re-derives the same verdict.                                                       |
+| Defect in v1                                                                                                                                                                                                                  | v2                                                                                                                                               |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| fio ran with the implicit `psync` engine, which silently caps iodepth at 1, so the queue-depth axis of the matrix measured nothing.                                                                                           | `--fio-engine` defaults to `io_uring` and is identity-bearing, so an engine change re-baselines rather than pools.                               |
+| The safety-signal regex matched a bare `null` token, so every `null_blk:` commit subject counted as safety-related.                                                                                                           | Classification rules live in the `static/classify.toml` asset, whose sha is part of the result identity; the driver's own name is not a signal.  |
+| Commit mining paged the GitHub API against a moving `HEAD` with a floating "4 years ago" window.                                                                                                                              | History comes from a locked, blobless `git-meta` mirror at a pinned rev with an absolute `[block.static].since` bound. Offline and reproducible. |
+| The unsafe-surface scan globbed one directory level, silently skipping `rust/kernel/block/mq/*.rs` — where the unsafe actually lives — so the abstraction layer measured as having none and the abstraction ratio came out 0. | The scan recurses and counts `unsafe impl` alongside blocks and functions, so the layer a driver leans on is measured rather than missed.        |
+| The bootstrap confidence interval was unseeded, so the verdict was not reproducible.                                                                                                                                          | Seeded from the campaign manifest; the same results directory re-derives the same verdict.                                                       |
 
 **The statistics changed, and that is the substantive change.** v1
 asked each gate whether it could detect a difference. A rank test
@@ -364,6 +364,33 @@ each subcommand declares exactly the option groups it reads, so a
 branch's `--help` is the truth about what that branch consumes. Env
 var names are unchanged from v1 `block/scripts/flags`, and precedence
 is CLI over environment over default.
+
+## Known seams in the methodology
+
+Three places where the instrument and the methodology it implements do
+not line up exactly. None is a defect in the code; all are worth
+knowing before quoting a number.
+
+- **The CWE encoding is ours, not the ACSAC paper's.** The three
+  super-classes are theirs, and `auto_eliminated`, `needs_discipline`
+  and `unaffected` are exactly their Yes, Yes+P and No. The CWE
+  identifiers are a translation layer, because CWE is what a commit
+  history yields mechanically and a named-class taxonomy is not. It
+  diverges in both directions: more generous than they are on null
+  dereference, integer arithmetic and buffer overflow, and more
+  conservative on race conditions, which they eliminate outright and
+  which carry the bulk of their 34.2% threshold. The table in
+  `src/block/compare/safety.rs` records this divergence next to the
+  mapping it applies to.
+- **An unmeasured screening dimension scores nothing, not "low".** A
+  domain with no cached baseline is reported as unavailable and
+  excluded from the mean rather than dragged toward zero. That is the
+  honest reading of missing evidence, but it means a driver screened
+  on partial data is scored on the dimensions that ran, not penalized
+  for the ones that did not.
+- **`--longrun` is not the published dataset's plan.** It is a
+  long-run profile of 30 campaigns; the published dataset used 10.
+  The block harness README carries the exact reproduction command.
 
 ## Known limitations
 
