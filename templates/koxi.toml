@@ -69,16 +69,18 @@ url = "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.19.tar.xz"
 # git-meta is a bare history mirror used for commit mining. It is never
 # checked out or built.
 #
-# koxi asks for --filter=blob:none, but that is a request: a server
-# without partial-clone support answers "filtering not recognized by
-# server, ignoring" and sends the whole history anyway. git.kernel.org
-# is one of those, so this mirror lands at ~3.8 GB and takes tens of
-# minutes on a first setup. koxi says so when it happens. Point this at
-# a mirror that implements partial clone if that cost matters to you --
-# the rev below resolves to the same commit either way, so the mined
-# history, and the lock, are unchanged.
+# koxi asks for --filter=blob:none, but that is a request, not a
+# guarantee: a server without partial-clone support answers "filtering
+# not recognized by server, ignoring" and sends the whole history
+# anyway, exiting 0. koxi warns when that happens and reports the size
+# either way.
+#
+# git.kernel.org is one of those servers. Measured on the same host:
+# 3.8 GB in ~40 min from git.kernel.org, 2.0 GB in ~5 min from the
+# GitHub mirror below, which honours the filter. Both resolve v6.19 to
+# the same commit, so the mined history and the lock are identical.
 [sources.linux-meta]
-git-meta = "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
+git-meta = "https://github.com/torvalds/linux.git"
 rev = "v6.19"
 
 [sources.busybox]
