@@ -13,8 +13,12 @@
 # ---------------------------------------------------------------------
 # Toolchain
 # ---------------------------------------------------------------------
-# cc is the C compiler for the kernel build; --cc or the CC env var
-# override it for one-off runs. target uses kbuild vocabulary (only
+# toolchain selects the binutils set: "gnu" (gcc, the default) or
+# "llvm" (clang plus ld.lld and the llvm-* tools, kbuild's LLVM=1).
+# cc narrows which compiler *within* that toolchain, e.g. clang-21;
+# --toolchain/--cc or KOXI_TOOLCHAIN/KOXI_CC override for one-off runs.
+# koxi reads KOXI_CC rather than CC on purpose: build environments set
+# CC for their own reasons, and that would silently override this. target uses kbuild vocabulary (only
 # x86_64 today). extra-artifacts are kernel-tree-relative files
 # harvested out of the fuzz-flavor build and sha-locked, because the
 # build scratch is deleted afterwards; vmlinux is what syzkaller needs

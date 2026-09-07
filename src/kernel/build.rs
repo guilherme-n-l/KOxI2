@@ -22,6 +22,7 @@ use tracing::{debug, info, warn};
 
 use crate::assets::{self, Loaded};
 use crate::cmd;
+use crate::config::Toolchain;
 use crate::fetch::{self, Ctx};
 use crate::lock::{Lock, LockedSource};
 use crate::scratch::Scratch;
@@ -39,6 +40,11 @@ pub const BZIMAGE: &str = "bzImage";
 /// The effective post-olddefconfig .config, harvested per flavor for
 /// auditability (and for syzkaller, which wants the config file).
 pub const EFFECTIVE_CONFIG: &str = "config";
+
+/// Build provenance dropped next to the artifacts. The artifact shas
+/// already tell two builds apart, but a sha does not say *what* built
+/// it, and a results directory outlives the run that produced it.
+pub const PROVENANCE: &str = "toolchain";
 
 /// A kernel build variant: the base config asset, plus (for Fuzz) a
 /// kconfig fragment asset merged in with the kernel's own
@@ -126,6 +132,10 @@ pub struct Options {
     pub cc: String,
     /// Build target arch in kbuild vocabulary (see [`kbuild_arch`]).
     pub target: String,
+    /// Which binutils set the build uses. Threaded through every make
+    /// invocation, configure included: a clang configure with a gcc
+    /// compile is a silent mismatch.
+    pub toolchain: Toolchain,
     /// Kernel modules to harvest into artifacts/ after the build.
     pub modules: Vec<Module>,
     /// Kconfig directives (fragment syntax) that the settled .config
@@ -214,7 +224,7 @@ impl Inputs {
 
         let (kconfig, fragment) = load_configs(ctx, opts.flavor)?;
         let (tarball, stem) = fetch::tarball_path(SOURCE, ctx)?;
-        let toolchain = toolchain_id(&opts.cc);
+        let toolchain = toolchain_id(opts.toolchain, &opts.cc);
         let expected = fingerprint(
             &locked_source_sha(ctx.lock)?,
             &kconfig.sha256,
@@ -301,12 +311,18 @@ fn configure(ctx: &Ctx, opts: &Options, inputs: &Inputs, tree: &Path) -> Result<
     }
 
     if opts.menuconfig {
-        menuconfig(tree, inputs.arch, &opts.cc)?;
+        menuconfig(tree, inputs.arch, opts.toolchain, &opts.cc)?;
     }
 
     info!("configuring kernel (olddefconfig)");
     cmd::status(
-        make(tree, inputs.arch, &opts.cc, &["olddefconfig"]),
+        make(
+            tree,
+            inputs.arch,
+            opts.toolchain,
+            &opts.cc,
+            &["olddefconfig"],
+        ),
         "make-olddefconfig",
         logs,
     )?;
@@ -347,7 +363,13 @@ fn compile(opts: &Options, inputs: &Inputs, tree: &Path, logs: &Path) -> Result<
         logs.join("make-kernel.log").display()
     );
     Ok(cmd::status(
-        make(tree, inputs.arch, &opts.cc, &["-j", &jobs.to_string()]),
+        make(
+            tree,
+            inputs.arch,
+            opts.toolchain,
+            &opts.cc,
+            &["-j", &jobs.to_string()],
+        ),
         "make-kernel",
         logs,
     )?)
@@ -363,6 +385,19 @@ fn harvest(ctx: &mut Ctx, opts: &Options, inputs: &Inputs, tree: &Path) -> Resul
     }
     fs::create_dir_all(&inputs.outdir)?;
     fs::copy(&bzimage, &inputs.artifact)?;
+
+    // Say which toolchain produced these. The shas discriminate a
+    // clang kernel from a gcc one, but nobody reading a results
+    // directory can tell which is which from a sha.
+    fs::write(
+        inputs.outdir.join(PROVENANCE),
+        format!(
+            "toolchain={}\ncc={}\ncc_version={}\n",
+            opts.toolchain.name(),
+            opts.cc,
+            util::probe_version(&opts.cc, &["--version"], "unknown")
+        ),
+    )?;
     ctx.lock
         .artifacts
         .insert(key(BZIMAGE), util::sha256_file(&inputs.artifact)?);
@@ -463,31 +498,36 @@ fn dropped_directives(directives: &str, config: &str) -> Vec<String> {
 
 /// Compiler identity (the configured CC + rustc when present); a
 /// toolchain bump must rebuild even with identical source and config.
-fn toolchain_id(cc: &str) -> String {
+fn toolchain_id(toolchain: Toolchain, cc: &str) -> String {
+    // The toolchain name is part of the identity, not decoration:
+    // without it a gnu -> llvm switch keeps the same fingerprint,
+    // the cached kernel is reused, and the comparison is a binary
+    // against itself.
     format!(
-        "{}|{}",
+        "{}|{}|{}",
+        toolchain.name(),
         util::probe_version(cc, &["--version"], "none"),
         util::probe_version("rustc", &["--version"], "none")
     )
 }
 
-fn make(tree: &Path, arch: &str, cc: &str, args: &[&str]) -> Command {
+fn make(tree: &Path, arch: &str, toolchain: Toolchain, cc: &str, args: &[&str]) -> Command {
     let mut cmd = Command::new("make");
-    cmd.arg("-C")
-        .arg(tree)
-        .arg(format!("ARCH={arch}"))
-        .arg(format!("CC={cc}"))
-        .args(args);
+    cmd.arg("-C").arg(tree).arg(format!("ARCH={arch}"));
+    // LLVM=1 before CC: it selects the assembler, linker and the whole
+    // binutils set, and CC only narrows which clang within that.
+    cmd.args(toolchain.make_vars());
+    cmd.arg(format!("CC={cc}")).args(args);
     cmd
 }
 
 /// Interactive `make menuconfig`, inheriting the terminal.
-fn menuconfig(tree: &Path, arch: &str, cc: &str) -> Result<(), Error> {
+fn menuconfig(tree: &Path, arch: &str, toolchain: Toolchain, cc: &str) -> Result<(), Error> {
     if !std::io::stdin().is_terminal() {
         return Err(Error::MenuconfigNeedsTty);
     }
     info!("running menuconfig");
-    let status = make(tree, arch, cc, &["menuconfig"])
+    let status = make(tree, arch, toolchain, cc, &["menuconfig"])
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -540,7 +580,9 @@ pub enum Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{dropped_directives, verify_fragment};
+    use super::{dropped_directives, make, toolchain_id, verify_fragment};
+    use crate::config::Toolchain;
+    use std::path::Path;
 
     #[test]
     fn fragment_verification_catches_vetoed_symbols() {
@@ -579,5 +621,43 @@ mod tests {
         // A registry with no Rust driver requires nothing of Rust.
         assert!(dropped_directives("", settled).is_empty());
         assert!(dropped_directives("CONFIG_CONFIGFS_FS=y", settled).is_empty());
+    }
+
+    /// LLVM=1 has to reach every make invocation, configure included:
+    /// a clang configure with a gcc compile is a silent mismatch, and
+    /// olddefconfig resolves compiler-dependent symbols.
+    #[test]
+    fn the_llvm_toolchain_reaches_the_make_command_line() {
+        let args = |toolchain, cc| {
+            let cmd = make(Path::new("/t"), "x86_64", toolchain, cc, &["olddefconfig"]);
+            cmd.get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        let gnu = args(Toolchain::Gnu, "gcc");
+        assert!(gnu.contains(&"CC=gcc".to_owned()));
+        assert!(
+            !gnu.iter().any(|arg| arg.starts_with("LLVM")),
+            "the GNU chain is kbuild's default and names no variable"
+        );
+
+        let llvm = args(Toolchain::Llvm, "clang-21");
+        assert!(llvm.contains(&"LLVM=1".to_owned()));
+        assert!(
+            llvm.contains(&"CC=clang-21".to_owned()),
+            "cc still narrows which clang"
+        );
+        assert!(llvm.contains(&"olddefconfig".to_owned()));
+    }
+
+    /// Without the toolchain in the fingerprint a gnu -> llvm switch
+    /// reuses the cached kernel, and the comparison is a binary
+    /// against itself.
+    #[test]
+    fn the_toolchain_is_part_of_the_build_fingerprint() {
+        assert_ne!(
+            toolchain_id(Toolchain::Gnu, "cc"),
+            toolchain_id(Toolchain::Llvm, "cc")
+        );
     }
 }

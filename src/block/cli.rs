@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use clap::{Arg, ArgMatches, Command};
 
 use crate::cli::{exclusive, flag_value, knobs, source, value, Error, GuestOpts, Source, VmOpts};
+use crate::config::{BuildConfig, Toolchain};
 
 const SELECTION: &str = "Selection";
 const PHASE: &str = "Phase";
@@ -25,8 +26,21 @@ const STATIC: &str = "Static analysis";
 const SCREENING: &str = "Screening";
 const COMPARE: &str = "Compare";
 
-/// The compiler when neither the CLI/env nor `koxi.toml` names one.
-pub const DEFAULT_CC: &str = "gcc";
+/// Toolchain first, then the compiler within it: the CLI/env knob,
+/// then koxi.toml's [build] table, then the toolchain's own compiler.
+fn resolve_toolchain(
+    toolchain: Option<Toolchain>,
+    cc: Option<String>,
+    build: Option<&BuildConfig>,
+) -> (Toolchain, String) {
+    let toolchain = toolchain
+        .or_else(|| build.and_then(|build| build.toolchain))
+        .unwrap_or_default();
+    let cc = cc
+        .or_else(|| build.and_then(|build| build.cc.clone()))
+        .unwrap_or_else(|| toolchain.default_cc().to_owned());
+    (toolchain, cc)
+}
 
 /// The `koxi block` subcommand tree, mirroring v1 `block/run`.
 pub fn command() -> Command {
@@ -42,6 +56,7 @@ pub fn command() -> Command {
         .subcommand(
             Command::new("test")
                 .about("Verify system deps, user config, and setup state")
+                .arg(BuildOpts::arg("toolchain"))
                 .arg(BuildOpts::arg("cc")),
         )
         .subcommand(
@@ -199,10 +214,17 @@ knobs! {
     /// What `koxi block setup` builds and how.
     #[derive(Debug, Clone)]
     pub struct BuildOpts(BUILD) {
-        /// C compiler for the kernel build, e.g. clang (default:
-        /// koxi.toml [build].cc, else gcc; note CC is often already
-        /// set in the environment, nix included).
-        opt cc: String = "cc" / "CC", "compiler";
+        /// Kernel build toolchain: gnu (gcc + GNU binutils) or llvm
+        /// (clang + LLVM binutils, kbuild's LLVM=1). Default:
+        /// koxi.toml [build].toolchain, else gnu.
+        opt toolchain: Toolchain = "toolchain" / "KOXI_TOOLCHAIN", "gnu|llvm";
+        /// C compiler for the kernel build, overriding the toolchain's
+        /// own default (gcc for gnu, clang for llvm) -- e.g. clang-21.
+        /// Default: koxi.toml [build].cc. Reads KOXI_CC, not CC: build
+        /// environments set CC for their own reasons (a nix shell with
+        /// clang in it exports CC=clang), and that would silently
+        /// override the toolchain the project declared.
+        opt cc: String = "cc" / "KOXI_CC", "compiler";
         /// Force kernel rebuild (also nukes the extracted tree).
         flag force_build = "force-build" / "FORCE_BUILD";
         /// Run `make menuconfig`, persist .config, force rebuild.
@@ -217,8 +239,27 @@ knobs! {
 impl BuildOpts {
     /// The compiler with no project config to consult (`block test`,
     /// which probes the toolchain and builds nothing).
-    pub fn cc_or_default(matches: &ArgMatches) -> Result<String, Error> {
-        Ok(value(matches, "cc", "CC")?.unwrap_or_else(|| DEFAULT_CC.to_owned()))
+    /// The toolchain and the C compiler for a kernel build: the
+    /// CLI/env knob first, then koxi.toml's [build] table, then the
+    /// toolchain's own compiler. Resolved together because `cc` is an
+    /// override *within* a toolchain -- `LLVM=1` swaps the assembler,
+    /// linker and binutils as a set, so it can never be a cc value.
+    pub fn toolchain_and_cc(&self, build: Option<&BuildConfig>) -> (Toolchain, String) {
+        resolve_toolchain(self.toolchain, self.cc.clone(), build)
+    }
+
+    /// The same resolution for a subcommand that declares only these
+    /// two knobs instead of the whole build group -- `block test`
+    /// takes no --force-build, so it cannot be read as a BuildOpts.
+    pub fn toolchain_probe(
+        matches: &ArgMatches,
+        build: Option<&BuildConfig>,
+    ) -> Result<(Toolchain, String), Error> {
+        Ok(resolve_toolchain(
+            value(matches, "toolchain", "KOXI_TOOLCHAIN")?,
+            value(matches, "cc", "KOXI_CC")?,
+            build,
+        ))
     }
 }
 
@@ -551,7 +592,7 @@ mod tests {
     /// only when neither the flag nor the environment named one.
     #[test]
     fn cc_comes_from_the_cli_then_the_environment() {
-        with_env(&[("CC", "clang")], || {
+        with_env(&[("KOXI_CC", "clang")], || {
             assert_eq!(
                 BuildOpts::from_matches(&parse(&["setup"]))
                     .unwrap()
@@ -560,8 +601,78 @@ mod tests {
                 Some("clang")
             );
             assert_eq!(
-                BuildOpts::cc_or_default(&parse(&["test", "--cc", "gcc-13"])).unwrap(),
+                BuildOpts::toolchain_probe(&parse(&["test", "--cc", "gcc-13"]), None)
+                    .unwrap()
+                    .1,
                 "gcc-13"
+            );
+        });
+    }
+
+    /// `LLVM=1` swaps the assembler, the linker and the binutils as a
+    /// set, so it is a toolchain and never a value of `cc`; `cc` only
+    /// narrows which compiler within the toolchain.
+    #[test]
+    fn the_toolchain_picks_the_compiler_and_cc_narrows_it() {
+        let opts = |args: &[&str]| BuildOpts::from_matches(&parse(args)).unwrap();
+        let bare: Option<&BuildConfig> = None;
+
+        assert_eq!(
+            opts(&["setup"]).toolchain_and_cc(bare),
+            (Toolchain::Gnu, "gcc".to_owned()),
+            "gnu is the default and brings gcc with it"
+        );
+        assert_eq!(
+            opts(&["setup", "--toolchain", "llvm"]).toolchain_and_cc(bare),
+            (Toolchain::Llvm, "clang".to_owned()),
+            "llvm brings clang without anyone naming it"
+        );
+        assert_eq!(
+            opts(&["setup", "--toolchain", "llvm", "--cc", "clang-21"]).toolchain_and_cc(bare),
+            (Toolchain::Llvm, "clang-21".to_owned()),
+            "cc narrows within the toolchain"
+        );
+
+        // koxi.toml supplies both, and the flag beats the file.
+        let declared = BuildConfig {
+            toolchain: Some(Toolchain::Llvm),
+            cc: Some("clang-20".to_owned()),
+            ..BuildConfig::default()
+        };
+        assert_eq!(
+            opts(&["setup"]).toolchain_and_cc(Some(&declared)),
+            (Toolchain::Llvm, "clang-20".to_owned())
+        );
+        assert_eq!(
+            opts(&["setup", "--toolchain", "gnu"])
+                .toolchain_and_cc(Some(&declared))
+                .0,
+            Toolchain::Gnu,
+            "the flag overrides the project's declaration"
+        );
+
+        // The env layer parses with FromStr, not clap's value_parser.
+        with_env(&[("KOXI_TOOLCHAIN", "llvm")], || {
+            assert_eq!(opts(&["setup"]).toolchain_and_cc(bare).0, Toolchain::Llvm);
+        });
+        with_env(&[("KOXI_TOOLCHAIN", "nonsense")], || {
+            assert!(BuildOpts::from_matches(&parse(&["setup"])).is_err());
+        });
+    }
+
+    /// nixpkgs' cc-wrapper exports CC=clang the moment clang is in the
+    /// shell, and the dev shell ships clang for the llvm toolchain. A
+    /// knob reading CC would therefore turn the default gnu build into
+    /// clang driving GNU binutils, silently -- the exact mismatch the
+    /// toolchain selection exists to prevent.
+    #[test]
+    fn the_ambient_cc_does_not_decide_the_toolchain() {
+        with_env(&[("CC", "clang"), ("CXX", "clang++")], || {
+            let opts = BuildOpts::from_matches(&parse(&["setup"])).unwrap();
+            assert_eq!(
+                opts.toolchain_and_cc(None),
+                (Toolchain::Gnu, "gcc".to_owned()),
+                "the environment's CC is not the project's toolchain"
             );
         });
     }

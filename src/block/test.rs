@@ -11,10 +11,24 @@ use std::process::Command;
 
 use anyhow::bail;
 
+use crate::config::Toolchain;
 use crate::{cmd, fetch};
 
 /// Tools the kernel/userland build chain shells out to (Linux only).
 const KERNEL_TOOLS: &[&str] = &["make", "flex", "bison", "bc", "perl", "pahole"];
+
+/// The binutils `LLVM=1` selects. Required only under that
+/// toolchain, and checked here so a missing one fails preflight
+/// instead of partway into a kernel build.
+const LLVM_TOOLS: &[&str] = &[
+    "ld.lld",
+    "llvm-ar",
+    "llvm-nm",
+    "llvm-objcopy",
+    "llvm-strip",
+    "llvm-readelf",
+    "llvm-objdump",
+];
 
 /// Tools later phases shell out to; missing ones warn rather than
 /// fail so setup-only hosts still pass.
@@ -30,7 +44,7 @@ const PHASE_TOOLS: &[&str] = &[
     "bindgen",
 ];
 
-pub fn drive(cc: &str, logs: &Path) -> anyhow::Result<()> {
+pub fn drive(toolchain: Toolchain, cc: &str, logs: &Path) -> anyhow::Result<()> {
     let mut missing = false;
 
     let mut require = |tool: &str| {
@@ -45,9 +59,15 @@ pub fn drive(cc: &str, logs: &Path) -> anyhow::Result<()> {
         require(tool);
     }
     if cfg!(target_os = "linux") {
+        println!("info     kernel toolchain: {} (CC={cc})", toolchain.name());
         require(cc);
         for tool in KERNEL_TOOLS {
             require(tool);
+        }
+        if toolchain == Toolchain::Llvm {
+            for tool in LLVM_TOOLS {
+                require(tool);
+            }
         }
     }
 

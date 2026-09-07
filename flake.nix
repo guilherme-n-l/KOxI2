@@ -85,6 +85,20 @@
                 krustPkgs.rustc
                 krustPkgs.rust-bindgen
                 krustPkgs.rustfmt
+                # The LLVM chain for [build].toolchain = "llvm", which
+                # builds the kernel with kbuild's LLVM=1: clang plus
+                # ld.lld and the llvm-* binutils, since LLVM=1 swaps
+                # all of them together. Deliberately from krustPkgs,
+                # the same set that provides rust-bindgen above:
+                # bindgen resolves libclang, and the kernel's
+                # rust_is_available.sh checks that libclang against the
+                # C compiler. Pulling clang from a different set risks
+                # a version skew that silently drops CONFIG_RUST --
+                # which the build's required-config assertion now
+                # catches, but a matched pair avoids entirely.
+                krustPkgs.clang
+                krustPkgs.lld
+                krustPkgs.llvm
               ]
             )
             # Archive / download

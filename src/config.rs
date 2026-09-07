@@ -53,7 +53,11 @@ pub struct BaremetalConfig {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BuildConfig {
-    /// C compiler name or path (default: gcc).
+    /// Toolchain for the kernel build: gnu or llvm (default: gnu).
+    #[serde(default)]
+    pub toolchain: Option<Toolchain>,
+    /// C compiler name or path, overriding the toolchain's default
+    /// (gcc for gnu, clang for llvm).
     #[serde(default)]
     pub cc: Option<String>,
     /// Build target arch in kbuild vocabulary (default: x86_64).
@@ -145,6 +149,62 @@ pub struct Driver {
 pub enum Role {
     C,
     Rs,
+}
+
+/// Which toolchain builds the kernel. `LLVM=1` is not a value of `cc`:
+/// it swaps the assembler, the linker and the whole binutils set
+/// together, so it is a selection of its own with `cc` left as the
+/// narrow override *within* it (clang-21 instead of clang, say).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Toolchain {
+    #[default]
+    Gnu,
+    Llvm,
+}
+
+impl Toolchain {
+    /// The C compiler the toolchain implies when `cc` is not set.
+    pub fn default_cc(self) -> &'static str {
+        match self {
+            Self::Gnu => "gcc",
+            Self::Llvm => "clang",
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Gnu => "gnu",
+            Self::Llvm => "llvm",
+        }
+    }
+
+    /// The make variables that select it. `LLVM=1` is what kbuild
+    /// documents (Documentation/kbuild/llvm.rst); there is no
+    /// corresponding variable for the GNU chain, which is the default.
+    pub fn make_vars(self) -> &'static [&'static str] {
+        match self {
+            Self::Gnu => &[],
+            Self::Llvm => &["LLVM=1"],
+        }
+    }
+}
+
+/// The knob layer parses env values with `raw.parse::<T>()` and clap
+/// resolves `value_parser!` through `FromStr` too, so a knob whose type
+/// is not a std primitive has to provide this. Accepts the compiler
+/// names as aliases because `--toolchain clang` is what a reader of
+/// kbuild's llvm.rst will reach for.
+impl std::str::FromStr for Toolchain {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "gnu" | "gcc" => Ok(Self::Gnu),
+            "llvm" | "clang" => Ok(Self::Llvm),
+            other => Err(format!("expected gnu or llvm, got {other:?}")),
+        }
+    }
 }
 
 impl Config {

@@ -22,7 +22,7 @@ use cli::{
 };
 
 use crate::cli::{Globals, GuestOpts, VmOpts};
-use crate::config::{Config, Driver, Role};
+use crate::config::{Config, Driver, Project, Role};
 use crate::host;
 
 /// Dispatch a parsed `koxi block <command>` invocation. Each arm
@@ -32,7 +32,18 @@ pub fn run(matches: &ArgMatches, globals: &Globals, logs: &Path) -> anyhow::Resu
     let (name, sub) = matches.subcommand().expect("subcommand is required");
     match name {
         "setup" => setup::drive(&BuildOpts::from_matches(sub)?, globals.yes, logs)?,
-        "test" => test::drive(&BuildOpts::cc_or_default(sub)?, logs)?,
+        "test" => {
+            // Preflight has to check the toolchain the project would
+            // actually build with, so it consults koxi.toml's [build]
+            // table when there is a project; without one it still
+            // checks whatever the CLI or environment selected.
+            let project = Project::locate().ok();
+            let (toolchain, cc) = BuildOpts::toolchain_probe(
+                sub,
+                project.as_ref().map(|project| &project.config.build),
+            )?;
+            test::drive(toolchain, &cc, logs)?;
+        }
         "perf" => {
             let profile = Profile::from_matches(sub)?;
             perf::drive(

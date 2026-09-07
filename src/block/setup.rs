@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Context};
 use tracing::{info, warn};
 
-use crate::block::cli::{BuildOpts, DEFAULT_CC};
+use crate::block::cli::BuildOpts;
 use crate::config::{Project, Role};
 use crate::fetch::Ctx;
 use crate::home::{self, CacheLock};
@@ -53,11 +53,7 @@ fn build_all(ctx: &mut Ctx, opts: &BuildOpts) -> anyhow::Result<()> {
     info!("kernel history mirror ready at {}", history.display());
     // CLI/env --cc beats koxi.toml [build].cc beats the gcc default;
     // target comes from [build].target.
-    let cc = opts
-        .cc
-        .clone()
-        .or_else(|| ctx.config.build.cc.clone())
-        .unwrap_or_else(|| DEFAULT_CC.to_owned());
+    let (toolchain, cc) = opts.toolchain_and_cc(Some(&ctx.config.build));
     let target = ctx
         .config
         .build
@@ -122,6 +118,7 @@ fn build_all(ctx: &mut Ctx, opts: &BuildOpts) -> anyhow::Result<()> {
             cc: cc.clone(),
             target: target.clone(),
             modules: modules.clone(),
+            toolchain,
             required_config: required_config.clone(),
             flavor: kernel::build::Flavor::Clean,
         },
@@ -136,6 +133,7 @@ fn build_all(ctx: &mut Ctx, opts: &BuildOpts) -> anyhow::Result<()> {
             cc,
             target,
             modules: fuzz_modules,
+            toolchain,
             required_config,
             flavor: kernel::build::Flavor::Fuzz,
         },
