@@ -99,6 +99,17 @@
                 krustPkgs.clang
                 krustPkgs.lld
                 krustPkgs.llvm
+                # bfd.h, for objtool. Its Makefile decides whether to
+                # build the disassembler by *linking* a probe against
+                # -lopcodes -lbfd -liberty, declaring the symbol itself
+                # rather than including a header. Under clang that probe
+                # links, so -DDISAS goes on and the build then includes
+                # <bfd.h> -- which nixpkgs keeps in a separate dev
+                # output, so it is absent and objtool fails. (Under gcc
+                # the probe does not link, DISAS stays off, and the
+                # mismatch never shows.) Giving it the headers makes the
+                # build agree with the probe.
+                libbfd.dev
               ]
             )
             # Archive / download
@@ -138,6 +149,18 @@
             # (fixdep died of a circular IFUNC this way). The syzkaller
             # build scopes it so the executor's -static probe passes.
             GLIBC_STATIC_LIB = "${pkgs.glibc.static}/lib";
+            # The kernel's target compiler for [build].toolchain =
+            # "llvm". It must be the *unwrapped* clang: the wrapper
+            # injects -nostdlibinc, clang calls that unused on the
+            # compilations that ignore it, and the kernel's -Werror
+            # makes it fatal. Most of the tree can be quieted with
+            # kbuild's user-append variables, but arch/x86/realmode and
+            # drivers/firmware/efi/libstub rebuild KBUILD_CFLAGS from
+            # scratch, so nothing reaches them. Target compiles need no
+            # libc anyway (-nostdinc); HOSTCC is left alone, because
+            # host tools do want the wrapper, and LLVM=1 takes that
+            # from PATH.
+            KOXI_LLVM_CC = "${krustPkgs.llvmPackages.clang-unwrapped}/bin/clang";
           };
 
           # Dev-only helpers; never needed to build or run koxi.

@@ -517,6 +517,32 @@ fn make(tree: &Path, arch: &str, toolchain: Toolchain, cc: &str, args: &[&str]) 
     // LLVM=1 before CC: it selects the assembler, linker and the whole
     // binutils set, and CC only narrows which clang within that.
     cmd.args(toolchain.make_vars());
+    if toolchain == Toolchain::Llvm {
+        // A wrapped clang (nixpkgs' is one) is handed -nostdlibinc, and
+        // clang calls that an unused argument for every compilation
+        // that does not consume it. The kernel builds with -Werror, so
+        // the warning is fatal.
+        //
+        // It has to go on all five of kbuild's user-append variables,
+        // not just KCFLAGS: the flag reaches C compiles (KCFLAGS),
+        // assembly (KAFLAGS -- arch/x86/boot/startup/efi-mixed.o),
+        // preprocess-only runs (KCPPFLAGS -- scripts/module.lds), and
+        // the host compilers, which LLVM=1 also points at clang
+        // (HOSTCFLAGS, HOSTCXXFLAGS). Covering only the first two got
+        // thirty minutes into the build before dying on the third.
+        //
+        // For an unwrapped clang this suppresses a warning that never
+        // fires, so it costs nothing.
+        for var in [
+            "KCFLAGS",
+            "KAFLAGS",
+            "KCPPFLAGS",
+            "HOSTCFLAGS",
+            "HOSTCXXFLAGS",
+        ] {
+            cmd.arg(format!("{var}=-Wno-unused-command-line-argument"));
+        }
+    }
     cmd.arg(format!("CC={cc}")).args(args);
     cmd
 }

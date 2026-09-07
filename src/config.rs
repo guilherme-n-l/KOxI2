@@ -179,6 +179,25 @@ impl Toolchain {
         }
     }
 
+    /// A compiler the *environment* names for this toolchain, used
+    /// when nothing else does. It exists because the bare name on PATH
+    /// is not always the right binary: the kernel's freestanding
+    /// sub-builds (realmode, the EFI stub) rebuild KBUILD_CFLAGS from
+    /// scratch, so no user-append variable reaches them, and a clang
+    /// wrapper that injects `-nostdlibinc` therefore cannot compile
+    /// them under `-Werror`. Only the target compiler is affected --
+    /// HOSTCC still wants the wrapper, and `LLVM=1` picks that up from
+    /// PATH on its own.
+    pub fn env_cc(self) -> Option<String> {
+        let key = match self {
+            Self::Gnu => "KOXI_GNU_CC",
+            Self::Llvm => "KOXI_LLVM_CC",
+        };
+        std::env::var(key)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    }
+
     /// The make variables that select it. `LLVM=1` is what kbuild
     /// documents (Documentation/kbuild/llvm.rst); there is no
     /// corresponding variable for the GNU chain, which is the default.

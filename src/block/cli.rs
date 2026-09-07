@@ -38,6 +38,7 @@ fn resolve_toolchain(
         .unwrap_or_default();
     let cc = cc
         .or_else(|| build.and_then(|build| build.cc.clone()))
+        .or_else(|| toolchain.env_cc())
         .unwrap_or_else(|| toolchain.default_cc().to_owned());
     (toolchain, cc)
 }
@@ -617,21 +618,27 @@ mod tests {
         let opts = |args: &[&str]| BuildOpts::from_matches(&parse(args)).unwrap();
         let bare: Option<&BuildConfig> = None;
 
-        assert_eq!(
-            opts(&["setup"]).toolchain_and_cc(bare),
-            (Toolchain::Gnu, "gcc".to_owned()),
-            "gnu is the default and brings gcc with it"
-        );
-        assert_eq!(
-            opts(&["setup", "--toolchain", "llvm"]).toolchain_and_cc(bare),
-            (Toolchain::Llvm, "clang".to_owned()),
-            "llvm brings clang without anyone naming it"
-        );
-        assert_eq!(
-            opts(&["setup", "--toolchain", "llvm", "--cc", "clang-21"]).toolchain_and_cc(bare),
-            (Toolchain::Llvm, "clang-21".to_owned()),
-            "cc narrows within the toolchain"
-        );
+        // Under the env guard even though it sets nothing: resolution
+        // consults KOXI_*_CC, and cargo runs tests on parallel threads,
+        // so asserting a *default* outside the lock can observe a value
+        // another test is holding.
+        with_env(&[], || {
+            assert_eq!(
+                opts(&["setup"]).toolchain_and_cc(bare),
+                (Toolchain::Gnu, "gcc".to_owned()),
+                "gnu is the default and brings gcc with it"
+            );
+            assert_eq!(
+                opts(&["setup", "--toolchain", "llvm"]).toolchain_and_cc(bare),
+                (Toolchain::Llvm, "clang".to_owned()),
+                "llvm brings clang without anyone naming it"
+            );
+            assert_eq!(
+                opts(&["setup", "--toolchain", "llvm", "--cc", "clang-21"]).toolchain_and_cc(bare),
+                (Toolchain::Llvm, "clang-21".to_owned()),
+                "cc narrows within the toolchain"
+            );
+        });
 
         // koxi.toml supplies both, and the flag beats the file.
         let declared = BuildConfig {
@@ -639,21 +646,47 @@ mod tests {
             cc: Some("clang-20".to_owned()),
             ..BuildConfig::default()
         };
-        assert_eq!(
-            opts(&["setup"]).toolchain_and_cc(Some(&declared)),
-            (Toolchain::Llvm, "clang-20".to_owned())
-        );
-        assert_eq!(
-            opts(&["setup", "--toolchain", "gnu"])
-                .toolchain_and_cc(Some(&declared))
-                .0,
-            Toolchain::Gnu,
-            "the flag overrides the project's declaration"
-        );
+        with_env(&[], || {
+            assert_eq!(
+                opts(&["setup"]).toolchain_and_cc(Some(&declared)),
+                (Toolchain::Llvm, "clang-20".to_owned())
+            );
+            assert_eq!(
+                opts(&["setup", "--toolchain", "gnu"])
+                    .toolchain_and_cc(Some(&declared))
+                    .0,
+                Toolchain::Gnu,
+                "the flag overrides the project's declaration"
+            );
+        });
 
         // The env layer parses with FromStr, not clap's value_parser.
         with_env(&[("KOXI_TOOLCHAIN", "llvm")], || {
             assert_eq!(opts(&["setup"]).toolchain_and_cc(bare).0, Toolchain::Llvm);
+        });
+
+        // An environment may name the compiler for a toolchain when the
+        // bare name on PATH is the wrong binary, but only for that
+        // toolchain, and never over an explicit choice.
+        with_env(&[("KOXI_LLVM_CC", "/store/unwrapped/clang")], || {
+            assert_eq!(
+                opts(&["setup", "--toolchain", "llvm"])
+                    .toolchain_and_cc(bare)
+                    .1,
+                "/store/unwrapped/clang"
+            );
+            assert_eq!(
+                opts(&["setup"]).toolchain_and_cc(bare).1,
+                "gcc",
+                "the llvm hook does not touch the gnu toolchain"
+            );
+            assert_eq!(
+                opts(&["setup", "--toolchain", "llvm", "--cc", "clang-21"])
+                    .toolchain_and_cc(bare)
+                    .1,
+                "clang-21",
+                "an explicit --cc still wins"
+            );
         });
         with_env(&[("KOXI_TOOLCHAIN", "nonsense")], || {
             assert!(BuildOpts::from_matches(&parse(&["setup"])).is_err());
