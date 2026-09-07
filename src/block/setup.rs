@@ -4,7 +4,7 @@ use anyhow::{anyhow, Context};
 use tracing::{info, warn};
 
 use crate::block::cli::{BuildOpts, DEFAULT_CC};
-use crate::config::Project;
+use crate::config::{Project, Role};
 use crate::fetch::Ctx;
 use crate::home::{self, CacheLock};
 use crate::lock::{Lock, LOCK_PATH};
@@ -80,6 +80,18 @@ fn build_all(ctx: &mut Ctx, opts: &BuildOpts) -> anyhow::Result<()> {
             required: false,
         })
         .collect();
+    // What the registry implies about the kernel config. A Rust
+    // driver cannot be built without CONFIG_RUST, and a driver that
+    // creates its device through configfs cannot be set up without
+    // CONFIG_CONFIGFS_FS -- and Kconfig drops either one silently.
+    let drivers = || ctx.config.block.drivers.values();
+    let mut required_config = Vec::new();
+    if drivers().any(|driver| driver.role == Role::Rs) {
+        required_config.push("CONFIG_RUST=y".to_owned());
+    }
+    if drivers().any(|driver| driver.configfs.is_some()) {
+        required_config.push("CONFIG_CONFIGFS_FS=y".to_owned());
+    }
     let mut fuzz_modules = modules.clone();
     for extra in &ctx.config.build.extra_artifacts {
         let file = extra
@@ -110,6 +122,7 @@ fn build_all(ctx: &mut Ctx, opts: &BuildOpts) -> anyhow::Result<()> {
             cc: cc.clone(),
             target: target.clone(),
             modules: modules.clone(),
+            required_config: required_config.clone(),
             flavor: kernel::build::Flavor::Clean,
         },
     )?;
@@ -123,6 +136,7 @@ fn build_all(ctx: &mut Ctx, opts: &BuildOpts) -> anyhow::Result<()> {
             cc,
             target,
             modules: fuzz_modules,
+            required_config,
             flavor: kernel::build::Flavor::Fuzz,
         },
     )?;

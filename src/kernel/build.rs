@@ -128,6 +128,11 @@ pub struct Options {
     pub target: String,
     /// Kernel modules to harvest into artifacts/ after the build.
     pub modules: Vec<Module>,
+    /// Kconfig directives (fragment syntax) that the settled .config
+    /// must still carry. `make olddefconfig` drops a symbol whose
+    /// dependencies stopped holding *and exits 0*, so a caller that
+    /// needs a symbol has to say so or find out much later.
+    pub required_config: Vec<String>,
 }
 
 /// A file to harvest from the built tree into artifacts/.
@@ -306,11 +311,19 @@ fn configure(ctx: &Ctx, opts: &Options, inputs: &Inputs, tree: &Path) -> Result<
         logs,
     )?;
 
+    let settled = fs::read_to_string(tree.join(".config"))?;
     if let Some(fragment) = &inputs.fragment {
-        verify_fragment(
-            &fragment.contents,
-            &fs::read_to_string(tree.join(".config"))?,
-        )?;
+        verify_fragment(&fragment.contents, &settled)?;
+    }
+    // The base config gets the same treatment for whatever the caller
+    // declared it cannot do without. Without this, a toolchain missing
+    // rustc/bindgen makes Kconfig quietly drop CONFIG_RUST, the Rust
+    // module is never built, the harvest only warns (registry modules
+    // are optional), and the run fails a kernel build and a userland
+    // build later with nothing pointing at the config.
+    let dropped = dropped_directives(&opts.required_config.join("\n"), &settled);
+    if !dropped.is_empty() {
+        return Err(Error::RequiredConfigDropped(dropped));
     }
 
     if opts.menuconfig {
@@ -421,8 +434,18 @@ fn fingerprint(
 /// symbol means kconfig vetoed it (missing dependency) — fail loudly
 /// instead of shipping a fuzz kernel without its instrumentation.
 fn verify_fragment(fragment: &str, config: &str) -> Result<(), Error> {
+    let dropped = dropped_directives(fragment, config);
+    if dropped.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::FragmentDropped(dropped))
+    }
+}
+
+/// Which of `directives` the settled `config` no longer satisfies.
+fn dropped_directives(directives: &str, config: &str) -> Vec<String> {
     let mut dropped = Vec::new();
-    for line in fragment.lines().map(str::trim) {
+    for line in directives.lines().map(str::trim) {
         if let Some(symbol) = line
             .strip_prefix("# CONFIG_")
             .and_then(|rest| rest.strip_suffix(" is not set"))
@@ -435,11 +458,7 @@ fn verify_fragment(fragment: &str, config: &str) -> Result<(), Error> {
             dropped.push(line.to_owned());
         }
     }
-    if dropped.is_empty() {
-        Ok(())
-    } else {
-        Err(Error::FragmentDropped(dropped))
-    }
+    dropped
 }
 
 /// Compiler identity (the configured CC + rustc when present); a
@@ -497,6 +516,14 @@ pub enum Error {
         .0.join(", ")
     )]
     FragmentDropped(Vec<String>),
+    #[error(
+        "kconfig dropped {} this build needs: {}. `make olddefconfig` settles silently and \
+         exits 0, so this is usually an incomplete toolchain (Rust drivers need rustc and \
+         bindgen on PATH -- `koxi block test` checks for them)",
+        if .0.len() == 1 { "a symbol" } else { "symbols" },
+        .0.join(", ")
+    )]
+    RequiredConfigDropped(Vec<String>),
     #[error("--menuconfig needs an interactive terminal")]
     MenuconfigNeedsTty,
     #[error("menuconfig failed: {0}")]
@@ -513,7 +540,7 @@ pub enum Error {
 
 #[cfg(test)]
 mod tests {
-    use super::verify_fragment;
+    use super::{dropped_directives, verify_fragment};
 
     #[test]
     fn fragment_verification_catches_vetoed_symbols() {
@@ -531,5 +558,26 @@ mod tests {
         // Prefix collisions don't count as matches or violations.
         verify_fragment("# CONFIG_KASAN_STACK is not set\n", config).unwrap();
         assert!(verify_fragment("# CONFIG_KASAN is not set\n", config).is_err());
+    }
+
+    /// Observed on work.local against linux 6.19: with rustc and
+    /// bindgen missing, `make olddefconfig` drops CONFIG_RUST and
+    /// CONFIG_RUST_OVERFLOW_CHECKS from the base config, prints
+    /// nothing about it, and exits 0. Only the flavor fragment used to
+    /// be asserted, and the base config carries the symbols that decide
+    /// what is actually measured -- so the Rust half of the comparison
+    /// could vanish at configure time and surface only much later, as a
+    /// missing module after two full builds.
+    #[test]
+    fn required_symbols_catch_a_silently_dropped_rust_config() {
+        let settled = "CONFIG_BLK_DEV_NULL_BLK=m\nCONFIG_CONFIGFS_FS=y\n";
+        assert_eq!(
+            dropped_directives("CONFIG_RUST=y\nCONFIG_CONFIGFS_FS=y", settled),
+            vec!["CONFIG_RUST=y".to_owned()],
+            "the dropped symbol is named, the surviving one is not"
+        );
+        // A registry with no Rust driver requires nothing of Rust.
+        assert!(dropped_directives("", settled).is_empty());
+        assert!(dropped_directives("CONFIG_CONFIGFS_FS=y", settled).is_empty());
     }
 }
