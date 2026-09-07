@@ -92,6 +92,7 @@ pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow
                 &compare_dir,
                 c_name,
                 rs_name,
+                &pair.rs.abstractions,
             )?;
             record("fuzz", &manifest, &mut baselines, &mut substrate);
         } else {

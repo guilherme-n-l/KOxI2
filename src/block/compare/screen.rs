@@ -43,7 +43,11 @@ pub(crate) fn drive(scope: &Scope, opts: &ScreenOpts) -> anyhow::Result<()> {
         // driver nobody has rewritten screens on its own name.
         let mut names = vec![c_name];
         names.extend(subject.rs.map(|(rs_name, _)| rs_name));
-        let classifier = Classifier::new(&names)?;
+        let abstractions = subject
+            .rs
+            .map(|(_, driver)| driver.abstractions.as_slice())
+            .unwrap_or_default();
+        let classifier = Classifier::new(&names, abstractions)?;
 
         let historical = match &static_pick {
             Some((dir, _)) => historical_risk(dir),

@@ -50,11 +50,16 @@ impl Classifier {
     /// Attribution is by driver name in the call stack, so the
     /// classifier takes every name the subject answers to: both
     /// halves of a pair, or just the C driver when phase 1 screens a
-    /// driver nobody has rewritten.
-    pub(super) fn new(names: &[&str]) -> Result<Self, regex::Error> {
+    /// driver nobody has rewritten. The Rust driver also answers to
+    /// the abstraction layer it leans on: the safety gate charges
+    /// `rust/kernel/block/` to it, so a crash whose only frames are in
+    /// `kernel::block::mq` (a completion from softirq context, say) is
+    /// its crash too, not an unknown one.
+    pub(super) fn new(names: &[&str], abstractions: &[PathBuf]) -> Result<Self, regex::Error> {
         let alternation = names
             .iter()
             .map(|name| regex::escape(name))
+            .chain(abstraction_patterns(abstractions))
             .collect::<Vec<_>>()
             .join("|");
         Ok(Self {
@@ -93,6 +98,47 @@ impl Classifier {
             UNKNOWN
         }
     }
+}
+
+/// Stack-frame patterns for an abstraction path. `rust/kernel/block/`
+/// is the module `kernel::block`, which a call trace shows either
+/// demangled (`kernel::block::mq::request::Request::end_ok`) or
+/// v0-mangled (`_RNvMNtNtNtCs..._6kernel5block2mq7request...`), so
+/// both spellings are matched. A path that is not a module (nothing
+/// under `rust/`) contributes nothing.
+fn abstraction_patterns(paths: &[PathBuf]) -> Vec<String> {
+    let mut patterns = Vec::new();
+    for path in paths {
+        let text = path.to_string_lossy();
+        let Some(rest) = text.strip_prefix("rust/") else {
+            continue;
+        };
+        let parts: Vec<&str> = rest
+            .trim_end_matches('/')
+            .trim_end_matches(".rs")
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect();
+        if parts.is_empty() {
+            continue;
+        }
+        let demangled = parts
+            .iter()
+            .map(|part| regex::escape(part))
+            .collect::<Vec<_>>()
+            .join("::");
+        let mangled = parts.iter().fold(String::new(), |mut acc, part| {
+            use std::fmt::Write;
+            let _ = write!(acc, "{}{}", part.len(), regex::escape(part));
+            acc
+        });
+        for pattern in [demangled, mangled] {
+            if !patterns.contains(&pattern) {
+                patterns.push(pattern);
+            }
+        }
+    }
+    patterns
 }
 
 #[derive(Clone)]
@@ -577,6 +623,7 @@ fn conditional_rate_ratio(
     (block, verdict)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn compare_fuzz(
     p1_dir: &Path,
     p2_dir: &Path,
@@ -585,11 +632,12 @@ pub fn compare_fuzz(
     outdir: &Path,
     c_name: &str,
     rs_name: &str,
+    rs_abstractions: &[PathBuf],
 ) -> anyhow::Result<()> {
     let alpha = opts.alpha;
     let margin = opts.fuzz_rate_margin;
 
-    let classifier = Classifier::new(&[c_name, rs_name])?;
+    let classifier = Classifier::new(&[c_name, rs_name], rs_abstractions)?;
     let overrides = match &opts.screen.validated_crashes {
         Some(path) => load_validated_crashes(path)?,
         None => HashMap::new(),
@@ -821,7 +869,14 @@ mod tests {
     use super::*;
 
     fn classifier() -> Classifier {
-        Classifier::new(&["null_blk", "rnull"]).unwrap()
+        Classifier::new(
+            &["null_blk", "rnull"],
+            &[
+                PathBuf::from("rust/kernel/block.rs"),
+                PathBuf::from("rust/kernel/block/"),
+            ],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1026,7 +1081,17 @@ mod tests {
                 validated_crashes: None,
             },
         };
-        compare_fuzz(&p1, &p2, &manifest(1.5), &opts, &out, "null_blk", "rnull").unwrap();
+        compare_fuzz(
+            &p1,
+            &p2,
+            &manifest(1.5),
+            &opts,
+            &out,
+            "null_blk",
+            "rnull",
+            &[],
+        )
+        .unwrap();
 
         let stats: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(out.join("fuzz_stats.json")).unwrap())
