@@ -20,9 +20,19 @@ safety-signal = "\\bfix|\\bbug|\\bnull\\b|\\buaf\\b|use.after.free|overflow|\\bo
 pattern = "use.after.free|uaf"
 cwe = "CWE-416"
 
+# "null.?ptr" covers nullptr, null ptr, null-ptr and null_ptr, so a
+# subject like "fix null-ptr-dereference" classifies instead of
+# falling out of the denominator unlabelled.
 [[cwe]]
-pattern = "null.pointer|null.deref|null ptr|nullptr"
+pattern = "null.pointer|null.?deref|null.?ptr"
 cwe = "CWE-476"
+
+# Reads past a bound are CWE-125, and Rust's bounds checks turn them
+# into a panic rather than removing them (ACSAC: Yes+P); the write
+# rule below would otherwise claim them as CWE-787.
+[[cwe]]
+pattern = "oob.read|out.of.bounds?.read|read.*(beyond|past)|(beyond|past).*(write pointer|the end)"
+cwe = "CWE-125"
 
 [[cwe]]
 pattern = "buffer.overflow|out.of.bound|\\boob\\b|overrun"
