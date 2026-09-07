@@ -24,21 +24,26 @@ use crate::config::{anchored, Project};
 pub(crate) fn drive(scope: &Scope, opts: &ScreenOpts) -> anyhow::Result<()> {
     let project = Project::locate()?;
     let results_root = anchored(&project.root, &scope.output);
-    let pairs = crate::block::driver_pairs(&project.config, &scope.only);
-    if pairs.is_empty() {
-        bail!("no matching driver pairs in the [block.drivers] registry");
+    let subjects = crate::block::subjects(&project.config, &scope.only);
+    if subjects.is_empty() {
+        bail!("no matching C drivers in the [block.drivers] registry");
     }
     let overrides = match &opts.validated_crashes {
         Some(path) => load_validated_crashes(path)?,
         None => HashMap::new(),
     };
 
-    for pair in pairs {
-        let c_name = pair.c_name;
+    for subject in subjects {
+        let c_name = subject.c_name;
         let driver_root = results_root.join("p1").join(c_name);
         let static_pick = latest_complete(&driver_root.join("static"))?;
         let fuzz_pick = latest_complete(&driver_root.join("fuzz"))?;
-        let classifier = Classifier::new(c_name, pair.rs_name)?;
+        // Screening is a phase-1 verdict on the C driver. A
+        // registered counterpart only widens crash attribution, so a
+        // driver nobody has rewritten screens on its own name.
+        let mut names = vec![c_name];
+        names.extend(subject.rs.map(|(rs_name, _)| rs_name));
+        let classifier = Classifier::new(&names)?;
 
         let historical = match &static_pick {
             Some((dir, _)) => historical_risk(dir),

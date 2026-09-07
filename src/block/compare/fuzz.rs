@@ -47,15 +47,20 @@ pub(super) struct Classifier {
 }
 
 impl Classifier {
-    pub(super) fn new(c_name: &str, rs_name: &str) -> Result<Self, regex::Error> {
+    /// Attribution is by driver name in the call stack, so the
+    /// classifier takes every name the subject answers to: both
+    /// halves of a pair, or just the C driver when phase 1 screens a
+    /// driver nobody has rewritten.
+    pub(super) fn new(names: &[&str]) -> Result<Self, regex::Error> {
+        let alternation = names
+            .iter()
+            .map(|name| regex::escape(name))
+            .collect::<Vec<_>>()
+            .join("|");
         Ok(Self {
-            target: RegexBuilder::new(&format!(
-                "{}|{}",
-                regex::escape(c_name),
-                regex::escape(rs_name)
-            ))
-            .case_insensitive(true)
-            .build()?,
+            target: RegexBuilder::new(&alternation)
+                .case_insensitive(true)
+                .build()?,
             infra: RegexBuilder::new(
                 "(no output from test machine|lost connection to test machine|SYZFAIL|\
                  failed to connect to manager|connection (?:reset|refused)|ssh: connect|\
@@ -558,7 +563,7 @@ pub fn compare_fuzz(
     let alpha = opts.alpha;
     let margin = opts.fuzz_rate_margin;
 
-    let classifier = Classifier::new(c_name, rs_name)?;
+    let classifier = Classifier::new(&[c_name, rs_name])?;
     let overrides = match &opts.screen.validated_crashes {
         Some(path) => load_validated_crashes(path)?,
         None => HashMap::new(),
@@ -787,7 +792,7 @@ mod tests {
     use super::*;
 
     fn classifier() -> Classifier {
-        Classifier::new("null_blk", "rnull").unwrap()
+        Classifier::new(&["null_blk", "rnull"]).unwrap()
     }
 
     #[test]

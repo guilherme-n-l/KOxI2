@@ -20,7 +20,7 @@ use tracing::{info, warn};
 
 use crate::block::cli::{RunOpts, StaticOpts};
 use crate::block::results::{self, Campaign, Identity, Manifest, SourceIds, StaticKnobs};
-use crate::block::DriverPair;
+use crate::block::Subject;
 use crate::config::{anchored, Driver, Project, Role};
 use crate::fetch::Ctx;
 use crate::home::{self, CacheLock};
@@ -86,9 +86,9 @@ pub(crate) fn drive(
         bail!("linux-meta mirror is not locked — run `koxi block setup` first");
     };
 
-    let pairs = super::driver_pairs(&project.config, &run.scope.only);
-    if pairs.is_empty() {
-        bail!("no matching driver pairs in the [block.drivers] registry");
+    let subjects = super::subjects(&project.config, &run.scope.only);
+    if subjects.is_empty() {
+        bail!("no matching C drivers in the [block.drivers] registry");
     }
 
     let analyzer = ast::Analyzer::new()?;
@@ -120,8 +120,8 @@ pub(crate) fn drive(
         yes,
     };
 
-    for pair in pairs {
-        analysis.pair(&plan, &pair)?;
+    for subject in subjects {
+        analysis.subject(&plan, &subject)?;
     }
     Ok(())
 }
@@ -181,7 +181,10 @@ impl Run<'_> {
 
     /// One pair: the C baseline (static is phase-1 screening, so it
     /// runs even under --p1) then the Rust driver under the campaign.
-    fn pair(&self, plan: &Plan, pair: &DriverPair) -> anyhow::Result<()> {
+    /// One subject's static profile: the C baseline always, since
+    /// phase 1 stands alone, and the Rust counterpart only when one
+    /// is registered and this is not a `--p1` run.
+    fn subject(&self, plan: &Plan, subject: &Subject) -> anyhow::Result<()> {
         let manifest = |identity: Identity, p2: Option<Campaign>| Manifest {
             complete: false,
             created: plan.now,
@@ -191,20 +194,32 @@ impl Run<'_> {
             p2,
         };
 
-        let c_identity = self.identity(pair.c_name, pair.c);
+        let c_identity = self.identity(subject.c_name, subject.c);
         let c_hash = results::identity_hash(&c_identity)?;
-        let p1_dir = results::p1_dir(&plan.results_root, pair.c_name, "static", &c_hash);
+        let p1_dir = results::p1_dir(&plan.results_root, subject.c_name, "static", &c_hash);
         if !plan.force_p1 && Manifest::is_complete(&p1_dir) {
             info!(
                 "p1 static cached for {} at {} (--force-p1 re-runs)",
-                pair.c_name,
+                subject.c_name,
                 p1_dir.display()
             );
         } else {
-            info!("p1 static: {} -> {}", pair.c_name, p1_dir.display());
-            self.analyze(pair.c_name, pair.c, &p1_dir, manifest(c_identity, None))?;
+            info!("p1 static: {} -> {}", subject.c_name, p1_dir.display());
+            self.analyze(
+                subject.c_name,
+                subject.c,
+                &p1_dir,
+                manifest(c_identity, None),
+            )?;
         }
 
+        let Some(pair) = subject.pair() else {
+            info!(
+                "{} has no registered Rust counterpart; stopping at phase 1",
+                subject.c_name
+            );
+            return Ok(());
+        };
         if plan.p1 {
             info!(
                 "phase 1 only: skipping p2 static for {}::{}",

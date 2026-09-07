@@ -104,6 +104,31 @@ fn all(matches: &ArgMatches, globals: &Globals, logs: &Path) -> anyhow::Result<(
     compare::drive(&run.scope, &campaign, &compare_opts).context("compare phase")
 }
 
+/// A C driver to study, with its Rust counterpart when one is
+/// registered. Phase 1 screens the C driver on its own and needs no
+/// counterpart; phase 2 compares against one and cannot run without.
+pub(crate) struct Subject<'c> {
+    pub c_name: &'c str,
+    pub c: &'c Driver,
+    /// The registered replacement, `None` for a C driver nobody has
+    /// rewritten yet.
+    pub rs: Option<(&'c str, &'c Driver)>,
+}
+
+impl<'c> Subject<'c> {
+    /// This subject as a phase-2 pair, or `None` when it has no
+    /// registered counterpart to compare against.
+    pub fn pair(&self) -> Option<DriverPair<'c>> {
+        let (rs_name, rs) = self.rs?;
+        Some(DriverPair {
+            rs_name,
+            rs,
+            c_name: self.c_name,
+            c: self.c,
+        })
+    }
+}
+
 /// One registered (rs, c) driver pair: the Rust driver under study
 /// and the C driver it replaces.
 pub(crate) struct DriverPair<'c> {
@@ -113,25 +138,43 @@ pub(crate) struct DriverPair<'c> {
     pub c: &'c Driver,
 }
 
-/// Every registered (rs, c) driver pair, filtered by --only on the
-/// C driver name (the Rust pair follows, v1-style).
-pub(crate) fn driver_pairs<'c>(config: &'c Config, only: &[String]) -> Vec<DriverPair<'c>> {
+/// Every registered C driver, each carrying its Rust counterpart when
+/// one exists, filtered by --only on the C driver name.
+///
+/// This is what phase 1 iterates. A C driver nobody has rewritten is
+/// still a screening subject: the methodology's whole first phase is
+/// deciding whether such a driver is worth rewriting, and its results
+/// live under `results/p1/<c>/`, which needs no Rust name.
+pub(crate) fn subjects<'c>(config: &'c Config, only: &[String]) -> Vec<Subject<'c>> {
+    let counterpart = |c_name: &str| {
+        config
+            .block
+            .drivers
+            .iter()
+            .find(|(_, driver)| driver.role == Role::Rs && driver.pair.as_deref() == Some(c_name))
+            .map(|(rs_name, rs)| (rs_name.as_str(), rs))
+    };
     config
         .block
         .drivers
         .iter()
-        .filter(|(_, driver)| driver.role == Role::Rs)
-        .filter_map(|(rs_name, rs)| {
-            let c_name = rs.pair.as_ref()?;
-            let c = config.block.drivers.get(c_name)?;
-            Some(DriverPair {
-                rs_name,
-                rs,
-                c_name,
-                c,
-            })
+        .filter(|(_, driver)| driver.role == Role::C)
+        .filter(|(c_name, _)| only.is_empty() || only.iter().any(|name| name == *c_name))
+        .map(|(c_name, c)| Subject {
+            c_name,
+            c,
+            rs: counterpart(c_name),
         })
-        .filter(|pair| only.is_empty() || only.iter().any(|name| name == pair.c_name))
+        .collect()
+}
+
+/// Every registered (rs, c) driver pair, filtered by --only on the
+/// C driver name (the Rust pair follows, v1-style). This is what the
+/// phase-2 gates iterate; phase 1 uses [`subjects`].
+pub(crate) fn driver_pairs<'c>(config: &'c Config, only: &[String]) -> Vec<DriverPair<'c>> {
+    subjects(config, only)
+        .iter()
+        .filter_map(Subject::pair)
         .collect()
 }
 
@@ -192,5 +235,86 @@ mod tests {
             1
         )
         .is_ok());
+    }
+
+    /// A registry with one rewritten driver and one nobody has
+    /// touched, which is the shape the methodology's two phases
+    /// distinguish.
+    fn registry() -> crate::config::Config {
+        crate::config::Config::parse(
+            r#"
+            [sources]
+            [block.drivers.null_blk]
+            role = "c"
+            ko = "null_blk.ko"
+            ko-dir = "drivers/block/null_blk/"
+            device = "/dev/nullb0"
+            gitpath = "drivers/block/null_blk/"
+
+            [block.drivers.rnull]
+            role = "rs"
+            ko = "rnull_mod.ko"
+            ko-dir = "drivers/block/rnull/"
+            device = "/dev/rnullb0"
+            gitpath = "drivers/block/rnull/"
+            pair = "null_blk"
+
+            [block.drivers.brd]
+            role = "c"
+            ko = "brd.ko"
+            ko-dir = "drivers/block/"
+            device = "/dev/ram0"
+            gitpath = "drivers/block/brd.c"
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn phase_one_screens_every_c_driver_paired_or_not() {
+        let config = registry();
+        let names: Vec<&str> = super::subjects(&config, &[])
+            .iter()
+            .map(|subject| subject.c_name)
+            .collect();
+        assert_eq!(
+            names,
+            ["brd", "null_blk"],
+            "a rewrite is not a prerequisite"
+        );
+
+        let subjects = super::subjects(&config, &[]);
+        let brd = subjects.iter().find(|s| s.c_name == "brd").unwrap();
+        assert!(brd.rs.is_none());
+        assert!(brd.pair().is_none(), "phase 2 has nothing to compare");
+        let null_blk = subjects.iter().find(|s| s.c_name == "null_blk").unwrap();
+        assert_eq!(null_blk.rs.map(|(name, _)| name), Some("rnull"));
+        assert_eq!(null_blk.pair().unwrap().rs_name, "rnull");
+    }
+
+    #[test]
+    fn phase_two_iterates_only_registered_pairs() {
+        let config = registry();
+        let pairs = super::driver_pairs(&config, &[]);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].c_name, "null_blk");
+        assert_eq!(pairs[0].rs_name, "rnull");
+    }
+
+    #[test]
+    fn only_selects_an_unpaired_driver_instead_of_erroring() {
+        let config = registry();
+        // The bug this replaced: --only on a driver with no Rust
+        // counterpart selected nothing, so screening refused to run.
+        let subjects = super::subjects(&config, &["brd".to_owned()]);
+        assert_eq!(subjects.len(), 1);
+        assert_eq!(subjects[0].c_name, "brd");
+        assert!(super::driver_pairs(&config, &["brd".to_owned()]).is_empty());
+
+        // Filtering names the C driver on both sides, v1-style.
+        let subjects = super::subjects(&config, &["null_blk".to_owned()]);
+        assert_eq!(subjects.len(), 1);
+        assert_eq!(subjects[0].c_name, "null_blk");
+        assert!(super::subjects(&config, &["rnull".to_owned()]).is_empty());
     }
 }

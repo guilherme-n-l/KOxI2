@@ -107,8 +107,9 @@ the guest, and where its source lives in the kernel tree.
 | `nbd`      | C    |            | Registered; needs an in-guest connector before it is usable. |
 | `dm-zero`  | C    |            | Registered; needs device-mapper setup in the guest.          |
 
-Only `rnull` carries `pair`, so only the `null_blk`/`rnull` pair is
-analyzed today. The Rust entry also carries `abstractions`, the
+Only `rnull` carries `pair`, so `null_blk` is the only driver that
+reaches Phase 2; the rest screen and stop. The Rust entry also carries
+`abstractions`, the
 kernel-tree paths whose unsafe surface is counted separately, so a
 driver body with no `unsafe` cannot hide unsafe pushed one layer
 down.
@@ -292,13 +293,10 @@ identifies the exact data it came from.
 
 ## Known limitations
 
-- Unpaired C drivers are carried in the registry but no phase
-  analyzes them, so Phase-1 screening of a C driver without a Rust
-  counterpart is unavailable.
-
 The harness-wide limitations, covering the shared cache, the lock
 format and the host fitness gate, are in the
-[repository README](../../README.md#known-limitations).
+[repository README](../../README.md#known-limitations). The block
+harness adds none of its own.
 
 ## Adding a block driver
 

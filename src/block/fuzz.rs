@@ -26,7 +26,7 @@ use tracing::{info, warn};
 use crate::assets;
 use crate::block::cli::{FuzzOpts, Profile, RunOpts};
 use crate::block::results::{self, ArtifactShas, Campaign, FuzzKnobs, Identity, Manifest};
-use crate::block::DriverPair;
+use crate::block::Subject;
 use crate::cli::GuestOpts;
 use crate::config::{anchored, Driver, Project};
 use crate::home;
@@ -90,9 +90,9 @@ pub(crate) fn drive(
     if knobs.campaigns == 0 || knobs.hours <= 0.0 || knobs.parallel == 0 {
         bail!("empty fuzz plan (check --fuzz-campaigns/--fuzz-hours/--fuzz-parallel)");
     }
-    let pairs = super::driver_pairs(&project.config, &run.scope.only);
-    if pairs.is_empty() {
-        bail!("no matching driver pairs in the [block.drivers] registry");
+    let subjects = super::subjects(&project.config, &run.scope.only);
+    if subjects.is_empty() {
+        bail!("no matching C drivers in the [block.drivers] registry");
     }
 
     let accel = host::accel();
@@ -133,8 +133,8 @@ pub(crate) fn drive(
         yes,
     };
 
-    for pair in pairs {
-        fuzz_pair(&shared, &ids, &plan, &pair)?;
+    for subject in subjects {
+        fuzz_subject(&shared, &ids, &plan, &subject)?;
     }
     Ok(())
 }
@@ -193,7 +193,15 @@ struct Plan {
 
 /// One pair: the C baseline (fuzz is a phase-1 screening domain, so
 /// it runs even under --p1) then the Rust driver under the campaign.
-fn fuzz_pair(shared: &SharedCfg, ids: &Ids, plan: &Plan, pair: &DriverPair) -> anyhow::Result<()> {
+/// One subject's campaigns: the C baseline always, since phase 1
+/// stands alone, and the Rust counterpart only when one is
+/// registered and this is not a `--p1` run.
+fn fuzz_subject(
+    shared: &SharedCfg,
+    ids: &Ids,
+    plan: &Plan,
+    subject: &Subject,
+) -> anyhow::Result<()> {
     let manifest = |identity: Identity, p2: Option<Campaign>| Manifest {
         complete: false,
         created: plan.now,
@@ -203,28 +211,35 @@ fn fuzz_pair(shared: &SharedCfg, ids: &Ids, plan: &Plan, pair: &DriverPair) -> a
         p2,
     };
 
-    let c_cfg = base_cfg(shared, pair.c_name)?;
-    let c_identity = ids.identity(pair.c_name, pair.c, &c_cfg)?;
+    let c_cfg = base_cfg(shared, subject.c_name)?;
+    let c_identity = ids.identity(subject.c_name, subject.c, &c_cfg)?;
     let c_hash = results::identity_hash(&c_identity)?;
-    let p1_dir = results::p1_dir(&plan.results_root, pair.c_name, "fuzz", &c_hash);
+    let p1_dir = results::p1_dir(&plan.results_root, subject.c_name, "fuzz", &c_hash);
     if !plan.force_p1 && Manifest::is_complete(&p1_dir) {
         info!(
             "p1 fuzz cached for {} at {} (--force-p1 re-runs)",
-            pair.c_name,
+            subject.c_name,
             p1_dir.display()
         );
     } else {
-        info!("p1 fuzz: {} -> {}", pair.c_name, p1_dir.display());
+        info!("p1 fuzz: {} -> {}", subject.c_name, p1_dir.display());
         run_campaigns(
             shared,
-            pair.c_name,
-            pair.c,
+            subject.c_name,
+            subject.c,
             &p1_dir,
             manifest(c_identity, None),
             &c_cfg,
         )?;
     }
 
+    let Some(pair) = subject.pair() else {
+        info!(
+            "{} has no registered Rust counterpart; stopping at phase 1",
+            subject.c_name
+        );
+        return Ok(());
+    };
     if plan.p1 {
         info!(
             "phase 1 only: skipping p2 fuzz for {}::{}",
