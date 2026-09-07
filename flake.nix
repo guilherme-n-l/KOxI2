@@ -263,7 +263,7 @@
 
           koxi = pkgs.rustPlatform.buildRustPackage {
             pname = "koxi";
-            version = "0.1.0";
+            version = "2.0.0-rc.1";
             src = self;
             cargoLock.lockFile = ./Cargo.lock;
             inherit nativeBuildInputs buildInputs;
