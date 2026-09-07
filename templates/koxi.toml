@@ -66,8 +66,17 @@ extra-artifacts = ["vmlinux"]
 version = "6.19"
 url = "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.19.tar.xz"
 
-# git-meta is a bare, blob-filtered history mirror used for commit
-# mining. It is never checked out or built, so it stays small.
+# git-meta is a bare history mirror used for commit mining. It is never
+# checked out or built.
+#
+# koxi asks for --filter=blob:none, but that is a request: a server
+# without partial-clone support answers "filtering not recognized by
+# server, ignoring" and sends the whole history anyway. git.kernel.org
+# is one of those, so this mirror lands at ~3.8 GB and takes tens of
+# minutes on a first setup. koxi says so when it happens. Point this at
+# a mirror that implements partial clone if that cost matters to you --
+# the rev below resolves to the same commit either way, so the mined
+# history, and the lock, are unchanged.
 [sources.linux-meta]
 git-meta = "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
 rev = "v6.19"

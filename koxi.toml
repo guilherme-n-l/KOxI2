@@ -30,8 +30,10 @@ extra-artifacts = ["vmlinux"]
 version = "6.19"
 url = "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.19.tar.xz"
 
-# git-meta: bare, blob-filtered history mirror for commit mining;
-# never checked out or built.
+# git-meta: bare history mirror for commit mining; never checked out or
+# built. --filter=blob:none is requested but git.kernel.org does not
+# implement partial clone and sends the full history (~3.8 GB); koxi
+# warns when the filter is declined.
 [sources.linux-meta]
 git-meta = "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
 rev = "v6.19"

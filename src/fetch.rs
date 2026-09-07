@@ -180,9 +180,31 @@ pub fn git(name: &str, ctx: &mut Ctx) -> Result<PathBuf, Error> {
     Ok(repo)
 }
 
-/// Ensure the git-meta source `name` — a bare, blob-filtered history
-/// mirror for commit mining — exists in `cache/<name>.git` with the
-/// locked commit available; returns the repo path. Never checked out.
+/// Ensure the git-meta source `name` — a bare history mirror for
+/// commit mining — exists in `cache/<name>.git` with the locked commit
+/// available; returns the repo path. Never checked out.
+///
+/// `--filter=blob:none` is a *request*. A server that does not
+/// implement partial clone answers "filtering not recognized by
+/// server, ignoring" and sends everything, and git still exits 0, so
+/// the mirror silently becomes a full one — 3.8 GB and roughly forty
+/// minutes for linux against git.kernel.org, which does not support
+/// filtering. [`filter_declined`] reads that refusal off the clone's
+/// output and reports the size either way, because the surprise is the
+/// cost, not the size itself.
+/// Whether git reported that the server refused to filter.
+///
+/// Not readable from the repo's config: git writes the filter it
+/// *asked for* into `remote.origin.partialclonefilter` (and sets
+/// `promisor = true`) whether or not the server honoured it, so a full
+/// 3.8 GB mirror from git.kernel.org carries exactly the same keys as a
+/// genuinely partial one. The only place the refusal appears is the
+/// warning on the clone's own output.
+fn filter_declined(logs: &Path) -> bool {
+    fs::read_to_string(logs.join("git-clone.log"))
+        .is_ok_and(|log| log.contains("filtering not recognized by server"))
+}
+
 pub fn git_meta(name: &str, ctx: &mut Ctx) -> Result<PathBuf, Error> {
     let source = lookup(name, ctx.config)?;
     let Source::GitMeta { git_meta: url, rev } = source else {
@@ -211,6 +233,19 @@ pub fn git_meta(name: &str, ctx: &mut Ctx) -> Result<PathBuf, Error> {
             .arg(url)
             .arg(&repo);
         cmd::status(clone, "git-clone", logs)?;
+        // Say what it cost either way; the mirror is the largest thing
+        // setup downloads and the number is otherwise invisible.
+        let size = crate::home::human_size(crate::home::size_of(&repo));
+        if filter_declined(logs) {
+            warn!(
+                "{name}: the server declined --filter=blob:none and sent the full history \
+                 ({size} on disk). Nothing is wrong with the mirror, it is just far larger \
+                 and slower than a filtered one; a mirror implementing partial clone would \
+                 fetch a fraction of it."
+            );
+        } else {
+            info!("{name}: history mirror is {size}");
+        }
     }
 
     let locked_commit = match ctx.lock.sources.get(name) {
@@ -567,6 +602,32 @@ mod tests {
             assume_yes: true,
         };
         tarball("thing", &mut ctx)
+    }
+
+    /// git writes the filter it asked for into the repo config whether
+    /// or not the server honoured it -- the real 3.8 GB mirror from
+    /// git.kernel.org carries `partialclonefilter = blob:none` and
+    /// `promisor = true` just like a genuinely partial one. So the
+    /// refusal can only be read off the clone's own output.
+    #[test]
+    fn a_declined_clone_filter_is_read_from_the_clone_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("git-clone.log");
+
+        fs::write(
+            &log,
+            "Cloning into bare repository '/home/u/.koxi/cache/linux-meta.git'...\n\
+             warning: filtering not recognized by server, ignoring\n",
+        )
+        .unwrap();
+        assert!(filter_declined(dir.path()));
+
+        fs::write(&log, "Cloning into bare repository 'x'...\n").unwrap();
+        assert!(!filter_declined(dir.path()));
+
+        // No log at all is not a refusal.
+        fs::remove_file(&log).unwrap();
+        assert!(!filter_declined(dir.path()));
     }
 
     #[test]
