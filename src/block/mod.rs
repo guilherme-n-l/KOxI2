@@ -111,6 +111,17 @@ fn all(matches: &ArgMatches, globals: &Globals, logs: &Path) -> anyhow::Result<(
     fuzz::drive(&run, profile, &vm.guest, &fuzz_opts, globals.yes, logs).context("fuzz phase")?;
     phase("screen");
     compare::screen::drive(&run.scope, &compare_opts.screen).context("screen phase")?;
+    // Compare is phase 2. Under --p1 there is no campaign to gate, and
+    // a selection of drivers nobody has rewritten has no pairs, which
+    // compare would (rightly) refuse: neither is a failed run.
+    if run.p1 {
+        info!("phase 1 only: compare is a phase-2 verb; skipping");
+        return Ok(());
+    }
+    if driver_pairs(&Project::locate()?.config, &run.scope.only).is_empty() {
+        info!("no driver pair among the selected drivers; nothing to compare");
+        return Ok(());
+    }
     phase("compare");
     compare::drive(&run.scope, &campaign, &compare_opts).context("compare phase")
 }
