@@ -18,10 +18,10 @@ it: Rust unsafe surface split between driver code and the shared
 matrix. The main Phase-2 pair is `null_blk` (C) versus `rnull`
 (Rust).
 
-Every phase iterates registered pairs. A C driver with no Rust
-counterpart sits in the registry but is not analyzed, even under
-`--p1`; screening an unpaired C driver is a v1 capability this
-rewrite has not restored.
+Phase 1 iterates every registered C driver, paired or not: a driver
+nobody has rewritten still gets its static analysis, its campaigns
+and a screening band. Phase 2 iterates pairs, since it needs both
+halves.
 
 ## Quick start
 
@@ -112,20 +112,39 @@ the guest, and where its source lives in the kernel tree.
 
 | Driver     | Role | Pair       | Notes                                                        |
 | ---------- | ---- | ---------- | ------------------------------------------------------------ |
-| `null_blk` | C    |            | The C baseline of the Phase-2 pair.                          |
+| `null_blk` | C    |            | The C baseline of the Phase-2 pair; carries `history-paths`. |
 | `rnull`    | Rust | `null_blk` | Declares the `rust/kernel/` abstractions it leans on.        |
-| `loop`     | C    |            | Registered; needs a file-backed `/dev/loop0` (`prep`).       |
-| `brd`      | C    |            | Registered; RAM disk.                                        |
-| `zram`     | C    |            | Registered; needs a configured disk size (`prep`).           |
-| `nbd`      | C    |            | Registered; needs an in-guest connector before it is usable. |
-| `dm-zero`  | C    |            | Registered; needs device-mapper setup in the guest.          |
+| `loop`     | C    |            | Boots; needs a file-backed `/dev/loop0` (`prep`).            |
+| `brd`      | C    |            | Boots; RAM disk.                                             |
+| `zram`     | C    |            | Built as a module; needs a configured disk size (`prep`).    |
+| `nbd`      | C    |            | Boots; needs an in-guest connector before it is usable.      |
+| `dm-zero`  | C    |            | Built as a module; needs `dmsetup`, which BusyBox lacks.     |
 
 Only `rnull` carries `pair`, so `null_blk` is the only driver that
 reaches Phase 2; the rest screen and stop. The Rust entry also carries
-`abstractions`, the
-kernel-tree paths whose unsafe surface is counted separately, so a
-driver body with no `unsafe` cannot hide unsafe pushed one layer
-down.
+`abstractions`, the kernel-tree paths whose unsafe surface is counted
+separately, so a driver body with no `unsafe` cannot hide unsafe
+pushed one layer down; crash attribution charges those paths to the
+Rust driver as well, so a crash whose only frames are in
+`kernel::block::mq` is its crash, not an unknown one.
+
+Two more things the pair's entries pin, because the defaults differ
+between the two drivers and a comparison on defaults measures the
+difference in configuration as much as in implementation:
+
+- **Device geometry.** `configfs-params` sets block size, capacity,
+  completion mode and (for null_blk) queue depth and submit queues to
+  the same values on both sides, and `prep` pins the I/O scheduler.
+  Left alone, null_blk completes through softirq with 512-byte blocks
+  and 64 tags under no scheduler, and rnull completes inline with 4 KiB
+  blocks and 256 tags under mq-deadline. The perf phase reads back
+  what each device presented and records it in the manifest.
+- **History.** `history-paths` lists where the driver's source lived
+  before `gitpath`, so commit mining is not cut off at the move that
+  created the current directory. null_blk was a single file under
+  `drivers/block/` from 2013 to 2020, and the directory alone holds
+  139 of its 364 commits. `commits_summary.csv` states the window it
+  mined.
 
 ## Results
 
@@ -226,11 +245,11 @@ results tree can be moved between machines and re-gated there:
 
 ## Gate artifacts and thresholds
 
-| Gate        | Artifact          | Gated quantity                                                                                                              |
-| ----------- | ----------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| Safety      | `safety.json`     | Elimination rate over CWE-classified fix commits, against `--safety-threshold`.                                             |
-| Fuzzing     | `fuzz_stats.json` | Non-inferiority of the target-attributable crash rate ratio, against `--fuzz-rate-margin`.                                  |
-| Performance | `perf_stats.json` | Per-workload TOST on the Hodges-Lehmann log-IOPS ratio, combined as an intersection-union test, against `--perf-threshold`. |
+| Gate        | Artifact          | Gated quantity                                                                                                                                   |
+| ----------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Safety      | `safety.json`     | Elimination rate over CWE-classified fix commits, against `--safety-threshold`; the exact 95% interval and n travel with it.                     |
+| Fuzzing     | `fuzz_stats.json` | Non-inferiority of the target-attributable crash rate ratio, against `--fuzz-rate-margin`: `non_inferior`, `inferior`, or `inconclusive`.        |
+| Performance | `perf_stats.json` | Per-workload one-sided non-inferiority on the Hodges-Lehmann log-IOPS ratio, combined as an intersection-union test, against `--perf-threshold`. |
 
 These defaults are calibrated for block drivers:
 
@@ -242,11 +261,29 @@ These defaults are calibrated for block drivers:
 | Significance alpha             | `--alpha`               | `0.05`  |
 | Bootstrap resamples            | `--bootstrap-resamples` | `10000` |
 
+The thresholds are conventions, not derivations. 34.2% is the share
+of Linux driver CVEs from 2020 to 2024 that Li et al. (ACSAC 2024,
+Table 2) label as eliminated by Rust alone, 82 of 240, so the safety
+gate asks whether this driver's history is at least as
+Rust-eliminable as the fleet's; 5% is a conventional noise floor for a
+throughput regression; and a rate ratio of 2 is the smallest
+regression a campaign of this size can hope to rule out, which the
+reported minimum detectable ratio makes checkable per run.
+
 `fuzz_stats.json` also reports `exposure_basis`. A campaign records
 the hours it actually ran, and the crash rate is divided by the sum
 of those; a campaign that recorded none falls back to its budget and
 the basis says so, because that denominator is then partly a plan
-rather than a measurement.
+rather than a measurement. Its `verdict.outcome` is one of three
+words: with zero events on both sides, or too few to bound the ratio,
+it is `inconclusive` and `pass` is null, so the gate is never passed
+by a campaign that found nothing.
+
+`perf_stats.json` reports `data_quality.device_geometry`: the block
+queue limits and configfs attributes each device actually presented,
+read from the guest, and whether the two sides matched. A mismatch
+drops the gate's data quality to `inferred`, because the comparison
+is then between configurations as much as implementations.
 
 ## The verdict
 
@@ -259,25 +296,35 @@ passed, the data quality behind it, the gate's own one-line detail,
 and the numbers a reader would otherwise have to dig out of the
 gate artifact:
 
-| Dimension     | Key numbers reported                                                                  |
-| ------------- | ------------------------------------------------------------------------------------- |
-| `safety`      | The elimination rate and the threshold it was tested against.                         |
-| `fuzzing`     | The metric used, its p-value and A12, the rate-ratio upper bound, and the gate basis. |
-| `performance` | The median delta, how many workloads passed TOST, and the threshold.                  |
+| Dimension     | Key numbers reported                                                                                    |
+| ------------- | ------------------------------------------------------------------------------------------------------- |
+| `safety`      | The elimination rate, its exact 95% interval, the n behind it, and the threshold it was tested against. |
+| `fuzzing`     | The metric used, its p-value and A12, the rate-ratio upper bound, the outcome, and the gate basis.      |
+| `performance` | The median delta, how many workloads passed the non-inferiority test, and the threshold.                |
 
 The overall field is deliberately conservative:
 
-- **`fail`** when any decidable gate failed. One clear failure is
-  enough to argue against replacing a mature C driver.
+- **`fail`** when any decidable gate failed, whatever the others did.
+  One clear failure is enough to argue against replacing a mature C
+  driver, and an undecided or unmeasured gate beside it does not
+  soften that into "inconclusive".
 - **`pass`** only when all three dimensions are present and all
   passed.
-- **`partial`** when a dimension is missing, so the evidence cannot
-  support a full verdict either way.
-- **`inconclusive`** when nothing decidable came back at all.
+- **`inconclusive`** when nothing failed and at least one present
+  gate could not decide: a fuzzing campaign with no events, say.
+- **`partial`** when nothing failed and a dimension is missing, so
+  the evidence cannot support a full verdict either way.
+
+The verdict also records the `substrate` the guest-side campaigns ran
+on (host and acceleration). Under TCG the fuzzing and performance
+dimensions are marked `inferred` whatever they measured, since the
+timing is the emulator's.
 
 The recommendation is v1's matrix over the (safety, fuzzing,
-performance) triple, unchanged so that a v1 and a v2 report read the
-same way:
+performance) triple when all three decided, unchanged so that a v1
+and a v2 report read the same way; a failure with an undecided or
+missing dimension beside it is spelled out instead ("Do not replace:
+performance fail; fuzzing undecided"):
 
 | Safety | Fuzzing | Performance | Recommendation                                                   |
 | ------ | ------- | ----------- | ---------------------------------------------------------------- |
@@ -309,7 +356,14 @@ identifies the exact data it came from.
 The harness-wide limitations, covering the shared cache, the lock
 format and the host fitness gate, are in the
 [repository README](../../README.md#known-limitations). The block
-harness adds none of its own.
+harness adds two of its own:
+
+- Every guest forwards its dropbear to one host port (`--port`, 5555
+  by default), so two runs on one host need distinct ports; the second
+  fails at boot rather than hanging.
+- Run logs under `$KOXI_HOME/log/` are never swept. They are small
+  (about a megabyte per thirty-five runs) but they are yours to
+  remove.
 
 ## Adding a block driver
 
@@ -319,7 +373,9 @@ harness adds none of its own.
    guest must do more before the device node appears.
 4. For a Rust driver, set `pair` to the C driver it replaces and
    `abstractions` to the kernel-tree paths whose unsafe surface
-   should be counted separately from the driver body.
+   should be counted separately from the driver body. Configure both
+   halves of a pair identically (`configfs-params`, `prep`), and give
+   the C driver its `history-paths` if the source has moved.
 5. Run `koxi block setup` so the module is built and harvested, then
    `koxi vm --driver <name>` to confirm the device node appears
    before spending a campaign on it.

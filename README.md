@@ -107,30 +107,46 @@ instantiation.
 
 ## How the gates decide
 
-Each gate states its criterion as a hypothesis test with an explicit
-margin, so "we found no significant difference" can never be mistaken
-for evidence of equivalence.
+The two measured gates state their criterion as a one-sided
+non-inferiority test with an explicit margin, so "we found no
+significant difference" can never be mistaken for evidence of
+equivalence. The safety gate is a threshold rule on a point estimate,
+and says so.
 
-| Gate        | Gated quantity                                                                                                                   |
-| ----------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| Safety      | The elimination rate: the fraction of CWE-classified fix commits whose class Rust removes at compile time.                       |
-| Fuzzing     | Non-inferiority of the target-attributable crash rate ratio, rust over C, via the exact conditional binomial.                    |
-| Performance | Per-workload TOST non-inferiority on the Hodges-Lehmann log-IOPS ratio, combined across workloads as an intersection-union test. |
+| Gate        | Gated quantity                                                                                                                                                                    |
+| ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Safety      | The elimination rate: the fraction of CWE-classified fix commits whose class Rust removes at compile time, against a threshold, with its exact interval and n reported alongside. |
+| Fuzzing     | Non-inferiority of the target-attributable crash rate ratio, rust over C, via the exact conditional binomial: pass, fail, or inconclusive.                                        |
+| Performance | Per-workload one-sided non-inferiority on the Hodges-Lehmann log-IOPS ratio, combined across workloads as an intersection-union test.                                             |
 
 The performance gate uses the (1 − 2α) order-statistic confidence
 interval on the Hodges-Lehmann shift of log IOPS: every workload's
-lower bound must clear the margin ratio. Combining cells as an
-intersection-union test controls the family-wise error rate at α with
-no multiplicity correction (Berger), and a cell that produced no
-comparable evidence is an untested cell, so it fails rather than
-passes silently. The fuzzing gate conditions on the total event count,
-which makes the Rust share binomial with p fixed by the exposure
-split; Clopper-Pearson bounds then transform into rate-ratio bounds.
-With zero events on both sides the ratio is unbounded, so the verdict
-falls back to the per-side exact Poisson rate bound and says so. Both
-gates keep v1's rank statistics (Mann-Whitney U, Vargha-Delaney A12
-with a DeLong interval, Holm-Bonferroni, the bootstrap median-delta
-interval) as descriptive evidence.
+lower bound must clear the margin ratio (the upper bound is reported,
+not tested, so this is one one-sided test, not the two of a TOST).
+Combining cells as an intersection-union test controls the
+family-wise error rate at α with no multiplicity correction (Berger),
+and a cell that produced no comparable evidence is an untested cell,
+so it fails rather than passes silently. The fuzzing gate conditions
+on the total event count, which makes the Rust share binomial with p
+fixed by the exposure split; Clopper-Pearson bounds then transform
+into rate-ratio bounds. It has three outcomes: non-inferior when the
+upper bound clears the margin, inferior when the lower bound sits
+above 1, and inconclusive otherwise. With zero events on both sides
+the ratio is unbounded, so the gate is inconclusive and reports the
+per-side exact Poisson rate bound as what the exposure did establish;
+an inconclusive gate is never a pass, and the overall verdict says
+"inconclusive" or, when another gate failed, "fail". Both gates keep
+v1's rank statistics (Mann-Whitney U, Vargha-Delaney A12 with a DeLong
+interval, Holm-Bonferroni, the bootstrap median-delta interval) as
+descriptive evidence.
+
+The safety gate compares the elimination rate to the threshold as a
+point estimate. Its denominator is small (eleven commits for the
+published pair) and the exact 95% interval on such a rate usually
+contains the threshold, so `safety.json` and the verdict carry the
+interval, the n, and whether the threshold falls inside it. That is a
+disclosure, not a test: turning the rule into one is a calibration
+decision the harness leaves to the reader.
 
 ## Starting a project
 
@@ -411,6 +427,39 @@ knowing before quoting a number.
 - **`--longrun` is not the published dataset's plan.** It is a
   long-run profile of 30 campaigns; the published dataset used 10.
   The block harness README carries the exact reproduction command.
+- **Fuzz exposure is wall-clock hours, not covered surface.** The
+  rate ratio divides crashes by the hours each side ran. A driver that
+  implements less exposes less, so a feature-poor port can only look
+  robust per hour; the gate says nothing per feature, and coverage is
+  not yet folded in.
+- **Fuzz events are syzkaller buckets per campaign.** The same bug
+  found in ten campaigns counts ten times, which the conditional
+  binomial treats as ten independent events. Distinct crash titles
+  across campaigns are not deduplicated.
+- **Perf reps are one boot per driver, in sequence.** All C reps run
+  in one guest, then all Rust reps in another, so any host drift
+  between the two sessions is confounded with the driver, and a cached
+  C baseline can be days older than the campaign it is compared to.
+  The rep order and both manifests record enough to see this; they do
+  not prevent it.
+- **The commit history is only as long as the paths registered.** A
+  driver mined at its current directory alone loses everything before
+  the move that created it: for null_blk that is 2013 to 2020 and 225
+  of 364 commits. `history-paths` in the registry carries the earlier
+  paths, and `commits_summary.csv` states the window mined.
+- **"Implicit unsafe operations" is not a Rust `unsafe` count.** It
+  sums pointer expressions, member accesses, casts and allocation
+  calls in C; it is a proxy for how much of the code the compiler
+  cannot check, not a count comparable to `unsafe` blocks, and should
+  not be read as one.
+
+Two of the audit's findings were fixed rather than disclosed, and are
+worth knowing about because they change numbers: the two devices are
+now configured identically (the registry pins block size, capacity,
+completion mode, queue depth and I/O scheduler on both; before, the
+performance gate compared a softirq-completing 64-deep C device with
+an inline-completing 256-deep Rust one), and the fuzzing gate no
+longer passes on zero events.
 
 ## Known limitations
 
