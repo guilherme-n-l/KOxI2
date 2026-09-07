@@ -18,11 +18,9 @@
 //! match across implementations.
 
 use std::collections::HashMap;
-use std::fmt;
 
 use statrs::distribution::{Beta, ContinuousCDF, Gamma, Normal};
 
-pub const ALPHA: f64 = 0.05;
 pub const A12_SMALL: f64 = 0.56;
 pub const A12_MEDIUM: f64 = 0.64;
 pub const A12_LARGE: f64 = 0.71;
@@ -30,7 +28,10 @@ pub const A12_LARGE: f64 = 0.71;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Alternative {
     TwoSided,
+    // One-sided alternatives are fixture-validated but no gate uses them yet.
+    #[cfg_attr(not(test), allow(dead_code))]
     Greater,
+    #[cfg_attr(not(test), allow(dead_code))]
     Less,
 }
 
@@ -38,8 +39,63 @@ pub enum Alternative {
 pub enum Method {
     /// scipy's rule: exact when min(n) <= 8 and there are no ties.
     Auto,
+    // Forced methods are fixture-validated but no gate uses them yet.
+    #[cfg_attr(not(test), allow(dead_code))]
     Exact,
+    #[cfg_attr(not(test), allow(dead_code))]
     Asymptotic,
+}
+
+fn standard_normal() -> Normal {
+    Normal::new(0.0, 1.0).expect("standard normal")
+}
+
+/// Midranks (1-based, ties averaged) of `keys`, in input order, plus
+/// the tie term sum(t^3 - t) the tie-corrected variances need — zero
+/// exactly when there are no ties. Ranks are half-integers, so every
+/// sum of them downstream is exact regardless of accumulation order.
+fn midranks(keys: &[f64]) -> (Vec<f64>, f64) {
+    let mut order: Vec<usize> = (0..keys.len()).collect();
+    order.sort_by(|&a, &b| keys[a].total_cmp(&keys[b]));
+    let mut ranks = vec![0.0; keys.len()];
+    let mut tie_term = 0.0;
+    let mut start = 0;
+    while start < order.len() {
+        let mut end = start;
+        while end + 1 < order.len() && keys[order[end + 1]] == keys[order[start]] {
+            end += 1;
+        }
+        let count = (end - start + 1) as f64;
+        if end > start {
+            tie_term += count * count * count - count;
+        }
+        let rank = ((start + 1) + (end + 1)) as f64 / 2.0;
+        for &original in &order[start..=end] {
+            ranks[original] = rank;
+        }
+        start = end + 1;
+    }
+    (ranks, tie_term)
+}
+
+/// P(S <= floor(k)) under a discrete null tabulated as `counts`
+/// (index = statistic value): 0 below the support, 1 above it.
+fn null_cdf(counts: &[f64], k: f64) -> f64 {
+    if k < 0.0 {
+        return 0.0;
+    }
+    let k = (k as usize).min(counts.len() - 1);
+    counts[..=k].iter().sum::<f64>() / counts.iter().sum::<f64>()
+}
+
+/// The requested tail, or scipy's doubled smaller tail (capped at 1)
+/// for the two-sided alternative.
+fn tail_p(alternative: Alternative, p_less: f64, p_greater: f64) -> f64 {
+    match alternative {
+        Alternative::Less => p_less,
+        Alternative::Greater => p_greater,
+        Alternative::TwoSided => (2.0 * p_less.min(p_greater)).min(1.0),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -49,7 +105,6 @@ pub struct MannWhitney {
     /// NaN when the variance degenerates (all observations tied) —
     /// scipy returns NaN there too; NaN never counts as significant.
     pub p: f64,
-    pub method: &'static str,
 }
 
 /// scipy.stats.mannwhitneyu parity (validated by golden fixtures).
@@ -65,108 +120,68 @@ pub fn mann_whitney(
     let n1 = x.len() as f64;
     let n2 = y.len() as f64;
 
-    // Midranks over the pooled sample + the tie correction term.
-    let mut pooled: Vec<(f64, bool)> = x
-        .iter()
-        .map(|&value| (value, true))
-        .chain(y.iter().map(|&value| (value, false)))
-        .collect();
-    pooled.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let mut rank_sum_x = 0.0;
-    let mut tie_term = 0.0;
-    let mut ties = false;
-    let mut index = 0;
-    while index < pooled.len() {
-        let mut end = index;
-        while end + 1 < pooled.len() && pooled[end + 1].0 == pooled[index].0 {
-            end += 1;
-        }
-        let count = (end - index + 1) as f64;
-        if end > index {
-            ties = true;
-            tie_term += count * count * count - count;
-        }
-        let rank = ((index + 1) + (end + 1)) as f64 / 2.0;
-        for &(_, from_x) in &pooled[index..=end] {
-            if from_x {
-                rank_sum_x += rank;
-            }
-        }
-        index = end + 1;
-    }
+    let pooled: Vec<f64> = x.iter().chain(y).copied().collect();
+    let (ranks, tie_term) = midranks(&pooled);
+    let rank_sum_x: f64 = ranks[..x.len()].iter().sum();
     let u1 = rank_sum_x - n1 * (n1 + 1.0) / 2.0;
 
     // scipy's exact method runs even with ties (no correction: the
     // midrank U is evaluated against the untied distribution); auto
     // simply avoids that regime.
-    let resolved = match method {
-        Method::Exact => Method::Exact,
-        Method::Asymptotic => Method::Asymptotic,
-        Method::Auto => {
-            if !ties && n1.min(n2) <= 8.0 {
-                Method::Exact
-            } else {
-                Method::Asymptotic
-            }
-        }
+    let exact = match method {
+        Method::Exact => true,
+        Method::Asymptotic => false,
+        Method::Auto => tie_term == 0.0 && n1.min(n2) <= 8.0,
     };
-
-    let p = match resolved {
-        Method::Exact => exact_p(u1, x.len(), y.len(), alternative),
-        _ => asymptotic_p(u1, n1, n2, tie_term, alternative)?,
+    let p = if exact {
+        exact_p(u1, x.len(), y.len(), alternative)
+    } else {
+        asymptotic_p(u1, n1, n2, tie_term, alternative)
     };
-    Ok(MannWhitney {
-        u1,
-        p,
-        method: match resolved {
-            Method::Exact => "exact",
-            _ => "asymptotic",
-        },
-    })
+    Ok(MannWhitney { u1, p })
 }
 
 /// Tie-corrected variance, 0.5 continuity correction toward each
 /// tail. All-tied input leaves zero variance: scipy 1.18's signed
 /// correction makes the two-sided z 0/0 (NaN) while the one-sided
 /// tails evaluate the SF at an infinity (1.0).
-fn asymptotic_p(
-    u1: f64,
-    n1: f64,
-    n2: f64,
-    tie_term: f64,
-    alternative: Alternative,
-) -> Result<f64, Error> {
+fn asymptotic_p(u1: f64, n1: f64, n2: f64, tie_term: f64, alternative: Alternative) -> f64 {
     let total = n1 + n2;
     let mean = n1 * n2 / 2.0;
     let variance = (n1 * n2 / 12.0) * ((total + 1.0) - tie_term / (total * (total - 1.0)));
     if variance <= 0.0 {
-        return Ok(match alternative {
+        return match alternative {
             Alternative::TwoSided => f64::NAN,
             _ => 1.0,
-        });
+        };
     }
     let sigma = variance.sqrt();
-    let normal = Normal::new(0.0, 1.0).expect("standard normal");
-    Ok(match alternative {
+    let normal = standard_normal();
+    match alternative {
         Alternative::Greater => 1.0 - normal.cdf((u1 - mean - 0.5) / sigma),
         Alternative::Less => normal.cdf((u1 - mean + 0.5) / sigma),
         Alternative::TwoSided => {
             (2.0 * (1.0 - normal.cdf(((u1 - mean).abs() - 0.5) / sigma))).min(1.0)
         }
-    })
+    }
 }
 
-/// Exact U distribution via the Gaussian-binomial recurrence
+/// Counts of the exact null U distribution for sample sizes m and n
+/// (index = U), via the Gaussian-binomial recurrence
 /// N(u; m, n) = N(u-n; m-1, n) + N(u; m, n-1).
-fn exact_counts(m: usize, n: usize, memo: &mut HashMap<(usize, usize), Vec<f64>>) -> Vec<f64> {
+fn exact_counts(m: usize, n: usize) -> Vec<f64> {
+    exact_counts_memo(m, n, &mut HashMap::new())
+}
+
+fn exact_counts_memo(m: usize, n: usize, memo: &mut HashMap<(usize, usize), Vec<f64>>) -> Vec<f64> {
     if m == 0 || n == 0 {
         return vec![1.0];
     }
     if let Some(counts) = memo.get(&(m, n)) {
         return counts.clone();
     }
-    let left = exact_counts(m - 1, n, memo);
-    let right = exact_counts(m, n - 1, memo);
+    let left = exact_counts_memo(m - 1, n, memo);
+    let right = exact_counts_memo(m, n - 1, memo);
     let mut counts = vec![0.0; m * n + 1];
     for (u, count) in left.iter().enumerate() {
         counts[u + n] += count;
@@ -179,16 +194,8 @@ fn exact_counts(m: usize, n: usize, memo: &mut HashMap<(usize, usize), Vec<f64>>
 }
 
 fn exact_p(u1: f64, m: usize, n: usize, alternative: Alternative) -> f64 {
-    let mut memo = HashMap::new();
-    let counts = exact_counts(m, n, &mut memo);
-    let total: f64 = counts.iter().sum();
-    let cdf = |k: f64| -> f64 {
-        if k < 0.0 {
-            return 0.0;
-        }
-        let k = (k as usize).min(counts.len() - 1); // floor
-        counts[..=k].iter().sum::<f64>() / total
-    };
+    let counts = exact_counts(m, n);
+    let cdf = |k: f64| null_cdf(&counts, k);
     // P(U >= k); ceil handles the half-integer U midranks produce.
     let sf_inclusive = |k: f64| 1.0 - cdf(k.ceil() - 1.0);
     match alternative {
@@ -230,7 +237,7 @@ pub fn hodges_lehmann_ci(x: &[f64], y: &[f64], conf_level: f64) -> Result<Hodges
         .iter()
         .flat_map(|&xi| y.iter().map(move |&yj| xi - yj))
         .collect();
-    diffs.sort_by(|a, b| a.total_cmp(b));
+    diffs.sort_by(f64::total_cmp);
     let estimate = percentile(&diffs, 50.0);
 
     let target = (1.0 - conf_level) / 2.0;
@@ -258,8 +265,7 @@ pub fn hodges_lehmann_ci(x: &[f64], y: &[f64], conf_level: f64) -> Result<Hodges
 fn qwilcox(p: f64, m: usize, n: usize) -> (usize, f64) {
     let products = m * n;
     if products <= 5000 {
-        let mut memo = HashMap::new();
-        let counts = exact_counts(m, n, &mut memo);
+        let counts = exact_counts(m, n);
         let total: f64 = counts.iter().sum();
         let mut acc = 0.0;
         for (k, count) in counts.iter().enumerate() {
@@ -270,7 +276,7 @@ fn qwilcox(p: f64, m: usize, n: usize) -> (usize, f64) {
         }
         (products, 1.0)
     } else {
-        let normal = Normal::new(0.0, 1.0).expect("standard normal");
+        let normal = standard_normal();
         let mu = products as f64 / 2.0;
         let sigma = (products as f64 * (m + n + 1) as f64 / 12.0).sqrt();
         let k = (mu - 0.5 + sigma * normal.inverse_cdf(p)).ceil().max(0.0) as usize;
@@ -284,6 +290,15 @@ pub struct SignedRank {
     pub statistic: f64,
     pub p: f64,
     pub method: &'static str,
+}
+
+/// The null `wilcoxon_signed_rank` evaluates T+ against once
+/// `Method::Auto` is resolved.
+#[derive(Debug, Clone, Copy)]
+enum SignedRankNull {
+    Exact,
+    Approx,
+    Permutation,
 }
 
 /// scipy.stats.wilcoxon parity under scipy's defaults
@@ -308,7 +323,6 @@ pub fn wilcoxon_signed_rank(
     if x.is_empty() {
         return Err(Error::EmptySample);
     }
-    let full_len = x.len();
     let diffs: Vec<f64> = x
         .iter()
         .zip(y)
@@ -318,32 +332,11 @@ pub fn wilcoxon_signed_rank(
     if diffs.is_empty() {
         return Err(Error::AllZeroDifferences);
     }
-    let zeros = full_len - diffs.len();
+    let zeros = x.len() - diffs.len();
     let n = diffs.len();
 
-    // Midranks of |d| and the tie term sum(t^3 - t).
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&a, &b| diffs[a].abs().total_cmp(&diffs[b].abs()));
-    let mut ranks = vec![0.0; n];
-    let mut tie_term = 0.0;
-    let mut ties = false;
-    let mut index = 0;
-    while index < n {
-        let mut end = index;
-        while end + 1 < n && diffs[order[end + 1]].abs() == diffs[order[index]].abs() {
-            end += 1;
-        }
-        let count = (end - index + 1) as f64;
-        if end > index {
-            ties = true;
-            tie_term += count * count * count - count;
-        }
-        let rank = ((index + 1) + (end + 1)) as f64 / 2.0;
-        for &original in &order[index..=end] {
-            ranks[original] = rank;
-        }
-        index = end + 1;
-    }
+    let magnitudes: Vec<f64> = diffs.iter().map(|d| d.abs()).collect();
+    let (ranks, tie_term) = midranks(&magnitudes);
     let r_plus: f64 = diffs
         .iter()
         .zip(&ranks)
@@ -352,101 +345,31 @@ pub fn wilcoxon_signed_rank(
         .sum();
     let r_minus = n as f64 * (n as f64 + 1.0) / 2.0 - r_plus;
 
-    enum Resolved {
-        Exact,
-        Approx,
-        Permutation,
-    }
-    let resolved = match method {
-        Method::Exact => Resolved::Exact,
-        Method::Asymptotic => Resolved::Approx,
+    let null = match method {
+        Method::Exact => SignedRankNull::Exact,
+        Method::Asymptotic => SignedRankNull::Approx,
         Method::Auto => {
-            if full_len > 50 {
-                Resolved::Approx
-            } else if !ties && zeros == 0 {
-                Resolved::Exact
-            } else if full_len <= 13 {
-                Resolved::Permutation
+            if x.len() > 50 {
+                SignedRankNull::Approx
+            } else if tie_term == 0.0 && zeros == 0 {
+                SignedRankNull::Exact
+            } else if x.len() <= 13 {
+                SignedRankNull::Permutation
             } else {
-                Resolved::Approx
+                SignedRankNull::Approx
             }
         }
     };
-
-    let (p, method_name) = match resolved {
-        Resolved::Exact => {
-            // Midranks can make T+ non-integral against the untied
-            // null; scipy rounds conservatively (gh-19872): less
-            // takes cdf(ceil), greater the inclusive sf(floor).
-            let counts = signed_rank_counts(n);
-            let total = counts.iter().sum::<f64>();
-            let cdf = |k: f64| -> f64 {
-                if k < 0.0 {
-                    return 0.0;
-                }
-                let k = (k as usize).min(counts.len() - 1);
-                counts[..=k].iter().sum::<f64>() / total
-            };
-            let p_less = cdf(r_plus.ceil());
-            let p_greater = 1.0 - cdf(r_plus.floor() - 1.0);
-            let p = match alternative {
-                Alternative::Less => p_less,
-                Alternative::Greater => p_greater,
-                Alternative::TwoSided => (2.0 * p_less.min(p_greater)).min(1.0),
-            };
-            (p, "exact")
-        }
-        Resolved::Approx => {
-            let count = n as f64;
-            let mean = count * (count + 1.0) / 4.0;
-            let sigma =
-                ((count * (count + 1.0) * (2.0 * count + 1.0) - tie_term / 2.0) / 24.0).sqrt();
-            let z = (r_plus - mean) / sigma;
-            let normal = Normal::new(0.0, 1.0).expect("standard normal");
-            let p = match alternative {
-                Alternative::Greater => 1.0 - normal.cdf(z),
-                Alternative::Less => normal.cdf(z),
-                Alternative::TwoSided => 2.0 * (1.0 - normal.cdf(z.abs())),
-            };
-            (p, "approx")
-        }
-        Resolved::Permutation => {
-            // Doubled ranks are exact integers, so the enumeration
-            // over the 2^n sign assignments needs no tolerance.
-            // Flipping a dropped zero never changes the statistic,
-            // so enumerating the non-zero part matches scipy's
-            // enumeration over the full vector.
-            let ranks2: Vec<u64> = ranks
-                .iter()
-                .map(|rank| (rank * 2.0).round() as u64)
-                .collect();
-            let observed2 = (r_plus * 2.0).round() as u64;
-            let total = 1u64 << n;
-            let mut greater_eq = 0u64;
-            let mut less_eq = 0u64;
-            for mask in 0..total {
-                let mut t2 = 0u64;
-                for (bit, rank2) in ranks2.iter().enumerate() {
-                    if mask >> bit & 1 == 1 {
-                        t2 += rank2;
-                    }
-                }
-                if t2 >= observed2 {
-                    greater_eq += 1;
-                }
-                if t2 <= observed2 {
-                    less_eq += 1;
-                }
-            }
-            let p_greater = greater_eq as f64 / total as f64;
-            let p_less = less_eq as f64 / total as f64;
-            let p = match alternative {
-                Alternative::Greater => p_greater,
-                Alternative::Less => p_less,
-                Alternative::TwoSided => (2.0 * p_less.min(p_greater)).min(1.0),
-            };
-            (p, "permutation")
-        }
+    let (p, method_name) = match null {
+        SignedRankNull::Exact => (signed_rank_exact_p(r_plus, n, alternative), "exact"),
+        SignedRankNull::Approx => (
+            signed_rank_approx_p(r_plus, n, tie_term, alternative),
+            "approx",
+        ),
+        SignedRankNull::Permutation => (
+            signed_rank_permutation_p(&ranks, r_plus, alternative),
+            "permutation",
+        ),
     };
 
     Ok(SignedRank {
@@ -457,6 +380,64 @@ pub fn wilcoxon_signed_rank(
         p,
         method: method_name,
     })
+}
+
+/// T+ against the exact untied null on n ranks. Midranks can make T+
+/// non-integral against it; scipy rounds conservatively (gh-19872):
+/// less takes cdf(ceil), greater the inclusive sf(floor).
+fn signed_rank_exact_p(r_plus: f64, n: usize, alternative: Alternative) -> f64 {
+    let counts = signed_rank_counts(n);
+    let p_less = null_cdf(&counts, r_plus.ceil());
+    let p_greater = 1.0 - null_cdf(&counts, r_plus.floor() - 1.0);
+    tail_p(alternative, p_less, p_greater)
+}
+
+/// Tie-corrected normal approximation of T+, no continuity
+/// correction (scipy's correction=False default).
+fn signed_rank_approx_p(r_plus: f64, n: usize, tie_term: f64, alternative: Alternative) -> f64 {
+    let count = n as f64;
+    let mean = count * (count + 1.0) / 4.0;
+    let sigma = ((count * (count + 1.0) * (2.0 * count + 1.0) - tie_term / 2.0) / 24.0).sqrt();
+    let z = (r_plus - mean) / sigma;
+    let normal = standard_normal();
+    match alternative {
+        Alternative::Greater => 1.0 - normal.cdf(z),
+        Alternative::Less => normal.cdf(z),
+        Alternative::TwoSided => 2.0 * (1.0 - normal.cdf(z.abs())),
+    }
+}
+
+/// T+ against the sign-flip permutation null: every one of the 2^n
+/// sign assignments of the ranks. Doubled ranks are exact integers,
+/// so the enumeration needs no tolerance. Flipping a dropped zero
+/// never changes the statistic, so enumerating the non-zero part
+/// matches scipy's enumeration over the full vector.
+fn signed_rank_permutation_p(ranks: &[f64], r_plus: f64, alternative: Alternative) -> f64 {
+    let ranks2: Vec<u64> = ranks
+        .iter()
+        .map(|rank| (rank * 2.0).round() as u64)
+        .collect();
+    let observed2 = (r_plus * 2.0).round() as u64;
+    let total = 1u64 << ranks.len();
+    let mut greater_eq = 0u64;
+    let mut less_eq = 0u64;
+    for mask in 0..total {
+        let mut t2 = 0u64;
+        for (bit, rank2) in ranks2.iter().enumerate() {
+            if mask >> bit & 1 == 1 {
+                t2 += rank2;
+            }
+        }
+        if t2 >= observed2 {
+            greater_eq += 1;
+        }
+        if t2 <= observed2 {
+            less_eq += 1;
+        }
+    }
+    let p_less = less_eq as f64 / total as f64;
+    let p_greater = greater_eq as f64 / total as f64;
+    tail_p(alternative, p_less, p_greater)
 }
 
 /// Counts of subsets of {1..n} by rank sum (the exact null of T+).
@@ -479,6 +460,18 @@ pub struct A12Interval {
     pub hi: f64,
 }
 
+/// Placement score of one pair: 1 when x wins, 0.5 on a tie — the
+/// quantity both A12 and pROC's DeLong variance count.
+fn placement(xi: f64, yj: f64) -> f64 {
+    if xi > yj {
+        1.0
+    } else if xi == yj {
+        0.5
+    } else {
+        0.0
+    }
+}
+
 /// DeLong CI for A12 (the AUC of x against y), matching pROC
 /// `ci.auc(..., method="delong")`: Wald interval on the placement
 /// variance, clipped to [0, 1]. Degenerate data (perfect separation,
@@ -495,27 +488,20 @@ pub fn a12_delong_ci(x: &[f64], y: &[f64], conf_level: f64) -> Result<A12Interva
     let mut y_placements = vec![0.0; y.len()];
     for (i, &xi) in x.iter().enumerate() {
         for (j, &yj) in y.iter().enumerate() {
-            let score = if xi > yj {
-                1.0
-            } else if xi == yj {
-                0.5
-            } else {
-                0.0
-            };
+            let score = placement(xi, yj);
             x_placements[i] += score;
             y_placements[j] += score;
         }
     }
-    for placement in x_placements.iter_mut() {
-        *placement /= n;
+    for score in &mut x_placements {
+        *score /= n;
     }
-    for placement in y_placements.iter_mut() {
-        *placement /= m;
+    for score in &mut y_placements {
+        *score /= m;
     }
     let a12 = x_placements.iter().sum::<f64>() / m;
     let variance = sample_variance(&x_placements) / m + sample_variance(&y_placements) / n;
-    let normal = Normal::new(0.0, 1.0).expect("standard normal");
-    let half = normal.inverse_cdf(1.0 - (1.0 - conf_level) / 2.0) * variance.sqrt();
+    let half = standard_normal().inverse_cdf(1.0 - (1.0 - conf_level) / 2.0) * variance.sqrt();
     Ok(A12Interval {
         a12,
         lo: (a12 - half).max(0.0),
@@ -523,12 +509,16 @@ pub fn a12_delong_ci(x: &[f64], y: &[f64], conf_level: f64) -> Result<A12Interva
     })
 }
 
+fn mean(values: &[f64]) -> f64 {
+    values.iter().sum::<f64>() / values.len() as f64
+}
+
 /// ddof=1 variance; 0 below two values.
 fn sample_variance(values: &[f64]) -> f64 {
     if values.len() < 2 {
         return 0.0;
     }
-    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let mean = mean(values);
     values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (values.len() as f64 - 1.0)
 }
 
@@ -538,18 +528,11 @@ pub fn vargha_delaney_a12(x: &[f64], y: &[f64]) -> f64 {
     if x.is_empty() || y.is_empty() {
         return 0.5;
     }
-    let mut more = 0.0;
-    let mut equal = 0.0;
-    for &xi in x {
-        for &yj in y {
-            if xi > yj {
-                more += 1.0;
-            } else if xi == yj {
-                equal += 1.0;
-            }
-        }
-    }
-    (more + 0.5 * equal) / (x.len() as f64 * y.len() as f64)
+    let wins: f64 = x
+        .iter()
+        .flat_map(|&xi| y.iter().map(move |&yj| placement(xi, yj)))
+        .sum();
+    wins / (x.len() as f64 * y.len() as f64)
 }
 
 /// v1's effect-size buckets, folded around 0.5.
@@ -583,18 +566,11 @@ pub fn descriptive(values: &[f64]) -> Result<Descriptive, Error> {
         return Err(Error::EmptySample);
     }
     let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.total_cmp(b));
-    let mean = values.iter().sum::<f64>() / values.len() as f64;
-    let std = if values.len() > 1 {
-        (values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (values.len() as f64 - 1.0))
-            .sqrt()
-    } else {
-        0.0
-    };
+    sorted.sort_by(f64::total_cmp);
     Ok(Descriptive {
         median: percentile(&sorted, 50.0),
-        mean,
-        std,
+        mean: mean(values),
+        std: sample_variance(values).sqrt(),
         p25: percentile(&sorted, 25.0),
         p75: percentile(&sorted, 75.0),
     })
@@ -608,6 +584,11 @@ fn percentile(sorted: &[f64], q: f64) -> f64 {
     sorted[low] + (sorted[high] - sorted[low]) * (position - low as f64)
 }
 
+/// Beta(a, b) for positive integer shapes.
+fn beta(a: u64, b: u64) -> Beta {
+    Beta::new(a as f64, b as f64).expect("valid beta parameters")
+}
+
 /// Exact binomial upper tail P(X >= k) for X ~ Bin(n, p), matching
 /// scipy binomtest(alternative="greater").
 pub fn binomial_sf(k: u64, n: u64, p: f64) -> f64 {
@@ -618,9 +599,7 @@ pub fn binomial_sf(k: u64, n: u64, p: f64) -> f64 {
         return 0.0;
     }
     // P(X >= k) = I_p(k, n - k + 1), the regularized incomplete beta.
-    Beta::new(k as f64, (n - k + 1) as f64)
-        .expect("valid beta parameters")
-        .cdf(p)
+    beta(k, n - k + 1).cdf(p)
 }
 
 /// Clopper-Pearson (exact) two-sided binomial CI, matching scipy
@@ -632,16 +611,12 @@ pub fn clopper_pearson(k: u64, n: u64, conf_level: f64) -> (f64, f64) {
     let lo = if k == 0 {
         0.0
     } else {
-        Beta::new(k as f64, (n - k + 1) as f64)
-            .expect("valid beta parameters")
-            .inverse_cdf(tail)
+        beta(k, n - k + 1).inverse_cdf(tail)
     };
     let hi = if k >= n {
         1.0
     } else {
-        Beta::new((k + 1) as f64, (n - k) as f64)
-            .expect("valid beta parameters")
-            .inverse_cdf(1.0 - tail)
+        beta(k + 1, n - k).inverse_cdf(1.0 - tail)
     };
     (lo, hi)
 }
@@ -670,11 +645,9 @@ pub fn binomial_mde_ratio(total: u64, t_c: f64, t_rs: f64, alpha: f64, power: f6
     let p0 = p_of(1.0);
     let critical = (0..=total).find(|&k| binomial_sf(k, total, p0) <= alpha)?;
     let achieves = |rho: f64| binomial_sf(critical, total, p_of(rho)) >= power;
+    // Bracket by doubling, then bisect to the boundary.
     let mut hi = 1.0f64;
-    loop {
-        if achieves(hi) {
-            break;
-        }
+    while !achieves(hi) {
         hi *= 2.0;
         if hi > 1e9 {
             return None;
@@ -682,7 +655,7 @@ pub fn binomial_mde_ratio(total: u64, t_c: f64, t_rs: f64, alpha: f64, power: f6
     }
     let mut lo = 1.0f64;
     for _ in 0..200 {
-        let mid = (lo + hi) / 2.0;
+        let mid = f64::midpoint(lo, hi);
         if achieves(mid) {
             hi = mid;
         } else {
@@ -749,42 +722,31 @@ pub fn bootstrap_median_delta_ci(
     let mut rs_sample = vec![0.0; rs.len()];
     let mut replicates = Vec::with_capacity(resamples as usize);
     for _ in 0..resamples {
-        for slot in c_sample.iter_mut() {
+        for slot in &mut c_sample {
             *slot = c[(next() % c.len() as u64) as usize];
         }
-        for slot in rs_sample.iter_mut() {
+        for slot in &mut rs_sample {
             *slot = rs[(next() % rs.len() as u64) as usize];
         }
-        c_sample.sort_by(|a, b| a.total_cmp(b));
-        rs_sample.sort_by(|a, b| a.total_cmp(b));
+        c_sample.sort_by(f64::total_cmp);
+        rs_sample.sort_by(f64::total_cmp);
         let c_median = percentile(&c_sample, 50.0);
         let rs_median = percentile(&rs_sample, 50.0);
         replicates.push((rs_median - c_median) / c_median * 100.0);
     }
-    replicates.sort_by(|a, b| a.total_cmp(b));
+    replicates.sort_by(f64::total_cmp);
     Ok((percentile(&replicates, 2.5), percentile(&replicates, 97.5)))
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
+    #[error("statistics need non-empty samples")]
     EmptySample,
+    #[error("paired statistics need equal-length samples")]
     UnpairedSamples,
+    #[error("signed-rank is undefined when every difference is zero")]
     AllZeroDifferences,
 }
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::EmptySample => write!(f, "statistics need non-empty samples"),
-            Error::UnpairedSamples => write!(f, "paired statistics need equal-length samples"),
-            Error::AllZeroDifferences => {
-                write!(f, "signed-rank is undefined when every difference is zero")
-            }
-        }
-    }
-}
-
-impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {
@@ -864,7 +826,7 @@ mod tests {
                 // infinity and give 1.0.
                 None => {
                     assert!(result.p.is_nan(), "{alt_name}: scipy returns NaN");
-                    assert_eq!(result.p.partial_cmp(&ALPHA), None);
+                    assert_eq!(result.p.partial_cmp(&0.05), None);
                 }
                 Some(expected) => assert_close(result.p, expected, alt_name),
             }
