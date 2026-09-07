@@ -213,6 +213,84 @@ complete, well-formed verdict on a kernel it was not built against; it says
 nothing about how rnull performs on 7.2, and the -58.77% median delta should not
 be quoted.
 
+## Second pass: what the first one did not touch
+
+The first pass drove the pipeline and walked the command tree. The
+second went looking for surfaces neither of those reach: the integrity
+checks a results tree is supposed to enforce, the crash classifier on
+crashes (no real campaign had produced one), the registry entries
+nobody had booted, interrupted runs, and knob values at the edge of
+their domain. Forty-six scenarios on the reference host, scripted, no
+kernel builds; then a verification run of every fix.
+
+### Found and fixed
+
+| #   | Defect                                                                                                      | Severity   |
+| --- | ----------------------------------------------------------------------------------------------------------- | ---------- |
+| 13  | `--alpha 1.5` and `--bootstrap-resamples 0` panicked inside the statistics; `--alpha 0` was accepted        | medium     |
+| 14  | Negative thresholds were refused by clap as unknown flags, never by the range check                         | low        |
+| 15  | A fio matrix typo (`--fio-bs 4x`, `--fio-rw randfoo`, `--fio-runtime 0`) booted a guest before failing      | low-medium |
+| 16  | SIGTERM to koxi left the guest running on the ssh port; SIGKILL mid-fuzz left syz-manager and 4 guests      | medium     |
+| 17  | A registry driver whose module was not built failed a whole `fuzz` run after every other campaign ran       | medium     |
+| 18  | `zram` and `dm-zero` were registered but the shipped config built neither as a module                       | medium     |
+| 19  | A tampered `koxi.lock` (artifact sha edited) measured and completed without a word                          | medium     |
+| 20  | A compare that failed halfway left the previous run's `verdict.json` in place                               | low-medium |
+| 21  | "Permission denied (os error 13)" named no file and no gate                                                 | low        |
+| 22  | A workload with no usable reps reported a median delta of 0%, which reads as parity                         | low        |
+| 23  | `koxi block all --p1` on a driver with no pair failed at the compare phase it should have skipped           | low-medium |
+| 24  | The manifests' host tag was "unknown": `hostname` is not in the nix shell, so the substrate guard was blind | medium     |
+| 25  | The two devices of the pair ran on different default geometries (see the methodology audit)                 | high       |
+
+Number 16 is the kind of thing a scripted pass finds and a person at a
+terminal never does, because Ctrl-C sends SIGINT to the whole
+foreground group and the guest dies with koxi. A service manager, a
+parent process or `kill` sends it to koxi alone, and a Rust binary
+with no signal handler exits without running a single `Drop`. The fix
+is not a handler: every guest and every syz-manager now asks the
+kernel for `PR_SET_PDEATHSIG`, so it dies when koxi does, however koxi
+died.
+
+Number 17 was reported as `No such file or directory (os error 2)`
+after a successful campaign, with no path. The identity of the next
+subject hashes its module file, `zram.ko` did not exist, and the error
+carried no context. That is also number 18: `CONFIG_ZRAM` was unset
+and `CONFIG_DM_ZERO` built in, so two of the seven registry entries
+could never have been booted. Both are modules now, and an unbuilt
+module skips its driver with a warning instead of ending the run.
+
+Number 25 came from reading the queue limits back from the guest,
+which the pass did for the 1 MiB question (`max_sectors_kb` is 127, so
+a 1 MiB request is eight or nine): `nr_requests` was 64 on the C device
+and 256 on the Rust one, and the scheduler was `none` against
+`mq-deadline`. The methodology audit has the rest.
+
+### Held
+
+- Results trees are portable: a copied tree re-gates to the same
+  verdict, in a path with spaces too, and the substrate guard refuses an
+  edited host or acceleration tag.
+- An incomplete domain and a missing baseline are both refused with
+  the path that is wrong.
+- The crash classifier does what the paper says: a driver frame in the
+  call stack attributes, the driver's name in `Modules linked in:`
+  alone does not, an infrastructure signature anywhere is noise, and an
+  override CSV wins over the automatic verdict. Two things it did not
+  do are in the audit: frames in the abstraction layer (fixed) and
+  frames without a module tag, which only a built-in driver produces.
+- Ctrl-C mid-perf leaves a resumable root: the reps in flight are
+  recorded as failed, the next run fills them and marks the root
+  complete.
+- A knob change mints a new baseline instead of pooling: `--fio-engine
+psync` beside `io_uring` gave a fifth perf root, not a wider one.
+- `koxi new`, `koxi init` and `koxi assets dump` refuse to overwrite,
+  and an override under `assets/` is reported as one.
+- Two guests on the same forward port fail cleanly (qemu exits early);
+  on distinct ports they run side by side.
+- The other registry drivers boot: brd, loop and nbd come up with their
+  device node, and the fuzz kernel boots rnull.
+- Logs grow by about a megabyte per thirty-five runs and nothing sweeps
+  them; `koxi clean` leaves `log/` alone by design.
+
 ## Backlog
 
 ### A clang-built comparison
