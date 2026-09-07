@@ -101,10 +101,30 @@ pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow
         }
 
         // Fold whatever landed into the overall verdict.
-        let screening =
-            std::fs::read_to_string(results_root.join("p1").join(c_name).join("screening.json"))
-                .ok()
-                .and_then(|content| serde_json::from_str(&content).ok());
+        // An unreadable screening.json is not an absent one. Chaining
+        // .ok() twice made a truncated file -- an interrupted write, a
+        // partial rsync between machines -- look exactly like a driver
+        // that was never screened, and the verdict would then omit its
+        // phase-1 context without saying why.
+        let screening_path = results_root.join("p1").join(c_name).join("screening.json");
+        let screening = match std::fs::read_to_string(&screening_path) {
+            Ok(content) => match serde_json::from_str(&content) {
+                Ok(value) => Some(value),
+                Err(err) => {
+                    warn!("{}: unreadable screening ({err}); the verdict will carry no phase-1 context",
+                        screening_path.display());
+                    None
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                warn!(
+                    "{}: unreadable screening ({err}); the verdict will carry no phase-1 context",
+                    screening_path.display()
+                );
+                None
+            }
+        };
         verdict::write_verdict(
             &compare_dir,
             campaign,
