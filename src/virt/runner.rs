@@ -156,15 +156,31 @@ pub fn ssh_command(key: &Path, batch: bool) -> Command {
     ssh
 }
 
-/// Host identity for result manifests.
+/// Host identity for result manifests. The kernel's own record comes
+/// first: `hostname` is a separate package on some distributions and
+/// absent from the nix shell, and a manifest tagged "unknown" cannot
+/// keep two machines' numbers apart, which is the tag's whole job.
 pub fn hostname() -> String {
-    Command::new("hostname")
-        .output()
+    let from_kernel = std::fs::read_to_string("/proc/sys/kernel/hostname")
         .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "unknown".to_owned())
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty());
+    from_kernel
+        .or_else(|| {
+            Command::new("hostname")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                .filter(|name| !name.is_empty())
+        })
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                "host name unavailable: results will be tagged \"unknown\" and the \
+                 same-substrate guard cannot tell this machine from another"
+            );
+            "unknown".to_owned()
+        })
 }
 
 /// A launched qemu guest; killed on drop (the guest is stateless).
