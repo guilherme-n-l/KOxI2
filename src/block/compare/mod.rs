@@ -43,6 +43,7 @@ pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow
     if pairs.is_empty() {
         bail!("no matching driver pairs in the [block.drivers] registry");
     }
+    let _gate = results::gate_lock(&results_root)?;
 
     let mut compared = 0;
     for pair in pairs {

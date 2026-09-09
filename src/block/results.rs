@@ -26,6 +26,25 @@ use crate::util::{self, confirm};
 
 pub const MANIFEST: &str = "manifest.toml";
 
+/// Advisory lock at the results root, held by any verb that writes
+/// gate artifacts (compare, screen). Two of them at once raced: one
+/// removed the stale artifacts the other had just written, and the
+/// verdict read the gap as a dimension never measured. Both also
+/// write crash_classification.json into the same phase-1 campaign
+/// directories.
+pub const GATE_LOCK: &str = ".gate-lock";
+
+/// Take the gate lock for a results root that must already exist:
+/// a root that does not is a typo in `--output`, not a place to
+/// create a lock file in.
+pub fn gate_lock(results_root: &Path) -> anyhow::Result<util::FileLock> {
+    if !results_root.is_dir() {
+        anyhow::bail!("no results at {}", results_root.display());
+    }
+    util::FileLock::acquire(&results_root.join(GATE_LOCK), "results")
+        .map_err(|err| anyhow::anyhow!("locking {}: {err}", results_root.display()))
+}
+
 /// One result root's record: identity (hashed) plus run state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
@@ -428,6 +447,37 @@ mod tests {
         static_.domain = "static".into();
         static_.fio = None;
         assert!(static_.validate().is_ok());
+    }
+
+    #[test]
+    fn the_gate_lock_needs_a_results_root_and_excludes_a_second_holder() {
+        use std::fs::{OpenOptions, TryLockError};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("results");
+        // A root that does not exist is a typo, not a place to lock.
+        let error = gate_lock(&root).unwrap_err().to_string();
+        assert!(error.contains("no results at"), "{error}");
+        fs::create_dir_all(&root).unwrap();
+        let held = gate_lock(&root).unwrap();
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join(GATE_LOCK))
+            .unwrap();
+        assert!(matches!(probe.try_lock(), Err(TryLockError::WouldBlock)));
+        drop(held);
+        assert!((0..100).any(|_| {
+            if probe.try_lock().is_ok() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        }));
+        // A lock path that cannot be opened names the root.
+        fs::remove_file(root.join(GATE_LOCK)).unwrap();
+        fs::create_dir(root.join(GATE_LOCK)).unwrap();
+        let error = gate_lock(&root).unwrap_err().to_string();
+        assert!(error.contains("locking"), "{error}");
     }
 
     #[test]

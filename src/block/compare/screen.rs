@@ -32,6 +32,7 @@ pub(crate) fn drive(scope: &Scope, opts: &ScreenOpts) -> anyhow::Result<()> {
         Some(path) => load_validated_crashes(path)?,
         None => HashMap::new(),
     };
+    let _gate = results::gate_lock(&results_root)?;
 
     for subject in subjects {
         let c_name = subject.c_name;

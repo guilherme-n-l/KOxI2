@@ -150,6 +150,11 @@ difference in configuration as much as in implementation:
 
 The default result root is `results/`, overridable with `--output`.
 It holds measurement data only, and is never touched by `koxi clean`.
+The verbs that write gate artifacts, `compare` and `screen`, hold an
+advisory lock at `results/.gate-lock` while they run: two of them at
+once used to race, one removing the stale artifacts the other had
+just written, and both write `crash_classification.json` into the
+same phase-1 campaign directories. A second run waits and says so.
 
 Phase 1 is a content-addressed baseline cache. Changing a knob
 changes the identity hash, which mints a fresh baseline and leaves
