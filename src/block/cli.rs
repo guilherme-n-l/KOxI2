@@ -531,13 +531,16 @@ impl CompareOpts {
                 "must lie between 0 and 100: it is an elimination rate in percent",
             ));
         }
-        if opts.fuzz_rate_margin < 1.0 {
+        // `< 1.0` let NaN and infinity through: neither is below 1,
+        // and neither is a margin the bound can be compared against.
+        if !(opts.fuzz_rate_margin.is_finite() && opts.fuzz_rate_margin >= 1.0) {
             return Err(invalid(
                 "FUZZ_RATE_MARGIN",
                 "fuzz-rate-margin",
                 opts.fuzz_rate_margin.to_string(),
-                "must be at least 1: a margin below 1 asks the Rust driver to crash less \
-                 than the C driver, which is superiority, not non-inferiority",
+                "must be a finite number of at least 1: a margin below 1 asks the Rust \
+                 driver to crash less than the C driver, which is superiority, not \
+                 non-inferiority",
             ));
         }
         if opts.bootstrap_resamples < 100 {
@@ -615,6 +618,11 @@ mod tests {
             ["--safety-threshold", "150"],
             ["--fuzz-rate-margin", "0.5"],
             ["--fuzz-rate-margin", "-2"],
+            ["--fuzz-rate-margin", "NaN"],
+            ["--fuzz-rate-margin", "inf"],
+            ["--alpha", "NaN"],
+            ["--perf-threshold", "inf"],
+            ["--safety-threshold", "NaN"],
             ["--bootstrap-resamples", "0"],
         ] {
             let err = checked(&bad).expect_err(&bad.join(" "));
