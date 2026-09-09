@@ -203,7 +203,8 @@ and scores four dimensions from 0 to 3. Every complete baseline found
 there must be what its path says: this driver, this domain, filed
 under its own identity hash, with no campaign record and a plan the
 gates can run. One that is not is an error, since the pick is
-recorded as the screening's source.
+recorded as the screening's source, and a screening that fails leaves
+no artifact behind.
 
 | Dimension            | Read from                             | Scored on                                                                          |
 | -------------------- | ------------------------------------- | ---------------------------------------------------------------------------------- |

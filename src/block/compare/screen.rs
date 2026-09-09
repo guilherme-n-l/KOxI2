@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, ensure};
+use anyhow::{bail, ensure, Context};
 use serde_json::json;
 use tracing::info;
 
@@ -36,6 +36,13 @@ pub(crate) fn drive(scope: &Scope, opts: &ScreenOpts) -> anyhow::Result<()> {
     for subject in subjects {
         let c_name = subject.c_name;
         let driver_root = results_root.join("p1").join(c_name);
+        // Last time's screening does not survive into this run: a
+        // screen that fails halfway must not leave the old artifact
+        // looking like this run's result.
+        let out = driver_root.join("screening.json");
+        if out.exists() {
+            fs::remove_file(&out).with_context(|| format!("removing stale {}", out.display()))?;
+        }
         let static_pick = latest_complete(&driver_root.join("static"), c_name, "static")?;
         let fuzz_pick = latest_complete(&driver_root.join("fuzz"), c_name, "fuzz")?;
         // Screening is a phase-1 verdict on the C driver. A
@@ -82,7 +89,6 @@ pub(crate) fn drive(scope: &Scope, opts: &ScreenOpts) -> anyhow::Result<()> {
             "overall": overall,
         });
         fs::create_dir_all(&driver_root)?;
-        let out = driver_root.join("screening.json");
         fs::write(&out, serde_json::to_string_pretty(&result)?)?;
         info!("screening {c_name}: {overall} -> {}", out.display());
     }
