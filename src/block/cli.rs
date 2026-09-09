@@ -631,56 +631,65 @@ mod tests {
 
     #[test]
     fn compare_knobs_are_range_checked_not_panicked_on() {
-        let checked = |args: &[&str]| CompareOpts::checked(&parse(&[&["compare"], args].concat()));
-        assert!(checked(&[]).is_ok());
-        // Negative numbers reach the range check instead of being
-        // read by clap as unknown flags.
-        for bad in [
-            ["--alpha", "0"],
-            ["--alpha", "1.5"],
-            ["--alpha", "-0.1"],
-            ["--perf-threshold", "-5"],
-            ["--perf-threshold", "500"],
-            ["--safety-threshold", "150"],
-            ["--fuzz-rate-margin", "0.5"],
-            ["--fuzz-rate-margin", "-2"],
-            ["--fuzz-rate-margin", "NaN"],
-            ["--fuzz-rate-margin", "inf"],
-            ["--alpha", "NaN"],
-            ["--perf-threshold", "inf"],
-            ["--safety-threshold", "NaN"],
-            ["--bootstrap-resamples", "0"],
-        ] {
-            let err = checked(&bad).expect_err(&bad.join(" "));
-            assert!(
-                matches!(err, Error::Invalid { .. }),
-                "{}: {err}",
-                bad.join(" ")
-            );
-        }
-        assert!(checked(&["--alpha", "0.2", "--fuzz-rate-margin", "1"]).is_ok());
+        with_env(&[], || {
+            let checked =
+                |args: &[&str]| CompareOpts::checked(&parse(&[&["compare"], args].concat()));
+            assert!(checked(&[]).is_ok());
+            // Negative numbers reach the range check instead of being
+            // read by clap as unknown flags.
+            for bad in [
+                ["--alpha", "0"],
+                ["--alpha", "1.5"],
+                ["--alpha", "-0.1"],
+                ["--perf-threshold", "-5"],
+                ["--perf-threshold", "500"],
+                ["--safety-threshold", "150"],
+                ["--fuzz-rate-margin", "0.5"],
+                ["--fuzz-rate-margin", "-2"],
+                ["--fuzz-rate-margin", "NaN"],
+                ["--fuzz-rate-margin", "inf"],
+                ["--alpha", "NaN"],
+                ["--perf-threshold", "inf"],
+                ["--safety-threshold", "NaN"],
+                ["--bootstrap-resamples", "0"],
+            ] {
+                let err = checked(&bad).expect_err(&bad.join(" "));
+                assert!(
+                    matches!(err, Error::Invalid { .. }),
+                    "{}: {err}",
+                    bad.join(" ")
+                );
+            }
+            assert!(checked(&["--alpha", "0.2", "--fuzz-rate-margin", "1"]).is_ok());
+        });
     }
 
+    /// Reads the environment (the profile layer does), so it takes
+    /// the env lock like every other test that does: without it, a
+    /// sibling's FIO_REPS=1 turned the well-formed plan into a
+    /// refused one.
     #[test]
     fn fio_plan_typos_fail_before_a_guest_boots() {
-        for bad in [
-            ["--fio-runtime", "0"],
-            ["--fio-qd", "0"],
-            ["--fio-bs", "0k"],
-            ["--fio-bs", "4x"],
-            ["--fio-rw", "randfoo"],
-        ] {
-            let err =
-                try_fio(&[&["perf", "--quick"], &bad[..]].concat()).expect_err(&bad.join(" "));
-            assert!(
-                matches!(err, Error::Invalid { .. }),
-                "{}: {err}",
-                bad.join(" ")
-            );
-        }
-        assert!(try_fio(&["perf", "--fio-bs", "4k 64k 1M", "--fio-rw", "randrw"]).is_ok());
-        assert!(fio_size("512") && fio_size("4k") && fio_size("1M") && fio_size("2G"));
-        assert!(!fio_size("0") && !fio_size("k") && !fio_size("4kk") && !fio_size("00k"));
+        with_env(&[], || {
+            for bad in [
+                ["--fio-runtime", "0"],
+                ["--fio-qd", "0"],
+                ["--fio-bs", "0k"],
+                ["--fio-bs", "4x"],
+                ["--fio-rw", "randfoo"],
+            ] {
+                let err =
+                    try_fio(&[&["perf", "--quick"], &bad[..]].concat()).expect_err(&bad.join(" "));
+                assert!(
+                    matches!(err, Error::Invalid { .. }),
+                    "{}: {err}",
+                    bad.join(" ")
+                );
+            }
+            assert!(try_fio(&["perf", "--fio-bs", "4k 64k 1M", "--fio-rw", "randrw"]).is_ok());
+            assert!(fio_size("512") && fio_size("4k") && fio_size("1M") && fio_size("2G"));
+            assert!(!fio_size("0") && !fio_size("k") && !fio_size("4kk") && !fio_size("00k"));
+        });
     }
 
     #[test]
