@@ -227,7 +227,9 @@ baseline the campaign recorded rather than whatever is newest:
 
 1. Load the campaign domain's `manifest.toml`. A domain that was
    never run is skipped; one that exists but is incomplete is an
-   error, since a partial measurement is not a comparable one.
+   error, since a partial measurement is not a comparable one. A
+   manifest that exists but cannot be read is an error too, not a
+   domain that was never run.
 2. Read the baseline identity hash out of the manifest and resolve
    `results/p1/<c>/<domain>/<hash>/`. A missing or incomplete
    baseline is an error.

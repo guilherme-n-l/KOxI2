@@ -193,12 +193,16 @@ impl Manifest {
     }
 
     /// Load a result root's manifest; Ok(None) when the dir has none.
+    /// Only absence reads as None: a manifest that exists but cannot
+    /// be read (a directory under that name, say) is an error, not a
+    /// domain that was never run.
     pub fn load(dir: &Path) -> Result<Option<Self>, Error> {
         let path = dir.join(MANIFEST);
-        if !path.is_file() {
-            return Ok(None);
-        }
-        let text = fs::read_to_string(&path)?;
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(Error::Read(path, err)),
+        };
         toml::from_str(&text)
             .map(Some)
             .map_err(|err| Error::Parse(path, err))
@@ -247,6 +251,8 @@ pub enum Error {
     Io(#[from] io::Error),
     #[error("serializing manifest: {0}")]
     Toml(#[from] toml::ser::Error),
+    #[error("reading {}: {}", .0.display(), .1)]
+    Read(PathBuf, #[source] io::Error),
     #[error("parsing {}: {}", .0.display(), .1)]
     Parse(PathBuf, #[source] toml::de::Error),
 }
@@ -336,6 +342,14 @@ mod tests {
         assert!(Manifest::is_complete(&dir));
 
         assert!(Manifest::load(&dir.join("nope")).unwrap().is_none());
+
+        // A manifest that exists but is not a file is unreadable, not
+        // absent: the caller must not mistake it for a domain never run.
+        let odd = dir.join("odd");
+        fs::create_dir_all(odd.join(MANIFEST)).unwrap();
+        let error = Manifest::load(&odd).unwrap_err();
+        assert!(matches!(error, Error::Read(..)), "{error}");
+        assert!(error.to_string().contains(MANIFEST));
         fs::remove_dir_all(&dir).unwrap();
     }
 }
