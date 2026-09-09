@@ -394,7 +394,7 @@ fn run_matrix(
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct Workload {
+pub(super) struct Workload {
     bs: String,
     rw: String,
     qd: u32,
@@ -402,7 +402,7 @@ struct Workload {
 }
 
 impl Workload {
-    fn dir_name(&self) -> String {
+    pub(super) fn dir_name(&self) -> String {
         format!("{}_{}_{}_{}", self.bs, self.rw, self.qd, self.size)
     }
 
@@ -463,7 +463,7 @@ fn device_geometry(vm: &Vm, driver: &Driver) -> BTreeMap<String, String> {
 }
 
 /// The full nested matrix in declaration order (bs × rw × qd × size).
-fn matrix(fio: &FioKnobs) -> Vec<Workload> {
+pub(super) fn matrix(fio: &FioKnobs) -> Vec<Workload> {
     let mut workloads = Vec::new();
     for bs in &fio.bs {
         for rw in &fio.rw {

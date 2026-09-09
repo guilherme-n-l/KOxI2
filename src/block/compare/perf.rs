@@ -24,7 +24,7 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::block::cli::CompareOpts;
-use crate::block::results::Manifest;
+use crate::block::results::{FioKnobs, Manifest};
 use crate::stats;
 use crate::util::{csv_text, round};
 
@@ -97,8 +97,14 @@ pub fn compare_perf(
         seed: opts.seed.unwrap_or(manifest.seed),
     };
 
-    let (c_workloads, c_stats) = load_workloads(p1_dir)?;
-    let (rs_workloads, rs_stats) = load_workloads(p2_dir)?;
+    let baseline = Manifest::load(p1_dir)?;
+    let (c_workloads, c_stats) = load_workloads(
+        p1_dir,
+        baseline
+            .as_ref()
+            .and_then(|manifest| manifest.identity.fio.as_ref()),
+    )?;
+    let (rs_workloads, rs_stats) = load_workloads(p2_dir, manifest.identity.fio.as_ref())?;
     ensure!(
         !c_workloads.is_empty() && !rs_workloads.is_empty(),
         "missing workload data for one or both drivers"
@@ -658,8 +664,17 @@ fn describe(desc: &stats::Descriptive) -> serde_json::Value {
 /// kernel.log, compare/) ignored.
 fn load_workloads(
     dir: &Path,
+    plan: Option<&FioKnobs>,
 ) -> Result<(BTreeMap<String, WorkloadBundle>, LoadStats), std::io::Error> {
     let mut workloads = BTreeMap::new();
+    // The manifest, not the surviving directories, declares the matrix.
+    // A lost directory still represents an untested cell. Keep the
+    // filesystem fallback for imported results without a declared plan.
+    if let Some(plan) = plan {
+        for workload in crate::block::perf::matrix(plan) {
+            workloads.insert(workload.dir_name(), WorkloadBundle::default());
+        }
+    }
     let mut stats = LoadStats::default();
     let mut entries: Vec<_> = fs::read_dir(dir)?
         .filter_map(Result::ok)
@@ -1000,6 +1015,61 @@ mod tests {
     }
 
     #[test]
+    fn the_manifest_keeps_missing_workload_directories_in_the_gate() {
+        let base = std::env::temp_dir().join(format!("koxi-perf-plan-{}", std::process::id()));
+        let (p1, p2, out) = (base.join("p1"), base.join("p2"), base.join("out"));
+        let mut manifest = manifest();
+        manifest.identity.fio = Some(crate::block::results::FioKnobs {
+            bs: vec!["4k".into()],
+            rw: vec!["randread".into(), "randwrite".into()],
+            qd: vec![32],
+            size: vec!["512M".into()],
+            reps: 10,
+            runtime: 5,
+            engine: "io_uring".into(),
+        });
+        for root in [&p1, &p2] {
+            manifest.save(root).unwrap();
+            let valid = root.join("4k_randread_32_512M");
+            fs::create_dir_all(&valid).unwrap();
+            for (index, iops) in REPS.iter().enumerate() {
+                write_fio(&valid, index + 1, *iops);
+            }
+        }
+        fs::create_dir_all(&out).unwrap();
+        for empty_directory in [false, true] {
+            if empty_directory {
+                for root in [&p1, &p2] {
+                    fs::create_dir_all(root.join("4k_randwrite_32_512M")).unwrap();
+                }
+            }
+            compare_perf(&p1, &p2, &manifest, &opts(), &out).unwrap();
+            let stats: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(out.join("perf_stats.json")).unwrap())
+                    .unwrap();
+            assert_eq!(stats["verdict"]["pass"], false);
+            assert_eq!(stats["aggregate"]["workloads_passing_tost"], "1/2");
+            assert_eq!(
+                stats["data_quality"]["coverage"]["workloads_with_insufficient_samples"],
+                1
+            );
+        }
+        for root in [&p1, &p2] {
+            let restored = root.join("4k_randwrite_32_512M");
+            for (index, iops) in REPS.iter().enumerate() {
+                write_fio(&restored, index + 1, *iops);
+            }
+        }
+        compare_perf(&p1, &p2, &manifest, &opts(), &out).unwrap();
+        let stats: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(out.join("perf_stats.json")).unwrap())
+                .unwrap();
+        assert_eq!(stats["verdict"]["pass"], true);
+        assert_eq!(stats["aggregate"]["workloads_passing_tost"], "2/2");
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn workload_names_parse_like_v1() {
         let parsed = parse_workload_name("4k_randread_32_512M");
         assert_eq!(parsed["block_size"], "4k");
@@ -1053,7 +1123,7 @@ mod tests {
             fs::write(&path, serde_json::to_string(&data).unwrap()).unwrap();
             assert_eq!(parse_fio_json(&path).is_some(), accepted);
         }
-        let (workloads, stats) = load_workloads(&root).unwrap();
+        let (workloads, stats) = load_workloads(&root, None).unwrap();
         assert!(workloads["4k_randread_32"].runs.is_empty());
         assert_eq!(workloads["4k_randread_32"].invalid_files, 1);
         assert_eq!(stats.invalid_files, 1);
