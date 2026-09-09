@@ -94,7 +94,7 @@ pub fn run(matches: &ArgMatches, globals: &Globals, logs: &Path) -> anyhow::Resu
 fn all(matches: &ArgMatches, globals: &Globals, logs: &Path) -> anyhow::Result<()> {
     let profile = Profile::from_matches(matches)?;
     let mut run = RunOpts::from_matches(matches)?;
-    let campaign = run.campaign(crate::util::unix_now());
+    let campaign = run.campaign(crate::util::unix_now())?;
     run.campaign = Some(campaign.clone());
     let vm = VmOpts::from_matches(matches)?;
     let fio = FioOpts::with_profile(matches, profile)?;

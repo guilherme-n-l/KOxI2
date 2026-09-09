@@ -221,9 +221,12 @@ scores nothing and is reported as unavailable rather than as zero.
 ## Comparing a campaign
 
 `koxi block compare --campaign <name>` is Phase 2, and collects no
-data of its own. For each registered pair it walks
-`results/p2/<c>::<rs>/<campaign>/` and, per domain, resolves the
-baseline the campaign recorded rather than whatever is newest:
+data of its own. A campaign name is one directory name under the
+pair's results root: not empty, not `.` or `..`, and without path
+separators, for the measuring phases as much as for compare. For
+each registered pair it walks `results/p2/<c>::<rs>/<campaign>/` and,
+per domain, resolves the baseline the campaign recorded rather than
+whatever is newest:
 
 1. Load the campaign domain's `manifest.toml`. A domain that was
    never run is skipped; one that exists but is incomplete is an

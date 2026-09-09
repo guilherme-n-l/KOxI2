@@ -79,7 +79,7 @@ pub(crate) fn drive(
     let now = util::unix_now();
     let plan = Plan {
         results_root: anchored(&project.root, &run.scope.output),
-        campaign: run.campaign(now),
+        campaign: run.campaign(now)?,
         now,
         seed: fio.seed.unwrap_or(now),
         force_p1: run.force_p1,

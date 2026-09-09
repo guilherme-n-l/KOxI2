@@ -160,18 +160,44 @@ impl RunOpts {
     /// The campaign this run writes under: the name the user gave,
     /// else the run's own timestamp — the same `now` the manifests
     /// record, so the campaign dir and its data agree.
-    pub fn campaign(&self, now: u64) -> String {
-        self.campaign.clone().unwrap_or_else(|| now.to_string())
+    pub fn campaign(&self, now: u64) -> Result<String, Error> {
+        match &self.campaign {
+            Some(name) => campaign_name(name).map(|()| name.clone()),
+            None => Ok(now.to_string()),
+        }
     }
+}
+
+/// A campaign name is one directory name under the pair's results
+/// root, and nothing that would resolve elsewhere: `../x` wrote
+/// outside the tree, and `a/b` nested a campaign nobody would find.
+pub fn campaign_name(name: &str) -> Result<(), Error> {
+    let why = if name.is_empty() {
+        "must not be empty"
+    } else if name == "." || name == ".." {
+        "must be a name, not a directory reference"
+    } else if name.contains(['/', '\\', '\0']) {
+        "must be a single directory name without path separators"
+    } else {
+        return Ok(());
+    };
+    Err(Error::Invalid {
+        env: "CAMPAIGN",
+        arg: "campaign",
+        value: name.to_owned(),
+        why: why.to_owned(),
+    })
 }
 
 /// The campaign name a comparison needs; unlike the measuring
 /// phases, compare cannot invent one.
 pub fn require_campaign(matches: &ArgMatches) -> Result<String, Error> {
-    value::<String>(matches, "campaign", "CAMPAIGN")?.ok_or(Error::Missing {
+    let name = value::<String>(matches, "campaign", "CAMPAIGN")?.ok_or(Error::Missing {
         arg: "campaign",
         env: "CAMPAIGN",
-    })
+    })?;
+    campaign_name(&name)?;
+    Ok(name)
 }
 
 /// The `--campaign` arg on its own, for `compare` (which takes the
@@ -767,6 +793,23 @@ mod tests {
         });
         with_env(&[("CAMPAIGN", "from-env")], || {
             assert_eq!(require_campaign(&parse(&["compare"])).unwrap(), "from-env");
+        });
+        // A campaign is one directory name under the pair's root.
+        for bad in ["", ".", "..", "a/b", "../trial", "trial/../trial", "a\\b"] {
+            assert!(
+                matches!(campaign_name(bad), Err(Error::Invalid { .. })),
+                "{bad:?} accepted"
+            );
+            with_env(&[("CAMPAIGN", bad)], || {
+                assert!(require_campaign(&parse(&["compare"])).is_err(), "{bad:?}");
+            });
+        }
+        assert!(campaign_name("trial run").is_ok());
+        with_env(&[], || {
+            let run = RunOpts::from_matches(&parse(&["perf", "--campaign", "../x"])).unwrap();
+            assert!(run.campaign(1).is_err());
+            let run = RunOpts::from_matches(&parse(&["perf"])).unwrap();
+            assert_eq!(run.campaign(7).unwrap(), "7");
         });
     }
 

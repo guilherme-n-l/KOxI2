@@ -131,7 +131,7 @@ pub(crate) fn drive(
     let now = util::unix_now();
     let plan = Plan {
         results_root: anchored(&project.root, &run.scope.output),
-        campaign: run.campaign(now),
+        campaign: run.campaign(now)?,
         now,
         p1: run.p1,
         force_p1: run.force_p1,
