@@ -12,9 +12,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context};
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
-use super::fuzz::{classify_campaign, load_validated_crashes, Classifier};
+use super::fuzz::{classify_campaign, load_validated_crashes, unmatched_overrides, Classifier};
 use super::safety::{get, number, read_csv};
 use super::verdict::worst_quality;
 use crate::block::cli::{Scope, ScreenOpts};
@@ -65,7 +65,7 @@ pub(crate) fn drive(scope: &Scope, opts: &ScreenOpts) -> anyhow::Result<()> {
             None => missing("missing static surface artifacts"),
         };
         let (dynamic, campaign_count) = match &fuzz_pick {
-            Some((dir, _, _)) => dynamic_robustness(dir, &classifier, &overrides)?,
+            Some((dir, _, manifest)) => dynamic_robustness(dir, manifest, &classifier, &overrides)?,
             None => (missing("missing fuzz campaign artifacts"), 0),
         };
         let tract = tractability(static_pick.is_some(), fuzz_pick.is_some(), campaign_count);
@@ -303,8 +303,13 @@ fn static_surface(static_dir: &Path) -> serde_json::Value {
     })
 }
 
+/// Returns the dimension and the number of usable campaigns: the
+/// ones that completed or crashed, which is what tractability counts.
+/// A campaign that did neither is no evidence of anything, and eight
+/// of them beside two real ones used to make a ten-campaign baseline.
 fn dynamic_robustness(
     fuzz_dir: &Path,
+    manifest: &Manifest,
     classifier: &Classifier,
     overrides: &HashMap<(String, String), super::fuzz::OverrideRow>,
 ) -> anyhow::Result<(serde_json::Value, usize)> {
@@ -318,16 +323,43 @@ fn dynamic_robustness(
         .filter(|path| path.is_dir())
         .collect();
     dirs.sort();
+    // The plan bounds the data here as it does in compare.
+    let planned = manifest
+        .identity
+        .fuzz
+        .as_ref()
+        .map_or(0, |knobs| knobs.campaigns) as usize;
+    ensure!(
+        dirs.len() == planned,
+        "{}: {} campaign directories, but the manifest declares {planned}",
+        fuzz_dir.display(),
+        dirs.len()
+    );
 
     let (mut target, mut infra, mut unknown) = (0u64, 0u64, 0u64);
     let mut qualities = Vec::new();
+    let mut summaries = Vec::new();
     for dir in &dirs {
         let summary = classify_campaign(classifier, dir, overrides)?;
         target += summary.counts.target;
         infra += summary.counts.infra;
         unknown += summary.counts.unknown;
         qualities.push(summary.quality);
+        summaries.push(summary);
     }
+    let usable = summaries
+        .iter()
+        .filter(|summary| summary.quality != "unavailable")
+        .count();
+    for summary in &summaries {
+        if summary.quality == "unavailable" {
+            warn!(
+                "campaign {} neither completed nor crashed; not counted as tractable exposure",
+                summary.id()
+            );
+        }
+    }
+    unmatched_overrides(overrides, &summaries.iter().collect::<Vec<_>>());
 
     let score = if target > 0 {
         3
@@ -349,12 +381,13 @@ fn dynamic_robustness(
         json!({
             "score": score,
             "evidence": format!(
-                "{} campaigns; target={target}, infrastructure={infra}, unknown={unknown}",
+                "{} campaigns ({usable} completed or crashed); target={target}, \
+                 infrastructure={infra}, unknown={unknown}",
                 dirs.len()
             ),
             "data_quality": quality,
         }),
-        dirs.len(),
+        usable,
     ))
 }
 
