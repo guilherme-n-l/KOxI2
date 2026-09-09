@@ -3,7 +3,8 @@
 //! under the campaign records the identity hash of the baseline it
 //! was measured against, so the comparator resolves
 //! `results/p1/<c>/<domain>/<hash>/` from data, not symlinks, and
-//! refuses to pool results whose identities disagree on host/accel.
+//! refuses to pool results whose identities describe different
+//! experiments (host, accel, guest shape, artifacts, knobs).
 //! Gate outputs land in `<campaign>/compare/` in v1's JSON shapes.
 
 pub mod fuzz;
@@ -19,7 +20,7 @@ use anyhow::{bail, Context};
 use tracing::{info, warn};
 
 use crate::block::cli::{CompareOpts, Scope};
-use crate::block::results::{self, Manifest};
+use crate::block::results::{self, Identity, Manifest};
 use crate::config::{anchored, Project};
 use verdict::Substrate;
 
@@ -97,7 +98,7 @@ pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow
 
         // Performance gate.
         if let Some((p2_dir, p1_dir, manifest)) =
-            load_domain(&results_root, &campaign_root, c_name, "perf")?
+            load_domain(&results_root, &campaign_root, c_name, rs_name, "perf")?
         {
             info!("compare perf: {} vs {}", p1_dir.display(), p2_dir.display());
             perf::compare_perf(&p1_dir, &p2_dir, &manifest, opts, &compare_dir)
@@ -109,7 +110,7 @@ pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow
 
         // Fuzzing gate.
         if let Some((p2_dir, p1_dir, manifest)) =
-            load_domain(&results_root, &campaign_root, c_name, "fuzz")?
+            load_domain(&results_root, &campaign_root, c_name, rs_name, "fuzz")?
         {
             info!("compare fuzz: {} vs {}", p1_dir.display(), p2_dir.display());
             fuzz::compare_fuzz(
@@ -130,7 +131,7 @@ pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow
 
         // Safety gate over the static analysis outputs.
         if let Some((p2_dir, p1_dir, manifest)) =
-            load_domain(&results_root, &campaign_root, c_name, "static")?
+            load_domain(&results_root, &campaign_root, c_name, rs_name, "static")?
         {
             info!(
                 "compare safety: {} vs {}",
@@ -205,6 +206,7 @@ fn load_domain(
     results_root: &Path,
     campaign_root: &Path,
     c_name: &str,
+    rs_name: &str,
     domain: &str,
 ) -> anyhow::Result<Option<(PathBuf, PathBuf, Manifest)>> {
     let p2_dir = campaign_root.join(domain);
@@ -240,20 +242,97 @@ fn load_domain(
             p2.baseline
         );
     }
-    // Same-substrate guard: the identity carries host+accel exactly
-    // so cross-machine or KVM-vs-TCG data can never be pooled.
-    if baseline.identity.host != manifest.identity.host
-        || baseline.identity.accel != manifest.identity.accel
-    {
+    // The two manifests must describe the registered pair, in this
+    // domain, and nothing else.
+    if p2.c_driver != c_name || p2.rs_driver != rs_name {
         bail!(
-            "baseline and campaign ran on different substrates ({}/{:?} vs {}/{:?})",
-            baseline.identity.host,
-            baseline.identity.accel,
-            manifest.identity.host,
-            manifest.identity.accel
+            "{} records the pair {}::{}, not {c_name}::{rs_name}",
+            p2_dir.display(),
+            p2.c_driver,
+            p2.rs_driver
+        );
+    }
+    for (dir, found, wanted) in [
+        (&p1_dir, &baseline.identity.driver, c_name),
+        (&p2_dir, &manifest.identity.driver, rs_name),
+    ] {
+        if found != wanted {
+            bail!("{} measured driver {found}, not {wanted}", dir.display());
+        }
+    }
+    for (dir, found) in [
+        (&p1_dir, &baseline.identity.domain),
+        (&p2_dir, &manifest.identity.domain),
+    ] {
+        if found != domain {
+            bail!("{} holds {found} data, not {domain} data", dir.display());
+        }
+    }
+    // Same-conditions guard: everything in the identity that is not
+    // the driver itself must agree, or the two sides measured
+    // different experiments. Host and accel keep cross-machine and
+    // KVM-vs-TCG data apart; the guest shape, the artifacts and the
+    // workload knobs keep a 4-vCPU io_uring baseline from being read
+    // against an 8-vCPU psync campaign.
+    let skew = identity_skew(&baseline.identity, &manifest.identity);
+    if !skew.is_empty() {
+        bail!(
+            "baseline {} and campaign {} were measured under different conditions: {}",
+            p1_dir.display(),
+            p2_dir.display(),
+            skew.join("; ")
         );
     }
     Ok(Some((p2_dir, p1_dir, manifest)))
+}
+
+/// The identity fields two comparable sides must share, and how each
+/// differs. Driver-specific fields (driver, spec, prep, the module
+/// sha, the static scope paths) are expected to differ and are not
+/// compared.
+fn identity_skew(baseline: &Identity, campaign: &Identity) -> Vec<String> {
+    let mut skew = Vec::new();
+    let mut check = |field: &str, left: String, right: String| {
+        if left != right {
+            skew.push(format!("{field} {left} vs {right}"));
+        }
+    };
+    let text = |value: &dyn std::fmt::Debug| format!("{value:?}");
+    check("host", text(&baseline.host), text(&campaign.host));
+    check("accel", text(&baseline.accel), text(&campaign.accel));
+    check("smp", text(&baseline.smp), text(&campaign.smp));
+    check("memory", text(&baseline.memory), text(&campaign.memory));
+    let artifacts = |identity: &Identity| {
+        identity.artifacts.as_ref().map(|shas| {
+            (
+                shas.kernel.clone(),
+                shas.initrd.clone(),
+                shas.kconfig.clone(),
+                shas.syzkaller.clone(),
+                shas.syz_template.clone(),
+            )
+        })
+    };
+    check(
+        "artifacts (kernel, initrd, kconfig, syzkaller, syz_template)",
+        text(&artifacts(baseline)),
+        text(&artifacts(campaign)),
+    );
+    check("source", text(&baseline.source), text(&campaign.source));
+    check("fio", text(&baseline.fio), text(&campaign.fio));
+    check("fuzz", text(&baseline.fuzz), text(&campaign.fuzz));
+    let static_scope = |identity: &Identity| {
+        identity
+            .static_
+            .as_ref()
+            .map(|knobs| (knobs.since.clone(), knobs.ast_recipe))
+    };
+    check(
+        "static (since, ast_recipe)",
+        text(&static_scope(baseline)),
+        text(&static_scope(campaign)),
+    );
+    skew
 }
 
 #[cfg(test)]
@@ -297,9 +376,11 @@ mod tests {
             baseline: hash,
         });
         campaign.save(&campaign_root.join("perf")).unwrap();
-        assert!(load_domain(&root, &campaign_root, "null_blk", "perf")
-            .unwrap()
-            .is_some());
+        assert!(
+            load_domain(&root, &campaign_root, "null_blk", "rnull", "perf")
+                .unwrap()
+                .is_some()
+        );
 
         // State and read-back geometry are not part of the identity.
         baseline.created += 1;
@@ -307,16 +388,83 @@ mod tests {
             .device
             .insert("queue.scheduler".into(), "none".into());
         baseline.save(&p1).unwrap();
-        assert!(load_domain(&root, &campaign_root, "null_blk", "perf")
-            .unwrap()
-            .is_some());
+        assert!(
+            load_domain(&root, &campaign_root, "null_blk", "rnull", "perf")
+                .unwrap()
+                .is_some()
+        );
 
         // A changed setup contract must not masquerade as the old baseline.
         baseline.identity.prep = "echo mq-deadline > /sys/block/nullb0/queue/scheduler".into();
         baseline.save(&p1).unwrap();
-        let error = load_domain(&root, &campaign_root, "null_blk", "perf").unwrap_err();
+        let error = load_domain(&root, &campaign_root, "null_blk", "rnull", "perf").unwrap_err();
         assert!(error.to_string().contains("identity hash"));
         assert!(error.to_string().contains(&p1.display().to_string()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Host and accel were the whole guard; a baseline measured on
+    /// four vCPUs with io_uring compared silently against a campaign
+    /// on eight with psync. Everything in the identity that is not
+    /// the driver must agree.
+    #[test]
+    fn the_two_sides_must_describe_the_same_experiment() {
+        use crate::block::results::FioKnobs;
+        type Mutation<'a> = &'a dyn Fn(&mut Manifest);
+        let root = std::env::temp_dir().join(format!("koxi-identity-skew-{}", std::process::id()));
+        let campaign_root = root.join("p2/null_blk::rnull/trial");
+        let mut baseline = baseline_manifest();
+        baseline.identity.smp = Some(4);
+        baseline.identity.memory = Some("4G".into());
+        baseline.identity.fio = Some(FioKnobs {
+            bs: vec!["4k".into()],
+            rw: vec!["randread".into()],
+            qd: vec![32],
+            size: vec!["512M".into()],
+            reps: 11,
+            runtime: 5,
+            engine: "io_uring".into(),
+        });
+        let hash = results::identity_hash(&baseline.identity).unwrap();
+        let p1 = results::p1_dir(&root, "null_blk", "perf", &hash);
+        baseline.save(&p1).unwrap();
+        let campaign = |mutate: Mutation| {
+            let mut campaign = baseline.clone();
+            campaign.identity.driver = "rnull".into();
+            campaign.identity.spec = "rs:rnull:rnull_mod.ko:/dev/rnullb0:::".into();
+            campaign.p2 = Some(Campaign {
+                campaign: "trial".into(),
+                c_driver: "null_blk".into(),
+                rs_driver: "rnull".into(),
+                baseline: hash.clone(),
+            });
+            mutate(&mut campaign);
+            campaign.save(&campaign_root.join("perf")).unwrap();
+            load_domain(&root, &campaign_root, "null_blk", "rnull", "perf")
+        };
+        // The driver-specific fields differ by design.
+        assert!(campaign(&|_| {}).unwrap().is_some());
+
+        let skews: [(&str, Mutation); 8] = [
+            ("smp", &|m| m.identity.smp = Some(8)),
+            ("memory", &|m| m.identity.memory = Some("8G".into())),
+            ("accel", &|m| m.identity.accel = Some("tcg".into())),
+            ("host", &|m| m.identity.host = "elsewhere".into()),
+            ("fio", &|m| {
+                m.identity.fio.as_mut().unwrap().engine = "psync".into();
+            }),
+            ("fio", &|m| m.identity.fio.as_mut().unwrap().runtime = 60),
+            ("not perf data", &|m| m.identity.domain = "static".into()),
+            ("measured driver brd", &|m| m.identity.driver = "brd".into()),
+        ];
+        for (expected, mutate) in skews {
+            let error = campaign(mutate).unwrap_err().to_string();
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
+        let error = campaign(&|m| m.p2.as_mut().unwrap().rs_driver = "brd".into())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("null_blk::brd"), "{error}");
         std::fs::remove_dir_all(root).unwrap();
     }
 }

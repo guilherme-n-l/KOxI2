@@ -232,11 +232,16 @@ baseline the campaign recorded rather than whatever is newest:
    domain that was never run.
 2. Read the baseline identity hash out of the manifest and resolve
    `results/p1/<c>/<domain>/<hash>/`. A missing or incomplete
-   baseline is an error.
-3. Refuse the pair outright if the two identities disagree on host or
-   acceleration. KVM and TCG numbers, or numbers from two machines,
-   must never be pooled, and the manifest is what makes that
-   checkable after the fact.
+   baseline is an error, and so is a baseline whose identity no
+   longer hashes to the name the campaign recorded.
+3. Refuse the pair outright if the two manifests describe different
+   experiments. Both must name the registered pair and the domain
+   being compared, and every identity field that is not the driver
+   itself must agree: host and acceleration (KVM and TCG numbers, or
+   numbers from two machines, must never be pooled), the guest's
+   vCPU count and memory, the kernel, initrd, config and syzkaller
+   artifacts, and the fio, fuzz and static knobs. The manifest is
+   what makes that checkable after the fact.
 
 Each domain that survives that feeds its gate, and the artifacts land
 in `<campaign>/compare/`. A campaign directory with no usable domain
