@@ -715,6 +715,15 @@ fn load_workloads(
 fn parse_fio_json(path: &Path) -> Option<(Run, bool)> {
     let data: serde_json::Value = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
     let job = data.get("jobs")?.as_array()?.first()?;
+    // fio can report positive IOPS for work completed before an I/O
+    // error. Those partial results are not successful measurements.
+    // Older imported artifacts may omit the error field entirely.
+    if job
+        .get("error")
+        .is_some_and(|error| error.as_u64() != Some(0))
+    {
+        return None;
+    }
     let section = ["read", "write", "trim"]
         .iter()
         .filter_map(|direction| job.get(*direction))
@@ -1026,6 +1035,29 @@ mod tests {
         assert_eq!(run.lat_mean_us, 32.0);
         assert_eq!(run.lat_p99_us, 64.0);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fio_jobs_with_errors_are_not_measurements() {
+        let root = std::env::temp_dir().join(format!("koxi-fio-error-{}", std::process::id()));
+        let dir = root.join("4k_randread_32");
+        fs::create_dir_all(&dir).unwrap();
+        write_fio(&dir, 1, 100.0);
+        let path = dir.join("fio_1.json");
+        let mut data: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        // Imported files without an error field remain readable.
+        assert!(parse_fio_json(&path).is_some());
+        for (error, accepted) in [(json!(0), true), (json!(5), false), (json!("5"), false)] {
+            data["jobs"][0]["error"] = error;
+            fs::write(&path, serde_json::to_string(&data).unwrap()).unwrap();
+            assert_eq!(parse_fio_json(&path).is_some(), accepted);
+        }
+        let (workloads, stats) = load_workloads(&root).unwrap();
+        assert!(workloads["4k_randread_32"].runs.is_empty());
+        assert_eq!(workloads["4k_randread_32"].invalid_files, 1);
+        assert_eq!(stats.invalid_files, 1);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
