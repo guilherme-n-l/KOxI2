@@ -177,7 +177,14 @@ campaigns with no crashes. The rank test was computed on that vector.
 **Fixed in the instrument, disclosed for the paper.** v2 records the
 hours a campaign ran in its completion marker, a campaign that died
 before writing one is `unavailable` rather than a zero, and the rate
-ratio divides by measured hours. For the talk: the Rust side is seven
+ratio divides by measured hours. That label was not enough on its
+own: until the third hardening pass an `unavailable` campaign was
+still counted as zero crashes over its budgeted hours, and a Rust
+side made only of such campaigns passed the gate against a C side
+that crashed twelve times, which is this finding reproduced by the
+instrument meant to catch it. Such campaigns are now dropped from the
+gate and named in `campaigns_excluded`, and a side left with none is
+`inconclusive` (hardening pass three, number 35). For the talk: the Rust side is seven
 full campaigns and part of an eighth, the exposure bound is 0.017
 crashes per hour (one per 59 hours) rather than 0.0125, and the limits
 slide says N = 10 planned. The reader's discrepancy 9 named campaigns

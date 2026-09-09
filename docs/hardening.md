@@ -306,6 +306,105 @@ psync` beside `io_uring` gave a fifth perf root, not a wider one.
 - Logs grow by about a megabyte per thirty-five runs and nothing sweeps
   them; `koxi clean` leaves `log/` alone by design.
 
+## Third pass: the results tree as an adversary
+
+The first two passes drove the pipeline and probed the command tree.
+The third treated the results tree itself as untrusted input: every
+file compare and screen read was corrupted, truncated, misfiled,
+duplicated, backdated or replaced with a directory, one mutation per
+scenario, and the question each time was whether the gate noticed.
+The battery grew across four rounds to 257 scenarios, each in its own
+project, home and results tree, synthetic throughout, no kernel builds
+or guest boots. It ran on the Mac after every fix and on the reference
+host at the end, 257 of 257 both places.
+
+### Found and fixed
+
+| #   | Defect                                                                                                                | Severity   |
+| --- | --------------------------------------------------------------------------------------------------------------------- | ---------- |
+| 26  | A workload cell whose every rep was invalid or warmup dropped out of the gate on both sides, and the rest passed      | medium     |
+| 27  | A fio job that reported an I/O error still counted its partial IOPS as a sample                                       | medium     |
+| 28  | The performance matrix was whatever directories survived, not what the manifest declared                              | medium     |
+| 29  | A baseline directory was never checked against the identity hash it was named for                                     | medium     |
+| 30  | An undecided gate beside a missing one read as `partial`, which is softer than `inconclusive`                         | low-medium |
+| 31  | A truncated gate artifact read as a dimension never measured                                                          | low-medium |
+| 32  | `--fuzz-rate-margin NaN` and `inf` passed the range check: neither is below 1                                         | low        |
+| 33  | A `manifest.toml` that was a directory read as a domain never run                                                     | low-medium |
+| 34  | A completion marker holding `inf` was a valid duration and panicked inside statrs' beta function                      | medium     |
+| 35  | A campaign with no marker and no crashes counted as zero crashes over its budgeted hours; a Rust side of them passed  | high       |
+| 36  | One substrate for the verdict: a TCG fuzz campaign beside a KVM perf run travelled as `measured`                      | medium     |
+| 37  | A campaign directory with no usable domain still got an all-unavailable `verdict.json` before compare failed          | low-medium |
+| 38  | The same-substrate guard compared host and accel only; 8 vCPUs and psync gated against 4 and io_uring                 | medium     |
+| 39  | A completion marker that could not be read was neither completed nor dead, so the campaign was guessed dead           | low-medium |
+| 40  | The plan was a floor: an undeclared cell, thirty extra reps, four of eleven, five campaigns for a plan of two         | medium     |
+| 41  | A `--validated-crashes` row naming a crash not on disk did nothing, silently                                          | low        |
+| 42  | A driver with no CWE-classified commit was gated at 0 of 0 = 0% and failed safety                                     | medium     |
+| 43  | A missing static table or a renamed column read as an empty table; `safety_related = yes` was neither true nor false  | medium     |
+| 44  | The `[p2]` record was read for its hash only: another campaign's name, a non-hash baseline, a phase-2 manifest as p1  | medium     |
+| 45  | A manifest read from disk was trusted as written: an empty matrix declared zero workloads and nothing to fail         | medium     |
+| 46  | `--campaign ../x` wrote outside the results tree; `trial/../trial` was `trial` under another name                     | medium     |
+| 47  | `qd = [32, 32]` produced two cells that shared a directory and counted twice                                          | low        |
+| 48  | The adjudication CSV was split on commas by position: a quoted export failed, a comma in notes shifted the columns    | low-medium |
+| 49  | Screening scored historical risk from `commits_summary.csv`; absent, it scored 0 with ten safety commits in the table | medium     |
+| 50  | Screening took any complete manifest under a domain root: fuzz data under `static/`, another driver, a p2 manifest    | medium     |
+| 51  | A failed screening left the previous `screening.json`, and compare folded it into the verdict                         | low-medium |
+| 52  | Tractability counted directories: eight dead campaigns beside two real ones made a ten-campaign baseline              | medium     |
+| 53  | compare and screen wrote the results tree with no lock; two at once raced on the stale-artifact removal               | medium     |
+
+Number 35 is the defect the methodology audit found in the published
+dataset, reproduced by the instrument that was meant to catch it: the
+two campaigns that never started were two clean campaigns to v1, and
+to v2 until this pass. A campaign that neither completed nor crashed
+is now dropped from the gate and named in `campaigns_excluded`; a side
+left with none is `inconclusive`. Number 52 is the same defect on the
+screening side.
+
+Numbers 38, 40, 44, 45 and 50 are one rule stated five times: the
+manifest is the record, and the data on disk must be exactly what it
+describes. Every identity field that is not the driver must agree
+between the two sides; the matrix, the rep count and the campaign
+count are bounds, not floors; the campaign record must name this
+campaign and a real hash; the plan must be one the gates can run; and
+what sits under a phase-1 domain root must be that driver's, that
+domain's, under its own hash. Before this pass, the manifest declared
+and the gate believed whatever it found.
+
+Number 53 was found by running eight compares against one campaign at
+once. Each removed the stale gate artifacts first, so one could delete
+`perf_stats.json` between another's write and its verdict, and that
+verdict read the gap as a dimension never measured. compare and screen
+now hold an advisory lock at `results/.gate-lock`; both also write
+`crash_classification.json` into the same phase-1 campaign
+directories, which the lock covers too.
+
+One shape change: `verdict.json` records `substrate` per domain
+(`substrate.fuzz`, `substrate.perf`) rather than once, because the two
+campaigns are separate runs and one may have fallen back to TCG.
+
+Also fixed on the way: two tests in `block::cli` read the environment
+without the env lock and failed about once in twenty runs beside a
+sibling that pins `FIO_REPS=1`.
+
+### Held
+
+- A device geometry recorded on one side only is `matched: null` and
+  stays `measured`: a v1 import beside a v2 campaign is unknown, not
+  mismatched. Left as is; the flag is in the artifact.
+- `--logfile` to a path that cannot be opened degrades to console with
+  a warning rather than failing the run, as `logging.rs` says.
+- `assets list` and `clean` work outside a project (the embedded set,
+  the scratch sweep); the cache and artifact scopes still refuse.
+- A byte-order mark on a manifest is not corruption; the TOML reader
+  strips it.
+- `--only` names the C driver, v1-style; `--only rnull` selects
+  nothing and says so.
+- Symlink loops under `crashes/`, binary crash reports, zero-variance
+  and extreme IOPS, a 30% regression, a Rust side crashing 24 to 0,
+  stray files under `campaigns/`, unicode and 200-character campaign
+  names, CRLF manifests, unknown manifest keys, a symlinked results
+  root, a read-only results tree, eight concurrent screens: all held
+  without a change.
+
 ## Backlog
 
 ### A clang-built comparison
