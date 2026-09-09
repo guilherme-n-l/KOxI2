@@ -695,7 +695,10 @@ fn load_workloads(
                 stats.invalid_files += 1;
             }
         }
-        if !bundle.runs.is_empty() {
+        // A cell containing only warmups or invalid files still belongs
+        // to the gate. Dropping it on both sides would turn missing
+        // evidence into a pass over the surviving subset of the matrix.
+        if bundle.total_files > 0 {
             let name = config_dir
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
@@ -948,6 +951,43 @@ mod tests {
         assert_eq!(csv.lines().count(), 1 + 2 * 10 * 2);
 
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn workloads_without_retained_runs_cannot_disappear_from_the_gate() {
+        let base = std::env::temp_dir().join(format!("koxi-perf-empty-{}", std::process::id()));
+        let (p1, p2, out) = (base.join("p1"), base.join("p2"), base.join("out"));
+        for root in [&p1, &p2] {
+            let valid = root.join("4k_randread_32");
+            fs::create_dir_all(&valid).unwrap();
+            for (index, iops) in REPS.iter().enumerate() {
+                write_fio(&valid, index + 1, *iops);
+            }
+            let invalid = root.join("4k_randwrite_1");
+            fs::create_dir_all(&invalid).unwrap();
+            fs::write(invalid.join("fio_1.json"), "broken JSON").unwrap();
+            let warmup = root.join("8k_randread_1");
+            fs::create_dir_all(&warmup).unwrap();
+            write_fio(&warmup, 1, 100.0);
+            let path = warmup.join("fio_1.json");
+            let mut data: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            data["koxi_metadata"]["warmup"] = json!(true);
+            fs::write(path, serde_json::to_string(&data).unwrap()).unwrap();
+            fs::create_dir_all(root.join("compare")).unwrap();
+        }
+        fs::create_dir_all(&out).unwrap();
+        compare_perf(&p1, &p2, &manifest(), &opts(), &out).unwrap();
+        let stats: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(out.join("perf_stats.json")).unwrap())
+                .unwrap();
+        assert_eq!(stats["verdict"]["pass"], false);
+        assert_eq!(stats["aggregate"]["workloads_passing_tost"], "1/3");
+        assert_eq!(
+            stats["data_quality"]["coverage"]["workloads_with_insufficient_samples"],
+            2
+        );
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
