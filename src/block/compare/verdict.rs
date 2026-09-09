@@ -234,11 +234,13 @@ fn decide(dimensions: &serde_json::Map<String, serde_json::Value>) -> Outcome {
     }
 }
 
-/// Where the guest-side campaigns ran, from their manifests. Carried
-/// into the verdict so a report says what it was measured on, and so
-/// TCG numbers cannot travel as "measured": without KVM the timing is
-/// the emulator's, and the README already calls those numbers not
-/// data.
+/// Where a guest-side campaign ran, from its manifest. Carried into
+/// the verdict per domain so a report says what each dimension was
+/// measured on, and so TCG numbers cannot travel as "measured":
+/// without KVM the timing is the emulator's, and the README already
+/// calls those numbers not data. Per domain, because the fuzz and
+/// perf campaigns are separate runs and one may have fallen back to
+/// TCG while the other had KVM.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Substrate {
     pub host: String,
@@ -258,25 +260,25 @@ pub fn write_verdict(
     c_name: &str,
     rs_name: &str,
     screening: Option<&serde_json::Value>,
-    substrate: Option<&Substrate>,
+    substrates: &BTreeMap<String, Substrate>,
 ) -> anyhow::Result<()> {
+    // Dimension name, gate artifact, the domain whose manifest says
+    // where it ran (none for the host-side safety gate).
     let files = [
-        ("safety", "safety.json"),
-        ("fuzzing", "fuzz_stats.json"),
-        ("performance", "perf_stats.json"),
+        ("safety", "safety.json", None),
+        ("fuzzing", "fuzz_stats.json", Some("fuzz")),
+        ("performance", "perf_stats.json", Some("perf")),
     ];
     let mut dimensions = serde_json::Map::new();
     let mut caveats: Vec<String> = Vec::new();
-    for (name, file) in files {
+    for (name, file, domain) in files {
         let data = read_json(&compare_dir.join(file))?;
         if data.is_none() {
             caveats.push(format!("{name}: not available (data missing)"));
         }
         let mut summary = summarize(name, data.as_ref());
-        if name != "safety"
-            && summary["available"] == true
-            && substrate.is_some_and(Substrate::emulated)
-        {
+        let substrate = domain.and_then(|domain| substrates.get(domain));
+        if summary["available"] == true && substrate.is_some_and(Substrate::emulated) {
             summary["data_quality"] = json!("inferred");
             caveats.push(format!(
                 "{name}: measured under TCG, not KVM; timing is the emulator's"
@@ -304,7 +306,10 @@ pub fn write_verdict(
         "campaign": campaign,
         "baselines": baselines,
         "drivers": {"c": c_name, "rs": rs_name},
-        "substrate": substrate.map(|s| json!({"host": s.host, "accel": s.accel})),
+        "substrate": substrates
+            .iter()
+            .map(|(domain, s)| (domain.clone(), json!({"host": s.host, "accel": s.accel})))
+            .collect::<serde_json::Map<String, serde_json::Value>>(),
         "data_quality": {
             "status": overall_status,
             "dimensions": dimensions
@@ -401,7 +406,7 @@ mod tests {
                 "null_blk",
                 "rnull",
                 None,
-                None,
+                &BTreeMap::new(),
             )
         };
         for contents in ["", r#"{"verdict":{"pass":false"#] {
@@ -429,6 +434,99 @@ mod tests {
         write().unwrap();
         assert_eq!(verdict_in(&dir)["overall"], "fail");
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// TCG numbers are inferred at best, and the verdict says where
+    /// each dimension was measured. The substrate is per domain: a
+    /// fuzz campaign that fell back to TCG beside a KVM perf run
+    /// downgrades fuzzing alone, and never borrows the perf run's KVM
+    /// to stay "measured".
+    #[test]
+    fn the_substrate_downgrades_each_dimension_on_its_own() {
+        let dir = std::env::temp_dir().join(format!("koxi-verdict-tcg-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, value: serde_json::Value| {
+            fs::write(dir.join(name), serde_json::to_string(&value).unwrap()).unwrap();
+        };
+        write(
+            "safety.json",
+            json!({"verdict": {"pass": true, "threshold": 34.2},
+                   "comparison": {"elimination_rate": 0.5, "elimination_detail": "d"},
+                   "data_quality": {"status": "manually_validated"}}),
+        );
+        write(
+            "fuzz_stats.json",
+            json!({"verdict": {"pass": true, "detail": "ok", "gate_basis": "rate_ratio_ci"},
+                   "metrics": {"target_attributable_crashes": {
+                       "test": {"p_value": 0.4}, "effect_size": {"value": 0.5}}},
+                   "rate_ratio": {"ratio": {"ci": {"hi": 1.2}}},
+                   "data_quality": {"status": "measured"}}),
+        );
+        write(
+            "perf_stats.json",
+            json!({"verdict": {"pass": true, "detail": "ok", "threshold": 5.0},
+                   "aggregate": {"median_delta_pct": -1.0, "workloads_passing_tost": "18/18"},
+                   "data_quality": {"status": "measured"}}),
+        );
+        let baselines = BTreeMap::new();
+        let substrate = |accel: &str| Substrate {
+            host: "laptop".into(),
+            accel: Some(accel.into()),
+        };
+        let mut substrates = BTreeMap::new();
+        substrates.insert("perf".to_string(), substrate("kvm"));
+        substrates.insert("fuzz".to_string(), substrate("tcg"));
+        write_verdict(
+            &dir,
+            "trial",
+            &baselines,
+            "null_blk",
+            "rnull",
+            None,
+            &substrates,
+        )
+        .unwrap();
+        let verdict = verdict_in(&dir);
+        assert_eq!(verdict["substrate"]["fuzz"]["accel"], "tcg");
+        assert_eq!(verdict["substrate"]["perf"]["accel"], "kvm");
+        assert_eq!(verdict["dimensions"]["fuzzing"]["data_quality"], "inferred");
+        assert_eq!(
+            verdict["dimensions"]["performance"]["data_quality"],
+            "measured"
+        );
+        assert_eq!(
+            verdict["dimensions"]["safety"]["data_quality"],
+            "manually_validated"
+        );
+        assert_eq!(verdict["data_quality"]["status"], "inferred");
+        assert!(verdict["caveats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|caveat| caveat
+                .as_str()
+                .unwrap()
+                .starts_with("fuzzing: measured under TCG")));
+
+        substrates.insert("perf".to_string(), substrate("tcg"));
+        write_verdict(
+            &dir,
+            "trial",
+            &baselines,
+            "null_blk",
+            "rnull",
+            None,
+            &substrates,
+        )
+        .unwrap();
+        let verdict = verdict_in(&dir);
+        assert_eq!(
+            verdict["dimensions"]["performance"]["data_quality"],
+            "inferred"
+        );
+        assert_eq!(verdict["data_quality"]["status"], "inferred");
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -464,7 +562,16 @@ mod tests {
         );
         let mut baselines = BTreeMap::new();
         baselines.insert("perf".to_string(), "abc123".to_string());
-        write_verdict(&dir, "trial", &baselines, "null_blk", "rnull", None, None).unwrap();
+        write_verdict(
+            &dir,
+            "trial",
+            &baselines,
+            "null_blk",
+            "rnull",
+            None,
+            &BTreeMap::new(),
+        )
+        .unwrap();
         let verdict = verdict_in(&dir);
         assert_eq!(verdict["overall"], "fail");
         assert_eq!(
@@ -496,7 +603,16 @@ mod tests {
                    "aggregate": {"median_delta_pct": -14.0, "workloads_passing_tost": "0/18"},
                    "data_quality": {"status": "measured"}}),
         );
-        write_verdict(&dir, "trial", &baselines, "null_blk", "rnull", None, None).unwrap();
+        write_verdict(
+            &dir,
+            "trial",
+            &baselines,
+            "null_blk",
+            "rnull",
+            None,
+            &BTreeMap::new(),
+        )
+        .unwrap();
         let verdict = verdict_in(&dir);
         assert_eq!(verdict["overall"], "fail");
         assert_eq!(
@@ -516,15 +632,6 @@ mod tests {
                    "aggregate": {"median_delta_pct": -1.0, "workloads_passing_tost": "18/18"},
                    "data_quality": {"status": "measured"}}),
         );
-        write_verdict(&dir, "trial", &baselines, "null_blk", "rnull", None, None).unwrap();
-        assert_eq!(verdict_in(&dir)["overall"], "inconclusive");
-
-        // TCG numbers are inferred at best, and the verdict says where
-        // it was measured.
-        let tcg = Substrate {
-            host: "laptop".into(),
-            accel: Some("tcg".into()),
-        };
         write_verdict(
             &dir,
             "trial",
@@ -532,24 +639,23 @@ mod tests {
             "null_blk",
             "rnull",
             None,
-            Some(&tcg),
+            &BTreeMap::new(),
         )
         .unwrap();
-        let verdict = verdict_in(&dir);
-        assert_eq!(verdict["substrate"]["accel"], "tcg");
-        assert_eq!(
-            verdict["dimensions"]["performance"]["data_quality"],
-            "inferred"
-        );
-        assert_eq!(
-            verdict["dimensions"]["safety"]["data_quality"],
-            "manually_validated"
-        );
-        assert_eq!(verdict["data_quality"]["status"], "inferred");
+        assert_eq!(verdict_in(&dir)["overall"], "inconclusive");
 
         // Missing a dimension -> partial with a caveat.
         fs::remove_file(dir.join("fuzz_stats.json")).unwrap();
-        write_verdict(&dir, "trial", &baselines, "null_blk", "rnull", None, None).unwrap();
+        write_verdict(
+            &dir,
+            "trial",
+            &baselines,
+            "null_blk",
+            "rnull",
+            None,
+            &BTreeMap::new(),
+        )
+        .unwrap();
         let verdict = verdict_in(&dir);
         assert_eq!(verdict["overall"], "partial");
         assert!(verdict["caveats"]
@@ -566,7 +672,16 @@ mod tests {
                    "aggregate": {"median_delta_pct": -14.0, "workloads_passing_tost": "0/18"},
                    "data_quality": {"status": "measured"}}),
         );
-        write_verdict(&dir, "trial", &baselines, "null_blk", "rnull", None, None).unwrap();
+        write_verdict(
+            &dir,
+            "trial",
+            &baselines,
+            "null_blk",
+            "rnull",
+            None,
+            &BTreeMap::new(),
+        )
+        .unwrap();
         let verdict = verdict_in(&dir);
         assert_eq!(verdict["overall"], "fail");
         assert_eq!(

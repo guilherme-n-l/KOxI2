@@ -70,21 +70,26 @@ pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow
             }
         }
         let mut baselines = BTreeMap::new();
-        let mut substrate: Option<Substrate> = None;
+        // Each guest-side domain says where it ran. Kept per domain:
+        // a fuzz campaign under TCG beside a KVM perf run must not
+        // borrow the perf run's substrate and travel as measured.
+        let mut substrates: BTreeMap<String, Substrate> = BTreeMap::new();
         let mut record = |domain: &str,
                           manifest: &Manifest,
                           baselines: &mut BTreeMap<_, _>,
-                          substrate: &mut Option<Substrate>| {
+                          substrates: &mut BTreeMap<String, Substrate>| {
             if let Some(p2) = &manifest.p2 {
                 baselines.insert(domain.to_owned(), p2.baseline.clone());
             }
-            // The guest-side domains say where they ran; static is
-            // host-side and says nothing about the substrate.
-            if manifest.identity.accel.is_some() && substrate.is_none() {
-                *substrate = Some(Substrate {
-                    host: manifest.identity.host.clone(),
-                    accel: manifest.identity.accel.clone(),
-                });
+            // Static is host-side and says nothing about the substrate.
+            if manifest.identity.accel.is_some() {
+                substrates.insert(
+                    domain.to_owned(),
+                    Substrate {
+                        host: manifest.identity.host.clone(),
+                        accel: manifest.identity.accel.clone(),
+                    },
+                );
             }
             compared += 1;
         };
@@ -96,7 +101,7 @@ pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow
             info!("compare perf: {} vs {}", p1_dir.display(), p2_dir.display());
             perf::compare_perf(&p1_dir, &p2_dir, &manifest, opts, &compare_dir)
                 .with_context(|| format!("performance gate under {}", compare_dir.display()))?;
-            record("perf", &manifest, &mut baselines, &mut substrate);
+            record("perf", &manifest, &mut baselines, &mut substrates);
         } else {
             info!("perf comparison: missing perf data; skipping");
         }
@@ -117,7 +122,7 @@ pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow
                 &pair.rs.abstractions,
             )
             .with_context(|| format!("fuzzing gate under {}", compare_dir.display()))?;
-            record("fuzz", &manifest, &mut baselines, &mut substrate);
+            record("fuzz", &manifest, &mut baselines, &mut substrates);
         } else {
             info!("fuzz comparison: missing fuzz data; skipping");
         }
@@ -133,7 +138,7 @@ pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow
             );
             safety::compare_safety(&p1_dir, &p2_dir, opts, &compare_dir)
                 .with_context(|| format!("safety gate under {}", compare_dir.display()))?;
-            record("static", &manifest, &mut baselines, &mut substrate);
+            record("static", &manifest, &mut baselines, &mut substrates);
         } else {
             info!("safety comparison: missing static data; skipping");
         }
@@ -170,7 +175,7 @@ pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow
             c_name,
             rs_name,
             screening.as_ref(),
-            substrate.as_ref(),
+            &substrates,
         )?;
     }
     if compared == 0 {

@@ -321,10 +321,11 @@ The overall field is deliberately conservative:
 - **`partial`** when nothing failed and a dimension is missing, so
   the evidence cannot support a full verdict either way.
 
-The verdict also records the `substrate` the guest-side campaigns ran
-on (host and acceleration). Under TCG the fuzzing and performance
-dimensions are marked `inferred` whatever they measured, since the
-timing is the emulator's.
+The verdict also records the `substrate` each guest-side domain ran
+on (host and acceleration), per domain, because the fuzz and perf
+campaigns are separate runs. A dimension measured under TCG is marked
+`inferred` whatever it measured, since the timing is the emulator's,
+and a KVM run beside it does not lend it its quality.
 
 The recommendation is v1's matrix over the (safety, fuzzing,
 performance) triple when all three decided, unchanged so that a v1
