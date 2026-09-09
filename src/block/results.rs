@@ -184,6 +184,23 @@ impl Identity {
                 if fio.qd.contains(&0) {
                     return Err("fio matrix has a queue depth of 0".to_owned());
                 }
+                // Two identical cells would share a directory and be
+                // counted twice in the declared matrix.
+                let repeated = |axis: &str, values: &[String]| {
+                    let mut seen = std::collections::BTreeSet::new();
+                    values
+                        .iter()
+                        .find(|value| !seen.insert(value.as_str()))
+                        .map(|value| format!("fio matrix repeats {axis} {value}"))
+                };
+                let qd: Vec<String> = fio.qd.iter().map(ToString::to_string).collect();
+                if let Some(why) = repeated("block size", &fio.bs)
+                    .or_else(|| repeated("pattern", &fio.rw))
+                    .or_else(|| repeated("queue depth", &qd))
+                    .or_else(|| repeated("size", &fio.size))
+                {
+                    return Err(why);
+                }
                 if fio.reps == 0 {
                     return Err("fio reps is 0".to_owned());
                 }
@@ -372,8 +389,11 @@ mod tests {
     fn an_identity_with_a_degenerate_plan_does_not_validate() {
         type Mutation<'a> = &'a dyn Fn(&mut Identity);
         assert!(identity().validate().is_ok());
-        let broken: [(&str, Mutation); 7] = [
+        let broken: [(&str, Mutation); 8] = [
             ("empty axis", &|i| i.fio.as_mut().unwrap().bs.clear()),
+            ("repeats queue depth 32", &|i| {
+                i.fio.as_mut().unwrap().qd = vec![1, 32, 32];
+            }),
             ("queue depth of 0", &|i| {
                 i.fio.as_mut().unwrap().qd = vec![0];
             }),
