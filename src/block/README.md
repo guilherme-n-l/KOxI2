@@ -293,8 +293,12 @@ rather than a measurement. A campaign that neither completed nor
 crashed is not a clean campaign but an unknown one: it is dropped
 from the gate, listed under `campaigns_excluded`, and a side left
 with no usable campaign makes the gate `inconclusive`, since a
-campaign that never ran cannot vouch for a driver. Its
-`verdict.outcome` is one of three words: with zero events on both
+campaign that never ran cannot vouch for a driver. A completion
+marker that exists but cannot be read is an error rather than either.
+Rows of `--validated-crashes` that match no crash on disk are listed
+under `data_quality.manual_overrides.unmatched`, since a mistyped
+crash id otherwise leaves the automatic classification in force
+without a word. Its `verdict.outcome` is one of three words: with zero events on both
 sides, or too few to bound the ratio, it is `inconclusive` and `pass`
 is null, so the gate is never passed by a campaign that found nothing.
 

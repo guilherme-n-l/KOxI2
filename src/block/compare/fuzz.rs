@@ -18,7 +18,7 @@
 //! signatures may match anywhere, and a --validated-crashes CSV
 //! overrides per-crash verdicts.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -194,6 +194,8 @@ pub(super) struct CampaignSummary {
     unique_crashes: u64,
     pub(super) counts: Counts,
     pub(super) quality: &'static str,
+    /// Crash ids whose classification came from --validated-crashes.
+    manual: Vec<String>,
     /// Hours syz-manager actually ran, read from the completion
     /// marker. None for a campaign that died before writing one, or
     /// for v1 data whose marker is empty.
@@ -225,7 +227,7 @@ pub(super) fn classify_campaign(
     let groups = crash_buckets(campaign_dir)?;
 
     let mut counts = Counts::default();
-    let mut manual_applied = 0u64;
+    let mut manual = Vec::new();
     let mut records = Vec::new();
     for (crash_id, files) in &groups {
         let evidence: Vec<&PathBuf> = files
@@ -245,7 +247,7 @@ pub(super) fn classify_campaign(
         let row = overrides.get(&(campaign.clone(), crash_id.clone()));
         let effective = row.map_or(auto, |row| row.classification.as_str());
         if row.is_some() {
-            manual_applied += 1;
+            manual.push(crash_id.clone());
         }
         match effective {
             TARGET => counts.target += 1,
@@ -276,7 +278,7 @@ pub(super) fn classify_campaign(
     // campaign that neither completed nor left any crashes behind is
     // genuinely unavailable.
     let marker = read_marker(campaign_dir)?;
-    let quality = if manual_applied > 0 {
+    let quality = if !manual.is_empty() {
         "manually_validated"
     } else if marker.is_some() || campaign_dir.join("crashes").is_dir() {
         "measured"
@@ -291,7 +293,7 @@ pub(super) fn classify_campaign(
             INFRA: counts.infra,
             UNKNOWN: counts.unknown,
         },
-        "manual_overrides_applied": manual_applied,
+        "manual_overrides_applied": manual.len(),
         "classified_crashes": records,
         "data_quality": {"status": quality},
     });
@@ -306,6 +308,7 @@ pub(super) fn classify_campaign(
         counts,
         quality,
         hours: marker.as_deref().and_then(parse_hours),
+        manual,
     })
 }
 
@@ -686,6 +689,28 @@ pub fn compare_fuzz(
             campaigns.len()
         );
     }
+    // Adjudication rows that matched no crash on disk are worth a
+    // word: a typo in a crash id silently leaves the automatic
+    // classification in force.
+    let applied: HashSet<(String, String)> = c_side
+        .iter()
+        .chain(&rs_side)
+        .flat_map(|campaign| {
+            campaign
+                .manual
+                .iter()
+                .map(|crash| (campaign.id.clone(), crash.clone()))
+        })
+        .collect();
+    let mut unmatched: Vec<String> = overrides
+        .keys()
+        .filter(|key| !applied.contains(key))
+        .map(|(campaign, crash)| format!("{campaign}/{crash}"))
+        .collect();
+    unmatched.sort();
+    for row in &unmatched {
+        warn!("--validated-crashes row {row} matched no crash on disk");
+    }
     // A campaign that neither completed nor crashed anything is not
     // a clean campaign: it may have run for a minute or never
     // started. Counting it as zero crashes over its budgeted hours
@@ -729,6 +754,10 @@ pub fn compare_fuzz(
         "data_quality": {
             "status": evidence.status(),
             "crash_attribution": evidence.attribution_quality,
+            "manual_overrides": {
+                "applied": applied.len(),
+                "unmatched": unmatched,
+            },
         },
         "sample_size": {"c": c_campaigns.len(), "rs": rs_campaigns.len()},
         // Campaigns on disk that the gate could not use: no completion
@@ -1354,6 +1383,37 @@ mod tests {
         assert!(error.contains("3 campaign directories"), "{error}");
         fs::remove_dir_all(p2.join("campaigns/campaign_3")).unwrap();
 
+        // An adjudication row for a crash that is not on disk is said
+        // so, and the artifact records it.
+        let csv = base.join("validated.csv");
+        fs::write(
+            &csv,
+            "campaign,crash_id,classification\ncampaign_1,bug-0,infrastructure_noise\n\
+             campaign_9,ghost,infrastructure_noise\n",
+        )
+        .unwrap();
+        let mut adjudicated = opts.clone();
+        adjudicated.screen.validated_crashes = Some(csv);
+        compare_fuzz(
+            &p1,
+            &p2,
+            &manifest,
+            &adjudicated,
+            &out,
+            "null_blk",
+            "rnull",
+            &[],
+        )
+        .unwrap();
+        let stats: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(out.join("fuzz_stats.json")).unwrap())
+                .unwrap();
+        assert_eq!(stats["data_quality"]["manual_overrides"]["applied"], 1);
+        assert_eq!(
+            stats["data_quality"]["manual_overrides"]["unmatched"],
+            serde_json::json!(["campaign_9/ghost"])
+        );
+
         // One Rust campaign completes: the gate runs on that campaign
         // alone, over its hour, and the dead one stays excluded.
         fs::write(
@@ -1437,6 +1497,7 @@ mod tests {
             counts: Counts::default(),
             quality: "measured",
             hours,
+            manual: Vec::new(),
         };
         // Two campaigns that ran six minutes each bought 0.2h, not
         // the 2h their budget would have charged them.
@@ -1464,6 +1525,7 @@ mod tests {
             },
             quality: "measured",
             hours: Some(1.0),
+            manual: Vec::new(),
         };
         let csv = fuzz_csv(
             &[summary("campaign_01", 3, 1, 1, 1)],
