@@ -276,10 +276,14 @@ reported minimum detectable ratio makes checkable per run.
 the hours it actually ran, and the crash rate is divided by the sum
 of those; a campaign that recorded none falls back to its budget and
 the basis says so, because that denominator is then partly a plan
-rather than a measurement. Its `verdict.outcome` is one of three
-words: with zero events on both sides, or too few to bound the ratio,
-it is `inconclusive` and `pass` is null, so the gate is never passed
-by a campaign that found nothing.
+rather than a measurement. A campaign that neither completed nor
+crashed is not a clean campaign but an unknown one: it is dropped
+from the gate, listed under `campaigns_excluded`, and a side left
+with no usable campaign makes the gate `inconclusive`, since a
+campaign that never ran cannot vouch for a driver. Its
+`verdict.outcome` is one of three words: with zero events on both
+sides, or too few to bound the ratio, it is `inconclusive` and `pass`
+is null, so the gate is never passed by a campaign that found nothing.
 
 `perf_stats.json` reports `data_quality.device_geometry`: the block
 queue limits and configfs attributes each device actually presented,

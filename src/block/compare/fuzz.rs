@@ -644,12 +644,19 @@ pub fn compare_fuzz(
         Some(path) => load_validated_crashes(path)?,
         None => HashMap::new(),
     };
-    let c_campaigns = load_side(&classifier, p1_dir, &overrides)?;
-    let rs_campaigns = load_side(&classifier, p2_dir, &overrides)?;
+    let c_side = load_side(&classifier, p1_dir, &overrides)?;
+    let rs_side = load_side(&classifier, p2_dir, &overrides)?;
     ensure!(
-        !c_campaigns.is_empty() && !rs_campaigns.is_empty(),
+        !c_side.is_empty() && !rs_side.is_empty(),
         "missing fuzz campaign data for one or both drivers"
     );
+    // A campaign that neither completed nor crashed anything is not
+    // a clean campaign: it may have run for a minute or never
+    // started. Counting it as zero crashes over its budgeted hours
+    // would flatter whichever side lost campaigns, so it is dropped
+    // from the gate and named in the artifact instead.
+    let (c_campaigns, c_excluded) = usable(c_side);
+    let (rs_campaigns, rs_excluded) = usable(rs_side);
 
     let (c_exposure, rs_exposure) = exposure_hours(p1_dir, manifest, &c_campaigns, &rs_campaigns)?;
     let (t_c, t_rs) = (c_exposure.hours, rs_exposure.hours);
@@ -657,7 +664,11 @@ pub fn compare_fuzz(
 
     let c_total: u64 = c_campaigns.iter().map(|c| c.counts.target).sum();
     let rs_total: u64 = rs_campaigns.iter().map(|c| c.counts.target).sum();
-    let (rate_ratio, verdict) = rate_ratio_gate(c_total, rs_total, t_c, t_rs, alpha, margin);
+    let (rate_ratio, verdict) = if c_campaigns.is_empty() || rs_campaigns.is_empty() {
+        no_completed_campaigns(&c_excluded, &rs_excluded, margin)
+    } else {
+        rate_ratio_gate(c_total, rs_total, t_c, t_rs, alpha, margin)
+    };
     let outcome = match verdict["pass"].as_bool() {
         Some(true) => "PASS",
         Some(false) => "FAIL",
@@ -683,6 +694,12 @@ pub fn compare_fuzz(
             "crash_attribution": evidence.attribution_quality,
         },
         "sample_size": {"c": c_campaigns.len(), "rs": rs_campaigns.len()},
+        // Campaigns on disk that the gate could not use: no completion
+        // marker and no crashes, so neither a count nor an exposure.
+        "campaigns_excluded": {
+            "c": c_excluded.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            "rs": rs_excluded.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+        },
         "exposure_hours": {"c": round(t_c, 3), "rs": round(t_rs, 3)},
         // Whether the denominator is what the campaigns ran or what
         // they were budgeted: a fallback means some campaign left no
@@ -700,15 +717,86 @@ pub fn compare_fuzz(
         outdir.join("fuzz_stats.json"),
         serde_json::to_string_pretty(&result)?,
     )?;
+    // The per-campaign listing keeps every campaign found, usable or
+    // not, so the exclusion above can be audited against it.
+    let listing = |usable: Vec<CampaignSummary>, excluded: Vec<CampaignSummary>| {
+        let mut all: Vec<CampaignSummary> = usable.into_iter().chain(excluded).collect();
+        all.sort_by(|a, b| a.id.cmp(&b.id));
+        all
+    };
     fs::write(
         outdir.join("fuzz.csv"),
-        fuzz_csv(&c_campaigns, &rs_campaigns),
+        fuzz_csv(
+            &listing(c_campaigns, c_excluded),
+            &listing(rs_campaigns, rs_excluded),
+        ),
     )?;
 
     info!(
         "fuzz gate: attributable c={c_total} rs={rs_total} over {t_c:.2}h/{t_rs:.2}h -> {outcome}"
     );
     Ok(())
+}
+
+/// Split one side's campaigns into the ones the gate can use and
+/// the ones it cannot (classified `unavailable`: no completion
+/// marker, no crashes).
+fn usable(campaigns: Vec<CampaignSummary>) -> (Vec<CampaignSummary>, Vec<CampaignSummary>) {
+    let (usable, excluded): (Vec<_>, Vec<_>) = campaigns
+        .into_iter()
+        .partition(|campaign| campaign.quality != "unavailable");
+    for campaign in &excluded {
+        warn!(
+            "campaign {} neither completed nor crashed; excluded from the fuzz gate",
+            campaign.id
+        );
+    }
+    (usable, excluded)
+}
+
+/// A side with no usable campaign has bought no exposure the gate
+/// can divide by, so nothing has been shown either way.
+fn no_completed_campaigns(
+    c_excluded: &[CampaignSummary],
+    rs_excluded: &[CampaignSummary],
+    margin: f64,
+) -> (serde_json::Value, serde_json::Value) {
+    let ids = |campaigns: &[CampaignSummary]| {
+        campaigns
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let empty_side = |excluded: &[CampaignSummary]| !excluded.is_empty();
+    let sides = [("C", c_excluded), ("Rust", rs_excluded)]
+        .into_iter()
+        .filter(|(_, excluded)| empty_side(excluded))
+        .map(|(side, excluded)| format!("{side}: {}", ids(excluded)))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let block = json!({
+        "events": serde_json::Value::Null,
+        "exposure_hours": serde_json::Value::Null,
+        "rates_per_hour": serde_json::Value::Null,
+        "ratio": serde_json::Value::Null,
+        "mde_ratio_80pct_power": serde_json::Value::Null,
+    });
+    let verdict = json!({
+        "pass": serde_json::Value::Null,
+        "outcome": OUTCOME_INCONCLUSIVE,
+        "gate_basis": "no_completed_campaigns",
+        "criterion": format!(
+            "one-sided exact upper bound on the rs/c attributable crash rate ratio \
+             <= {margin}; a side whose campaigns neither completed nor crashed has \
+             no measured exposure, so the gate is inconclusive"
+        ),
+        "detail": format!(
+            "no completed campaign on one side; campaigns that neither completed nor \
+             crashed ({sides}) are not evidence: inconclusive"
+        ),
+    });
+    (block, verdict)
 }
 
 /// Exposure comes from the identity knobs (hours per campaign),
@@ -1127,6 +1215,117 @@ mod tests {
         let csv = fs::read_to_string(out.join("fuzz.csv")).unwrap();
         assert_eq!(csv.lines().count(), 5);
         assert!(csv.contains("c,campaign_1,1,0,,1,0,0"));
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The published Rust dataset had two campaigns that never started
+    /// counted as two clean campaigns. A side made only of such
+    /// campaigns cannot pass: it bought no exposure the gate can use.
+    #[test]
+    fn campaigns_that_never_completed_cannot_pass_the_gate() {
+        use crate::block::cli::{CompareOpts, ScreenOpts};
+        use crate::block::results::{FuzzKnobs, Identity, Manifest};
+
+        let manifest = Manifest {
+            complete: true,
+            created: 0,
+            seed: 42,
+            koxi: "test".to_owned(),
+            device: std::collections::BTreeMap::new(),
+            identity: Identity {
+                domain: "fuzz".to_owned(),
+                driver: "null_blk".to_owned(),
+                spec: String::new(),
+                prep: String::new(),
+                host: "test".to_owned(),
+                accel: None,
+                smp: None,
+                memory: None,
+                artifacts: None,
+                source: None,
+                fio: None,
+                fuzz: Some(FuzzKnobs {
+                    campaigns: 2,
+                    hours: 1.0,
+                    parallel: 1,
+                }),
+                static_: None,
+            },
+            p2: None,
+        };
+        let base = std::env::temp_dir().join(format!("koxi-fuzz-dead-{}", std::process::id()));
+        let (p1, p2, out) = (base.join("p1"), base.join("p2"), base.join("out"));
+        for root in [&p1, &p2] {
+            for campaign in ["campaign_1", "campaign_2"] {
+                fs::create_dir_all(root.join("campaigns").join(campaign)).unwrap();
+            }
+            fs::write(
+                root.join("manifest.toml"),
+                toml::to_string(&manifest).unwrap(),
+            )
+            .unwrap();
+        }
+        // The C side completed and crashed six times per campaign; the
+        // Rust side left no marker and no crashes at all.
+        for campaign in ["campaign_1", "campaign_2"] {
+            let dir = p1.join("campaigns").join(campaign);
+            fs::write(dir.join(CAMPAIGN_DONE), "3600\n").unwrap();
+            for crash in 0..6 {
+                let bucket = dir.join("crashes").join(format!("bug-{crash}"));
+                fs::create_dir_all(&bucket).unwrap();
+                fs::write(bucket.join("report0"), "Call Trace:\n null_blk_rq+0x1\n\n").unwrap();
+            }
+        }
+        fs::create_dir_all(&out).unwrap();
+        let opts = CompareOpts {
+            alpha: 0.05,
+            perf_threshold: 5.0,
+            bootstrap_resamples: 200,
+            fuzz_rate_margin: 2.0,
+            safety_threshold: 34.2,
+            seed: Some(7),
+            screen: ScreenOpts {
+                validated_crashes: None,
+            },
+        };
+        let run = || {
+            compare_fuzz(&p1, &p2, &manifest, &opts, &out, "null_blk", "rnull", &[]).unwrap();
+            let stats: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(out.join("fuzz_stats.json")).unwrap())
+                    .unwrap();
+            stats
+        };
+        let stats = run();
+        assert_eq!(stats["verdict"]["pass"], serde_json::Value::Null);
+        assert_eq!(stats["verdict"]["gate_basis"], "no_completed_campaigns");
+        assert_eq!(stats["sample_size"]["rs"], 0);
+        assert_eq!(
+            stats["campaigns_excluded"]["rs"],
+            serde_json::json!(["campaign_1", "campaign_2"])
+        );
+        assert_eq!(stats["exposure_hours"]["rs"], 0.0);
+        // Every campaign is still listed, so the exclusion can be audited.
+        let csv = fs::read_to_string(out.join("fuzz.csv")).unwrap();
+        assert_eq!(csv.lines().count(), 5);
+        assert!(csv.contains("rs,campaign_1,0,0,,0,0,0"));
+
+        // One Rust campaign completes: the gate runs on that campaign
+        // alone, over its hour, and the dead one stays excluded.
+        fs::write(
+            p2.join("campaigns/campaign_2").join(CAMPAIGN_DONE),
+            "3600\n",
+        )
+        .unwrap();
+        let stats = run();
+        assert_eq!(stats["verdict"]["gate_basis"], "rate_ratio_ci");
+        assert_eq!(stats["sample_size"]["rs"], 1);
+        assert_eq!(stats["exposure_hours"]["rs"], 1.0);
+        assert_eq!(
+            stats["campaigns_excluded"]["rs"],
+            serde_json::json!(["campaign_1"])
+        );
+        assert_eq!(stats["exposure_basis"], "measured");
 
         fs::remove_dir_all(&base).unwrap();
     }
