@@ -97,9 +97,14 @@ pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow
         };
 
         // Performance gate.
-        if let Some((p2_dir, p1_dir, manifest)) =
-            load_domain(&results_root, &campaign_root, c_name, rs_name, "perf")?
-        {
+        if let Some((p2_dir, p1_dir, manifest)) = load_domain(
+            &results_root,
+            &campaign_root,
+            campaign,
+            c_name,
+            rs_name,
+            "perf",
+        )? {
             info!("compare perf: {} vs {}", p1_dir.display(), p2_dir.display());
             perf::compare_perf(&p1_dir, &p2_dir, &manifest, opts, &compare_dir)
                 .with_context(|| format!("performance gate under {}", compare_dir.display()))?;
@@ -109,9 +114,14 @@ pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow
         }
 
         // Fuzzing gate.
-        if let Some((p2_dir, p1_dir, manifest)) =
-            load_domain(&results_root, &campaign_root, c_name, rs_name, "fuzz")?
-        {
+        if let Some((p2_dir, p1_dir, manifest)) = load_domain(
+            &results_root,
+            &campaign_root,
+            campaign,
+            c_name,
+            rs_name,
+            "fuzz",
+        )? {
             info!("compare fuzz: {} vs {}", p1_dir.display(), p2_dir.display());
             fuzz::compare_fuzz(
                 &p1_dir,
@@ -130,9 +140,14 @@ pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow
         }
 
         // Safety gate over the static analysis outputs.
-        if let Some((p2_dir, p1_dir, manifest)) =
-            load_domain(&results_root, &campaign_root, c_name, rs_name, "static")?
-        {
+        if let Some((p2_dir, p1_dir, manifest)) = load_domain(
+            &results_root,
+            &campaign_root,
+            campaign,
+            c_name,
+            rs_name,
+            "static",
+        )? {
             info!(
                 "compare safety: {} vs {}",
                 p1_dir.display(),
@@ -205,6 +220,7 @@ pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow
 fn load_domain(
     results_root: &Path,
     campaign_root: &Path,
+    campaign: &str,
     c_name: &str,
     rs_name: &str,
     domain: &str,
@@ -222,6 +238,23 @@ fn load_domain(
     let Some(p2) = &manifest.p2 else {
         bail!("{} has no campaign record", p2_dir.display());
     };
+    // The record must be this campaign's, and it must point into the
+    // baseline cache by hash: a dirname that is not one cannot have
+    // been written by the perf or fuzz phase.
+    if p2.campaign != campaign {
+        bail!(
+            "{} records campaign {:?}, not {campaign:?}",
+            p2_dir.display(),
+            p2.campaign
+        );
+    }
+    if p2.baseline.len() != 12 || !p2.baseline.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!(
+            "{} records baseline {:?}, which is not an identity hash",
+            p2_dir.display(),
+            p2.baseline
+        );
+    }
     let p1_dir = results::p1_dir(results_root, c_name, domain, &p2.baseline);
     let Some(baseline) = Manifest::load(&p1_dir)? else {
         bail!(
@@ -232,6 +265,12 @@ fn load_domain(
     };
     if !baseline.complete {
         bail!("baseline {} is incomplete", p1_dir.display());
+    }
+    if baseline.p2.is_some() {
+        bail!(
+            "baseline {} carries a campaign record: it is phase-2 data filed as a baseline",
+            p1_dir.display()
+        );
     }
     let actual_hash = results::identity_hash(&baseline.identity)?;
     if actual_hash != p2.baseline {
@@ -354,6 +393,14 @@ mod tests {
             prep = ""
             host = "test"
             accel = "kvm"
+            [identity.fio]
+            bs = ["4k"]
+            rw = ["randread"]
+            qd = [32]
+            size = ["512M"]
+            reps = 11
+            runtime = 5
+            engine = "io_uring"
             "#,
         )
         .unwrap()
@@ -377,7 +424,7 @@ mod tests {
         });
         campaign.save(&campaign_root.join("perf")).unwrap();
         assert!(
-            load_domain(&root, &campaign_root, "null_blk", "rnull", "perf")
+            load_domain(&root, &campaign_root, "trial", "null_blk", "rnull", "perf")
                 .unwrap()
                 .is_some()
         );
@@ -389,7 +436,7 @@ mod tests {
             .insert("queue.scheduler".into(), "none".into());
         baseline.save(&p1).unwrap();
         assert!(
-            load_domain(&root, &campaign_root, "null_blk", "rnull", "perf")
+            load_domain(&root, &campaign_root, "trial", "null_blk", "rnull", "perf")
                 .unwrap()
                 .is_some()
         );
@@ -397,7 +444,8 @@ mod tests {
         // A changed setup contract must not masquerade as the old baseline.
         baseline.identity.prep = "echo mq-deadline > /sys/block/nullb0/queue/scheduler".into();
         baseline.save(&p1).unwrap();
-        let error = load_domain(&root, &campaign_root, "null_blk", "rnull", "perf").unwrap_err();
+        let error =
+            load_domain(&root, &campaign_root, "trial", "null_blk", "rnull", "perf").unwrap_err();
         assert!(error.to_string().contains("identity hash"));
         assert!(error.to_string().contains(&p1.display().to_string()));
         std::fs::remove_dir_all(root).unwrap();
@@ -440,7 +488,7 @@ mod tests {
             });
             mutate(&mut campaign);
             campaign.save(&campaign_root.join("perf")).unwrap();
-            load_domain(&root, &campaign_root, "null_blk", "rnull", "perf")
+            load_domain(&root, &campaign_root, "trial", "null_blk", "rnull", "perf")
         };
         // The driver-specific fields differ by design.
         assert!(campaign(&|_| {}).unwrap().is_some());
@@ -465,6 +513,30 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("null_blk::brd"), "{error}");
+        // The campaign record itself: this campaign and a real hash.
+        let records: [(&str, Mutation); 2] = [
+            ("records campaign \"other\"", &|m| {
+                m.p2.as_mut().unwrap().campaign = "other".into();
+            }),
+            ("not an identity hash", &|m| {
+                m.p2.as_mut().unwrap().baseline = "../../elsewhere".into();
+            }),
+        ];
+        for (expected, mutate) in records {
+            let error = campaign(mutate).unwrap_err().to_string();
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
+        // A phase-2 manifest filed under p1 is not a baseline.
+        let mut filed = baseline.clone();
+        filed.p2 = Some(Campaign {
+            campaign: "trial".into(),
+            c_driver: "null_blk".into(),
+            rs_driver: "rnull".into(),
+            baseline: "000000000000".into(),
+        });
+        filed.save(&p1).unwrap();
+        let error = campaign(&|_| {}).unwrap_err().to_string();
+        assert!(error.contains("campaign record"), "{error}");
         std::fs::remove_dir_all(root).unwrap();
     }
 }

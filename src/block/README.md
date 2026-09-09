@@ -231,9 +231,11 @@ baseline the campaign recorded rather than whatever is newest:
    manifest that exists but cannot be read is an error too, not a
    domain that was never run.
 2. Read the baseline identity hash out of the manifest and resolve
-   `results/p1/<c>/<domain>/<hash>/`. A missing or incomplete
-   baseline is an error, and so is a baseline whose identity no
-   longer hashes to the name the campaign recorded.
+   `results/p1/<c>/<domain>/<hash>/`. The record must name this
+   campaign and a real hash. A missing or incomplete baseline is an
+   error, and so is a baseline whose identity no longer hashes to
+   the name the campaign recorded, or one that carries a campaign
+   record of its own: that is phase-2 data filed as a baseline.
 3. Refuse the pair outright if the two manifests describe different
    experiments. Both must name the registered pair and the domain
    being compared, and every identity field that is not the driver
