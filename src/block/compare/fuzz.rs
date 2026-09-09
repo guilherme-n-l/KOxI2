@@ -314,7 +314,9 @@ pub(super) fn classify_campaign(
 fn measured_hours(campaign_dir: &Path) -> Option<f64> {
     let text = fs::read_to_string(campaign_dir.join(CAMPAIGN_DONE)).ok()?;
     let seconds: f64 = text.trim().parse().ok()?;
-    (seconds > 0.0).then_some(seconds / 3600.0)
+    // Rust's parser accepts "inf" and "NaN"; neither is a duration,
+    // and an infinite denominator panics inside the beta function.
+    (seconds.is_finite() && seconds > 0.0).then_some(seconds / 3600.0)
 }
 
 /// syzkaller's crashes/ dir: one bucket per unique crash, either a
@@ -752,12 +754,17 @@ fn exposure_hours(
     let baseline = Manifest::load(p1_dir)?
         .with_context(|| format!("{} lost its manifest", p1_dir.display()))?;
     let nominal = |manifest: &Manifest, side: &str| -> anyhow::Result<f64> {
-        manifest
+        let hours = manifest
             .identity
             .fuzz
             .as_ref()
             .map(|knobs| knobs.hours)
-            .with_context(|| format!("{side} manifest has no fuzz knobs in its identity"))
+            .with_context(|| format!("{side} manifest has no fuzz knobs in its identity"))?;
+        ensure!(
+            hours.is_finite() && hours > 0.0,
+            "{side} manifest budgets {hours} hours per campaign, which is not a duration"
+        );
+        Ok(hours)
     };
     Ok((
         side_exposure(c_campaigns, nominal(&baseline, "baseline")?),
@@ -1161,6 +1168,10 @@ mod tests {
         assert_eq!(measured_hours(&write("legacy", "")), None);
         assert_eq!(measured_hours(&write("odd", "not a number")), None);
         assert_eq!(measured_hours(&dir.path().join("absent")), None);
+        // Parseable but not a duration: the gate must not divide by these.
+        for marker in ["inf\n", "-inf\n", "NaN\n", "0\n", "-1\n"] {
+            assert_eq!(measured_hours(&write("bad", marker)), None, "{marker:?}");
+        }
 
         let campaign = |hours: Option<f64>| CampaignSummary {
             id: "c".to_owned(),
