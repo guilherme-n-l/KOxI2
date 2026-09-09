@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
+use anyhow::Context;
 use serde_json::json;
 use tracing::info;
 
@@ -46,8 +47,17 @@ fn recommendation(key: (bool, bool, bool)) -> &'static str {
     }
 }
 
-fn read_json(path: &Path) -> Option<serde_json::Value> {
-    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
+fn read_json(path: &Path) -> anyhow::Result<Option<serde_json::Value>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading gate artifact {}", path.display()));
+        }
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .with_context(|| format!("parsing gate artifact {}", path.display()))
 }
 
 fn summarize(name: &str, data: Option<&serde_json::Value>) -> serde_json::Value {
@@ -258,7 +268,7 @@ pub fn write_verdict(
     let mut dimensions = serde_json::Map::new();
     let mut caveats: Vec<String> = Vec::new();
     for (name, file) in files {
-        let data = read_json(&compare_dir.join(file));
+        let data = read_json(&compare_dir.join(file))?;
         if data.is_none() {
             caveats.push(format!("{name}: not available (data missing)"));
         }
@@ -376,6 +386,49 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn unreadable_gate_artifacts_are_not_missing_evidence() {
+        let dir = std::env::temp_dir().join(format!("koxi-verdict-corrupt-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let gate = dir.join("perf_stats.json");
+        let write = || {
+            write_verdict(
+                &dir,
+                "trial",
+                &BTreeMap::new(),
+                "null_blk",
+                "rnull",
+                None,
+                None,
+            )
+        };
+        for contents in ["", r#"{"verdict":{"pass":false"#] {
+            fs::write(&gate, contents).unwrap();
+            let error = write().unwrap_err();
+            assert!(error.to_string().contains(&gate.display().to_string()));
+            assert!(!dir.join("verdict.json").exists());
+        }
+        fs::remove_file(&gate).unwrap();
+        fs::create_dir(&gate).unwrap();
+        assert!(write()
+            .unwrap_err()
+            .to_string()
+            .contains(&gate.display().to_string()));
+        assert!(!dir.join("verdict.json").exists());
+        fs::remove_dir(&gate).unwrap();
+
+        // A genuinely absent gate remains unavailable, not a read error.
+        write().unwrap();
+        assert_eq!(
+            verdict_in(&dir)["dimensions"]["performance"]["available"],
+            false
+        );
+        fs::write(&gate, r#"{"verdict":{"pass":false}}"#).unwrap();
+        write().unwrap();
+        assert_eq!(verdict_in(&dir)["overall"], "fail");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
