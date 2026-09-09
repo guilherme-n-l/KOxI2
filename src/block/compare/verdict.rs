@@ -200,12 +200,16 @@ fn decide(dimensions: &serde_json::Map<String, serde_json::Value>) -> Outcome {
                 .to_string(),
             caveat: None,
         }
-    } else if missing.is_empty() {
+    } else if available
+        .iter()
+        .any(|summary| summary["pass"].as_bool().is_none())
+    {
         Outcome {
             overall: "inconclusive",
             recommendation: "Inconclusive: at least one dimension did not yield a decisive verdict"
                 .to_string(),
-            caveat: None,
+            caveat: (!missing.is_empty())
+                .then(|| format!("missing dimensions: {}", missing.join(", "))),
         }
     } else {
         let missing_msg = missing.join(", ");
@@ -335,6 +339,43 @@ mod tests {
 
     fn verdict_in(dir: &Path) -> serde_json::Value {
         serde_json::from_str(&fs::read_to_string(dir.join("verdict.json")).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn verdict_precedence_holds_for_every_gate_state() {
+        // Missing, present but undecided, failed, passed: four states
+        // per gate, including the mixed missing/undecided cases.
+        let states = [None, Some(None), Some(Some(false)), Some(Some(true))];
+        for safety in states {
+            for fuzzing in states {
+                for performance in states {
+                    let triple = [safety, fuzzing, performance];
+                    let dimensions = ["safety", "fuzzing", "performance"]
+                        .into_iter()
+                        .zip(triple)
+                        .map(|(name, state)| {
+                            (
+                                name.to_owned(),
+                                json!({
+                                    "available": state.is_some(),
+                                    "pass": state.flatten(),
+                                }),
+                            )
+                        })
+                        .collect();
+                    let expected = if triple.contains(&Some(Some(false))) {
+                        "fail"
+                    } else if triple.iter().all(|state| *state == Some(Some(true))) {
+                        "pass"
+                    } else if triple.contains(&Some(None)) || triple.iter().all(Option::is_none) {
+                        "inconclusive"
+                    } else {
+                        "partial"
+                    };
+                    assert_eq!(decide(&dimensions).overall, expected, "{triple:?}");
+                }
+            }
+        }
     }
 
     #[test]
