@@ -404,6 +404,12 @@ sibling that pins `FIO_REPS=1`.
   names, CRLF manifests, unknown manifest keys, a symlinked results
   root, a read-only results tree, eight concurrent screens: all held
   without a change.
+- A last round over the home and the scaffold found nothing: symlinks
+  pointing out of the cache, the scratch and `artifacts/` are removed
+  as links and never followed; a home that is a file, a home with
+  spaces, no `HOME` at all; `new` racing itself eight ways, `init
+--force` likewise, a log file shared by eight compares; every
+  `--help` beside a malformed `koxi.toml`.
 
 ### Keeping track
 
