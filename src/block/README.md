@@ -229,7 +229,8 @@ baseline the campaign recorded rather than whatever is newest:
    never run is skipped; one that exists but is incomplete is an
    error, since a partial measurement is not a comparable one. A
    manifest that exists but cannot be read is an error too, not a
-   domain that was never run.
+   domain that was never run, and so is a manifest whose plan the
+   gate cannot run: an empty matrix, zero reps, a zero-hour budget.
 2. Read the baseline identity hash out of the manifest and resolve
    `results/p1/<c>/<domain>/<hash>/`. The record must name this
    campaign and a real hash. A missing or incomplete baseline is an

@@ -161,6 +161,60 @@ pub struct Campaign {
     pub baseline: String,
 }
 
+impl Identity {
+    /// The knobs a loaded manifest must carry before its data can be
+    /// gated: a matrix with no cells, zero reps, or a zero-hour
+    /// campaign budget would otherwise pass vacuously or divide by
+    /// zero downstream. The run verbs refuse these on the command
+    /// line; this is the same rule for manifests read back from disk.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.domain.as_str() {
+            "perf" => {
+                let fio = self
+                    .fio
+                    .as_ref()
+                    .ok_or("perf identity has no [identity.fio] table")?;
+                if fio.bs.is_empty()
+                    || fio.rw.is_empty()
+                    || fio.qd.is_empty()
+                    || fio.size.is_empty()
+                {
+                    return Err("fio matrix has an empty axis".to_owned());
+                }
+                if fio.qd.contains(&0) {
+                    return Err("fio matrix has a queue depth of 0".to_owned());
+                }
+                if fio.reps == 0 {
+                    return Err("fio reps is 0".to_owned());
+                }
+                if fio.runtime == 0 {
+                    return Err("fio runtime is 0".to_owned());
+                }
+            }
+            "fuzz" => {
+                let fuzz = self
+                    .fuzz
+                    .as_ref()
+                    .ok_or("fuzz identity has no [identity.fuzz] table")?;
+                if fuzz.campaigns == 0 {
+                    return Err("fuzz plan has 0 campaigns".to_owned());
+                }
+                if !(fuzz.hours.is_finite() && fuzz.hours > 0.0) {
+                    return Err(format!(
+                        "fuzz plan budgets {} hours per campaign",
+                        fuzz.hours
+                    ));
+                }
+                if fuzz.parallel == 0 {
+                    return Err("fuzz plan has 0 parallel VMs".to_owned());
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 /// The dirname hash, derived from the identity's TOML serialization
 /// (12 hex chars, like v1's `hash`).
 pub fn identity_hash(identity: &Identity) -> Result<String, Error> {
@@ -312,6 +366,48 @@ mod tests {
             identity_hash(&knobs).unwrap(),
             "fio knobs are identity"
         );
+    }
+
+    #[test]
+    fn an_identity_with_a_degenerate_plan_does_not_validate() {
+        type Mutation<'a> = &'a dyn Fn(&mut Identity);
+        assert!(identity().validate().is_ok());
+        let broken: [(&str, Mutation); 7] = [
+            ("empty axis", &|i| i.fio.as_mut().unwrap().bs.clear()),
+            ("queue depth of 0", &|i| {
+                i.fio.as_mut().unwrap().qd = vec![0];
+            }),
+            ("reps is 0", &|i| i.fio.as_mut().unwrap().reps = 0),
+            ("runtime is 0", &|i| i.fio.as_mut().unwrap().runtime = 0),
+            ("no [identity.fio]", &|i| i.fio = None),
+            ("0 campaigns", &|i| {
+                i.domain = "fuzz".into();
+                i.fuzz = Some(FuzzKnobs {
+                    campaigns: 0,
+                    hours: 1.0,
+                    parallel: 1,
+                });
+            }),
+            ("budgets inf hours", &|i| {
+                i.domain = "fuzz".into();
+                i.fuzz = Some(FuzzKnobs {
+                    campaigns: 1,
+                    hours: f64::INFINITY,
+                    parallel: 1,
+                });
+            }),
+        ];
+        for (expected, mutate) in broken {
+            let mut identity = identity();
+            mutate(&mut identity);
+            let error = identity.validate().unwrap_err();
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
+        // Host-side domains carry no plan to check.
+        let mut static_ = identity();
+        static_.domain = "static".into();
+        static_.fio = None;
+        assert!(static_.validate().is_ok());
     }
 
     #[test]

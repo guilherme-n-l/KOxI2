@@ -272,6 +272,11 @@ fn load_domain(
             p1_dir.display()
         );
     }
+    for (dir, identity) in [(&p1_dir, &baseline.identity), (&p2_dir, &manifest.identity)] {
+        if let Err(why) = identity.validate() {
+            bail!("{}: {why}", dir.display());
+        }
+    }
     let actual_hash = results::identity_hash(&baseline.identity)?;
     if actual_hash != p2.baseline {
         bail!(
@@ -513,14 +518,19 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("null_blk::brd"), "{error}");
-        // The campaign record itself: this campaign and a real hash.
-        let records: [(&str, Mutation); 2] = [
+        // The campaign record itself: this campaign, a real hash, and
+        // a plan the gate can run.
+        let records: [(&str, Mutation); 4] = [
             ("records campaign \"other\"", &|m| {
                 m.p2.as_mut().unwrap().campaign = "other".into();
             }),
             ("not an identity hash", &|m| {
                 m.p2.as_mut().unwrap().baseline = "../../elsewhere".into();
             }),
+            ("empty axis", &|m| {
+                m.identity.fio.as_mut().unwrap().rw.clear();
+            }),
+            ("reps is 0", &|m| m.identity.fio.as_mut().unwrap().reps = 0),
         ];
         for (expected, mutate) in records {
             let error = campaign(mutate).unwrap_err().to_string();
