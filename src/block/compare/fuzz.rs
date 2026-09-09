@@ -662,12 +662,30 @@ pub fn compare_fuzz(
         Some(path) => load_validated_crashes(path)?,
         None => HashMap::new(),
     };
+    let baseline = Manifest::load(p1_dir)?
+        .with_context(|| format!("{} lost its manifest", p1_dir.display()))?;
     let c_side = load_side(&classifier, p1_dir, &overrides)?;
     let rs_side = load_side(&classifier, p2_dir, &overrides)?;
     ensure!(
         !c_side.is_empty() && !rs_side.is_empty(),
         "missing fuzz campaign data for one or both drivers"
     );
+    // The plan bounds the data: a complete manifest promised exactly
+    // this many campaigns, so more or fewer directories are not this
+    // experiment's data.
+    for (dir, manifest, campaigns) in [(p1_dir, &baseline, &c_side), (p2_dir, manifest, &rs_side)] {
+        let planned = manifest
+            .identity
+            .fuzz
+            .as_ref()
+            .map_or(0, |knobs| knobs.campaigns) as usize;
+        ensure!(
+            campaigns.len() == planned,
+            "{}: {} campaign directories, but the manifest declares {planned}",
+            dir.display(),
+            campaigns.len()
+        );
+    }
     // A campaign that neither completed nor crashed anything is not
     // a clean campaign: it may have run for a minute or never
     // started. Counting it as zero crashes over its budgeted hours
@@ -676,7 +694,8 @@ pub fn compare_fuzz(
     let (c_campaigns, c_excluded) = usable(c_side);
     let (rs_campaigns, rs_excluded) = usable(rs_side);
 
-    let (c_exposure, rs_exposure) = exposure_hours(p1_dir, manifest, &c_campaigns, &rs_campaigns)?;
+    let (c_exposure, rs_exposure) =
+        exposure_hours(&baseline, manifest, &c_campaigns, &rs_campaigns)?;
     let (t_c, t_rs) = (c_exposure.hours, rs_exposure.hours);
     let evidence = Evidence::gather(&c_campaigns, &rs_campaigns, alpha)?;
 
@@ -852,13 +871,11 @@ fn side_exposure(campaigns: &[CampaignSummary], nominal: f64) -> Exposure {
 }
 
 fn exposure_hours(
-    p1_dir: &Path,
+    baseline: &Manifest,
     manifest: &Manifest,
     c_campaigns: &[CampaignSummary],
     rs_campaigns: &[CampaignSummary],
 ) -> anyhow::Result<(Exposure, Exposure)> {
-    let baseline = Manifest::load(p1_dir)?
-        .with_context(|| format!("{} lost its manifest", p1_dir.display()))?;
     let nominal = |manifest: &Manifest, side: &str| -> anyhow::Result<f64> {
         let hours = manifest
             .identity
@@ -873,7 +890,7 @@ fn exposure_hours(
         Ok(hours)
     };
     Ok((
-        side_exposure(c_campaigns, nominal(&baseline, "baseline")?),
+        side_exposure(c_campaigns, nominal(baseline, "baseline")?),
         side_exposure(rs_campaigns, nominal(manifest, "campaign")?),
     ))
 }
@@ -1327,6 +1344,15 @@ mod tests {
         let csv = fs::read_to_string(out.join("fuzz.csv")).unwrap();
         assert_eq!(csv.lines().count(), 5);
         assert!(csv.contains("rs,campaign_1,0,0,,0,0,0"));
+
+        // The plan bounds the data: a third directory, or one fewer,
+        // is not the two-campaign experiment the manifest describes.
+        fs::create_dir_all(p2.join("campaigns/campaign_3")).unwrap();
+        let error = compare_fuzz(&p1, &p2, &manifest, &opts, &out, "null_blk", "rnull", &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("3 campaign directories"), "{error}");
+        fs::remove_dir_all(p2.join("campaigns/campaign_3")).unwrap();
 
         // One Rust campaign completes: the gate runs on that campaign
         // alone, over its hour, and the dead one stays excluded.

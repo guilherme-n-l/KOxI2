@@ -665,7 +665,7 @@ fn describe(desc: &stats::Descriptive) -> serde_json::Value {
 fn load_workloads(
     dir: &Path,
     plan: Option<&FioKnobs>,
-) -> Result<(BTreeMap<String, WorkloadBundle>, LoadStats), std::io::Error> {
+) -> anyhow::Result<(BTreeMap<String, WorkloadBundle>, LoadStats)> {
     let mut workloads = BTreeMap::new();
     // The manifest, not the surviving directories, declares the matrix.
     // A lost directory still represents an untested cell. Keep the
@@ -718,6 +718,24 @@ fn load_workloads(
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            // The plan bounds the data as well as declaring it. A cell
+            // the manifest never planned, or a cell holding more or
+            // fewer reps than the manifest promised when it was marked
+            // complete, is not this experiment's data.
+            if let Some(plan) = plan {
+                ensure!(
+                    workloads.contains_key(&name),
+                    "{}: workload {name} is not in the manifest's fio matrix",
+                    dir.display()
+                );
+                ensure!(
+                    bundle.total_files == plan.reps as usize,
+                    "{}: workload {name} holds {} fio reps, but the manifest declares {}",
+                    dir.display(),
+                    bundle.total_files,
+                    plan.reps
+                );
+            }
             workloads.insert(name, bundle);
         }
     }
@@ -975,6 +993,56 @@ mod tests {
         assert_eq!(csv.lines().count(), 1 + 2 * 10 * 2);
 
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A complete manifest promised its matrix and its reps; data
+    /// beyond either is not this experiment's, and data short of it
+    /// contradicts the completion flag.
+    #[test]
+    fn the_plan_bounds_what_is_on_disk() {
+        let root = std::env::temp_dir().join(format!("koxi-perf-bounds-{}", std::process::id()));
+        let plan = FioKnobs {
+            bs: vec!["4k".into()],
+            rw: vec!["randread".into()],
+            qd: vec![32],
+            size: vec!["512M".into()],
+            reps: 3,
+            runtime: 5,
+            engine: "io_uring".into(),
+        };
+        let cell = |name: &str, reps: u32| {
+            let dir = root.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            for rep in 1..=reps {
+                fs::write(
+                    dir.join(format!("fio_{rep}.json")),
+                    r#"{"jobs":[{"error":0,"read":{"iops":100.0,"lat_ns":{"mean":1.0},"clat_ns":{"percentile":{"99.000000":1.0}}}}],"koxi_metadata":{"warmup":false}}"#,
+                )
+                .unwrap();
+            }
+            dir
+        };
+        let declared = crate::block::perf::matrix(&plan)[0].dir_name();
+        cell(&declared, 3);
+        assert!(load_workloads(&root, Some(&plan)).is_ok());
+
+        let stray = cell("8k_randread_32_512M", 3);
+        let error = load_workloads(&root, Some(&plan)).unwrap_err().to_string();
+        assert!(
+            error.contains("not in the manifest's fio matrix"),
+            "{error}"
+        );
+        // Without a plan the filesystem is the matrix (imported results).
+        assert!(load_workloads(&root, None).is_ok());
+        fs::remove_dir_all(&stray).unwrap();
+
+        for reps in [2, 4] {
+            fs::remove_dir_all(root.join(&declared)).unwrap();
+            cell(&declared, reps);
+            let error = load_workloads(&root, Some(&plan)).unwrap_err().to_string();
+            assert!(error.contains(&format!("holds {reps} fio reps")), "{error}");
+        }
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

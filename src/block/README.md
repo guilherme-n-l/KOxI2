@@ -243,6 +243,12 @@ baseline the campaign recorded rather than whatever is newest:
    artifacts, and the fio, fuzz and static knobs. The manifest is
    what makes that checkable after the fact.
 
+4. Hold the data to the plan. A complete manifest promised a matrix,
+   a rep count and a campaign count, so a perf cell the matrix never
+   declared, a cell holding more or fewer reps than declared, or a
+   fuzz side with more or fewer campaign directories than planned is
+   an error, not this experiment's data.
+
 Each domain that survives that feeds its gate, and the artifacts land
 in `<campaign>/compare/`. A campaign directory with no usable domain
 gets no verdict at all: an all-unavailable `verdict.json` behind a
