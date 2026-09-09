@@ -629,6 +629,7 @@ mod tests {
         FioOpts::with_profile(&matches, profile)
     }
 
+    /// Hardening 13, 14, 32.
     #[test]
     fn compare_knobs_are_range_checked_not_panicked_on() {
         with_env(&[], || {
@@ -668,6 +669,7 @@ mod tests {
     /// the env lock like every other test that does: without it, a
     /// sibling's FIO_REPS=1 turned the well-formed plan into a
     /// refused one.
+    /// Hardening 15.
     #[test]
     fn fio_plan_typos_fail_before_a_guest_boots() {
         with_env(&[], || {
@@ -743,6 +745,7 @@ mod tests {
     /// comparator drops warmups, so a single rep runs the whole matrix
     /// and leaves nothing to compare. Rejected up front rather than
     /// discovered after the benchmark.
+    /// Hardening 7.
     #[test]
     fn one_fio_rep_is_all_warmup_and_is_refused() {
         let one_rep = |args: &[&str]| {
@@ -785,6 +788,7 @@ mod tests {
         });
     }
 
+    /// Hardening 46.
     #[test]
     fn compare_demands_a_campaign_from_cli_or_env() {
         with_env(&[], || {

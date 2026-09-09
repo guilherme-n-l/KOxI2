@@ -412,6 +412,7 @@ mod tests {
         .unwrap()
     }
 
+    /// Hardening 29.
     #[test]
     fn the_recorded_baseline_hash_must_match_its_manifest() {
         let root = std::env::temp_dir().join(format!("koxi-baseline-hash-{}", std::process::id()));
@@ -461,6 +462,7 @@ mod tests {
     /// four vCPUs with io_uring compared silently against a campaign
     /// on eight with psync. Everything in the identity that is not
     /// the driver must agree.
+    /// Hardening 38, 44.
     #[test]
     fn the_two_sides_must_describe_the_same_experiment() {
         use crate::block::results::FioKnobs;

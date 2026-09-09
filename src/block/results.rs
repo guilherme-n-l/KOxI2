@@ -404,6 +404,7 @@ mod tests {
         );
     }
 
+    /// Hardening 45, 47.
     #[test]
     fn an_identity_with_a_degenerate_plan_does_not_validate() {
         type Mutation<'a> = &'a dyn Fn(&mut Identity);
@@ -449,6 +450,7 @@ mod tests {
         assert!(static_.validate().is_ok());
     }
 
+    /// Hardening 53.
     #[test]
     fn the_gate_lock_needs_a_results_root_and_excludes_a_second_holder() {
         use std::fs::{OpenOptions, TryLockError};
@@ -480,6 +482,7 @@ mod tests {
         assert!(error.contains("locking"), "{error}");
     }
 
+    /// Hardening 33.
     #[test]
     fn manifest_round_trips_and_tracks_completion() {
         let dir = std::env::temp_dir().join(format!("koxi-results-test-{}", std::process::id()));

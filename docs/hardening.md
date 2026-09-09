@@ -405,6 +405,18 @@ sibling that pins `FIO_REPS=1`.
   root, a read-only results tree, eight concurrent screens: all held
   without a change.
 
+### Keeping track
+
+Every row in these tables is meant to have a test that would fail if
+the defect came back. The bookkeeping lives in the tests, not here: a
+unit test that guards a row carries the number in its doc comment
+(`/// Hardening 35.`), and the local scenario battery maps numbers to
+its case names. `tests/hardening-coverage.py` reads both and prints,
+per row, what guards it; `--check` exits non-zero when a row from the
+third pass on has nothing. The first two passes were fixed in the
+pipeline (kernel builds, guest boots) and are reported but not
+counted, since most of them have no unit-testable shape.
+
 ## Backlog
 
 ### A clang-built comparison

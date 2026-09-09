@@ -636,6 +636,7 @@ mod tests {
     /// what is actually measured -- so the Rust half of the comparison
     /// could vanish at configure time and surface only much later, as a
     /// missing module after two full builds.
+    /// Hardening 2.
     #[test]
     fn required_symbols_catch_a_silently_dropped_rust_config() {
         let settled = "CONFIG_BLK_DEV_NULL_BLK=m\nCONFIG_CONFIGFS_FS=y\n";

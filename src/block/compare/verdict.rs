@@ -356,6 +356,7 @@ mod tests {
         serde_json::from_str(&fs::read_to_string(dir.join("verdict.json")).unwrap()).unwrap()
     }
 
+    /// Hardening 30.
     #[test]
     fn verdict_precedence_holds_for_every_gate_state() {
         // Missing, present but undecided, failed, passed: four states
@@ -393,6 +394,7 @@ mod tests {
         }
     }
 
+    /// Hardening 31.
     #[test]
     fn unreadable_gate_artifacts_are_not_missing_evidence() {
         let dir = std::env::temp_dir().join(format!("koxi-verdict-corrupt-{}", std::process::id()));
@@ -441,6 +443,7 @@ mod tests {
     /// fuzz campaign that fell back to TCG beside a KVM perf run
     /// downgrades fuzzing alone, and never borrows the perf run's KVM
     /// to stay "measured".
+    /// Hardening 36.
     #[test]
     fn the_substrate_downgrades_each_dimension_on_its_own() {
         let dir = std::env::temp_dir().join(format!("koxi-verdict-tcg-{}", std::process::id()));

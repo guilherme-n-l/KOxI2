@@ -503,6 +503,7 @@ mod tests {
 
     /// The pick is recorded as the screening's source, so what sits
     /// under the domain root must be what the path says it is.
+    /// Hardening 50.
     #[test]
     fn a_misfiled_baseline_is_an_error_not_a_skip() {
         use crate::block::results::Campaign;
@@ -555,6 +556,7 @@ mod tests {
     /// moving one re-rates every candidate, so they are pinned here
     /// rather than left to the next reader to infer. Scored from the
     /// commit rows, not from a summary table that may be absent.
+    /// Hardening 49.
     #[test]
     fn historical_risk_follows_the_v1_bands() {
         use std::fmt::Write as _;

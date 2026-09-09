@@ -737,6 +737,7 @@ mod tests {
 
     /// The published pair has eleven classified commits; a driver
     /// with none has no rate, and "0 of 0" must not read as 0%.
+    /// Hardening 42, 43.
     #[test]
     fn no_classified_commits_leaves_the_gate_undecided() {
         use crate::block::cli::{CompareOpts, ScreenOpts};
@@ -898,6 +899,7 @@ mod tests {
     /// A hand-edited artifact (manual_cwe review) can pick up a blank
     /// line. It must not become a phantom row: row counts feed
     /// total_functions and the commit totals.
+    /// Hardening 4.
     #[test]
     fn blank_lines_are_not_rows() {
         let dir = tempfile::tempdir().unwrap();

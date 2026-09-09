@@ -141,7 +141,7 @@ fn abstraction_patterns(paths: &[PathBuf]) -> Vec<String> {
     patterns
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(super) struct OverrideRow {
     classification: String,
     validator: String,
@@ -1150,6 +1150,7 @@ mod tests {
         assert!(block["ratio"]["ci"]["lo"].as_f64().unwrap() > 1.0);
     }
 
+    /// Hardening 48.
     #[test]
     fn override_csv_rejects_bad_classes_and_applies_good_ones() {
         let dir = std::env::temp_dir().join(format!("koxi-fuzzcmp-{}", std::process::id()));
@@ -1168,6 +1169,22 @@ mod tests {
         );
         fs::write(&csv, "campaign,crash_id,classification\nc1,x,bogus\n").unwrap();
         assert!(load_validated_crashes(&csv).is_err());
+        // A spreadsheet export: every field quoted, a comma in the
+        // notes, CRLF line ends, columns in another order.
+        fs::write(
+            &csv,
+            "notes,classification,crash_id,campaign\r\n\
+             \"host, not driver\",\"infrastructure_noise\",\"probe\",\"campaign_1\"\r\n",
+        )
+        .unwrap();
+        let overrides = load_validated_crashes(&csv).unwrap();
+        let row = &overrides[&("campaign_1".to_string(), "probe".to_string())];
+        assert_eq!(row.classification, INFRA);
+        assert_eq!(row.notes, "host, not driver");
+        // No header, or a header without the three columns, is refused.
+        fs::write(&csv, "campaign_1,probe,infrastructure_noise\n").unwrap();
+        let error = load_validated_crashes(&csv).unwrap_err().to_string();
+        assert!(error.contains("missing column"), "{error}");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1315,6 +1332,7 @@ mod tests {
     /// The published Rust dataset had two campaigns that never started
     /// counted as two clean campaigns. A side made only of such
     /// campaigns cannot pass: it bought no exposure the gate can use.
+    /// Hardening 35, 40, 41.
     #[test]
     fn campaigns_that_never_completed_cannot_pass_the_gate() {
         use crate::block::cli::{CompareOpts, ScreenOpts};
@@ -1485,6 +1503,7 @@ mod tests {
         fs::remove_dir_all(&base).unwrap();
     }
 
+    /// Hardening 34, 39.
     #[test]
     fn exposure_counts_hours_run_not_hours_budgeted() {
         let dir = tempfile::tempdir().unwrap();

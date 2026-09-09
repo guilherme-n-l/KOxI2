@@ -873,6 +873,7 @@ mod tests {
         }
     }
 
+    /// Hardening 25.
     #[test]
     fn geometry_disagrees_only_on_attributes_both_devices_expose() {
         let dir = std::env::temp_dir().join(format!("koxi-geom-{}", std::process::id()));
@@ -998,6 +999,7 @@ mod tests {
     /// A complete manifest promised its matrix and its reps; data
     /// beyond either is not this experiment's, and data short of it
     /// contradicts the completion flag.
+    /// Hardening 40.
     #[test]
     fn the_plan_bounds_what_is_on_disk() {
         let root = std::env::temp_dir().join(format!("koxi-perf-bounds-{}", std::process::id()));
@@ -1045,6 +1047,7 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
+    /// Hardening 26.
     #[test]
     fn workloads_without_retained_runs_cannot_disappear_from_the_gate() {
         let base = std::env::temp_dir().join(format!("koxi-perf-empty-{}", std::process::id()));
@@ -1082,6 +1085,7 @@ mod tests {
         fs::remove_dir_all(base).unwrap();
     }
 
+    /// Hardening 28.
     #[test]
     fn the_manifest_keeps_missing_workload_directories_in_the_gate() {
         let base = std::env::temp_dir().join(format!("koxi-perf-plan-{}", std::process::id()));
@@ -1175,6 +1179,7 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Hardening 27.
     #[test]
     fn fio_jobs_with_errors_are_not_measurements() {
         let root = std::env::temp_dir().join(format!("koxi-fio-error-{}", std::process::id()));
