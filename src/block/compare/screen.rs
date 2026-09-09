@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::bail;
+use anyhow::{bail, ensure};
 use serde_json::json;
 use tracing::info;
 
@@ -18,7 +18,7 @@ use super::fuzz::{classify_campaign, load_validated_crashes, Classifier};
 use super::safety::{get, number, read_csv};
 use super::verdict::worst_quality;
 use crate::block::cli::{Scope, ScreenOpts};
-use crate::block::results::Manifest;
+use crate::block::results::{self, Manifest};
 use crate::config::{anchored, Project};
 
 pub(crate) fn drive(scope: &Scope, opts: &ScreenOpts) -> anyhow::Result<()> {
@@ -36,8 +36,8 @@ pub(crate) fn drive(scope: &Scope, opts: &ScreenOpts) -> anyhow::Result<()> {
     for subject in subjects {
         let c_name = subject.c_name;
         let driver_root = results_root.join("p1").join(c_name);
-        let static_pick = latest_complete(&driver_root.join("static"))?;
-        let fuzz_pick = latest_complete(&driver_root.join("fuzz"))?;
+        let static_pick = latest_complete(&driver_root.join("static"), c_name, "static")?;
+        let fuzz_pick = latest_complete(&driver_root.join("fuzz"), c_name, "fuzz")?;
         // Screening is a phase-1 verdict on the C driver. A
         // registered counterpart only widens crash attribution, so a
         // driver nobody has rewritten screens on its own name.
@@ -50,15 +50,15 @@ pub(crate) fn drive(scope: &Scope, opts: &ScreenOpts) -> anyhow::Result<()> {
         let classifier = Classifier::new(&names, abstractions)?;
 
         let historical = match &static_pick {
-            Some((dir, _)) => historical_risk(dir),
+            Some((dir, _, _)) => historical_risk(dir),
             None => missing("missing commit-history artifacts"),
         };
         let surface = match &static_pick {
-            Some((dir, _)) => static_surface(dir),
+            Some((dir, _, _)) => static_surface(dir),
             None => missing("missing static surface artifacts"),
         };
         let (dynamic, campaign_count) = match &fuzz_pick {
-            Some((dir, _)) => dynamic_robustness(dir, &classifier, &overrides)?,
+            Some((dir, _, _)) => dynamic_robustness(dir, &classifier, &overrides)?,
             None => (missing("missing fuzz campaign artifacts"), 0),
         };
         let tract = tractability(static_pick.is_some(), fuzz_pick.is_some(), campaign_count);
@@ -74,8 +74,8 @@ pub(crate) fn drive(scope: &Scope, opts: &ScreenOpts) -> anyhow::Result<()> {
         let result = json!({
             "driver": c_name,
             "sources": {
-                "static": static_pick.as_ref().map(|(_, hash)| hash.clone()),
-                "fuzz": fuzz_pick.as_ref().map(|(_, hash)| hash.clone()),
+                "static": static_pick.as_ref().map(|(_, hash, _)| hash.clone()),
+                "fuzz": fuzz_pick.as_ref().map(|(_, hash, _)| hash.clone()),
             },
             "data_quality": {"status": status},
             "dimensions": dimensions,
@@ -127,7 +127,16 @@ fn rate(dimensions: &serde_json::Value) -> (&'static str, &str) {
 }
 
 /// Newest complete manifest under results/p1/<driver>/<domain>/.
-fn latest_complete(domain_root: &Path) -> anyhow::Result<Option<(PathBuf, String)>> {
+/// Every complete baseline found there must be what the path says
+/// it is: this driver, this domain, filed under its own identity
+/// hash, with no campaign record and a plan the gates can run. A
+/// misfiled or corrupt baseline is an error, not one to skip past,
+/// since the pick is recorded as the screening's source.
+fn latest_complete(
+    domain_root: &Path,
+    c_name: &str,
+    domain: &str,
+) -> anyhow::Result<Option<(PathBuf, String, Manifest)>> {
     if !domain_root.is_dir() {
         return Ok(None);
     }
@@ -139,7 +148,7 @@ fn latest_complete(domain_root: &Path) -> anyhow::Result<Option<(PathBuf, String
         .map(|entry| entry.path())
         .collect();
     entries.sort();
-    let mut best: Option<(u64, PathBuf, String)> = None;
+    let mut best: Option<(u64, PathBuf, String, Manifest)> = None;
     for path in entries {
         if !path.is_dir() {
             continue;
@@ -154,14 +163,35 @@ fn latest_complete(domain_root: &Path) -> anyhow::Result<Option<(PathBuf, String
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
+        ensure!(
+            manifest.p2.is_none(),
+            "{}: carries a campaign record; phase-2 data filed as a baseline",
+            path.display()
+        );
+        ensure!(
+            manifest.identity.driver == c_name && manifest.identity.domain == domain,
+            "{}: holds {} {} data, not {c_name} {domain} data",
+            path.display(),
+            manifest.identity.driver,
+            manifest.identity.domain
+        );
+        let actual = results::identity_hash(&manifest.identity)?;
+        ensure!(
+            actual == hash,
+            "{}: identity hashes to {actual}, not to its directory name",
+            path.display()
+        );
+        if let Err(why) = manifest.identity.validate() {
+            bail!("{}: {why}", path.display());
+        }
         if best
             .as_ref()
-            .is_none_or(|(created, _, _)| manifest.created >= *created)
+            .is_none_or(|(created, _, _, _)| manifest.created >= *created)
         {
-            best = Some((manifest.created, path, hash));
+            best = Some((manifest.created, path, hash, manifest));
         }
     }
-    Ok(best.map(|(_, path, hash)| (path, hash)))
+    Ok(best.map(|(_, path, hash, manifest)| (path, hash, manifest)))
 }
 
 /// Validated CWE wins over the automatic one, as in the safety gate.
@@ -349,9 +379,9 @@ mod tests {
     use super::*;
     use crate::block::results::Identity;
 
-    /// A minimal static-domain identity; only completeness and
-    /// `created` matter to the pick.
-    fn manifest(created: u64) -> Manifest {
+    /// A minimal static-domain identity, distinguished by `prep` so
+    /// two baselines can coexist under their own hashes.
+    fn manifest(created: u64, prep: &str) -> Manifest {
         Manifest {
             complete: true,
             created,
@@ -362,7 +392,7 @@ mod tests {
                 domain: "static".to_owned(),
                 driver: "null_blk".to_owned(),
                 spec: "c:null_blk:null_blk.ko:/dev/nullb0:::".to_owned(),
-                prep: String::new(),
+                prep: prep.to_owned(),
                 host: "test".to_owned(),
                 accel: None,
                 smp: None,
@@ -377,6 +407,17 @@ mod tests {
         }
     }
 
+    /// Save under the identity's own hash, as the phases do.
+    fn file(domain: &Path, manifest: &Manifest) -> String {
+        let hash = results::identity_hash(&manifest.identity).unwrap();
+        manifest.save(&domain.join(&hash)).unwrap();
+        hash
+    }
+
+    fn pick(domain: &Path) -> anyhow::Result<Option<String>> {
+        Ok(latest_complete(domain, "null_blk", "static")?.map(|(_, hash, _)| hash))
+    }
+
     #[test]
     fn baseline_pick_is_deterministic_when_baselines_share_a_second() {
         let dir = tempfile::tempdir().unwrap();
@@ -384,13 +425,15 @@ mod tests {
         // Two complete baselines minted in the same second: the pick
         // is recorded in screening.json, so it must not depend on the
         // order the filesystem hands the directories back.
-        for hash in ["ffff11112222", "0000aaaabbbb"] {
-            manifest(1_700_000_000).save(&domain.join(hash)).unwrap();
-        }
-        let picked = latest_complete(&domain).unwrap().unwrap().1;
-        assert_eq!(picked, "ffff11112222", "ties resolve by sorted name");
+        let mut hashes: Vec<String> = ["", "echo 1 > x"]
+            .iter()
+            .map(|prep| file(&domain, &manifest(1_700_000_000, prep)))
+            .collect();
+        hashes.sort();
+        let picked = pick(&domain).unwrap().unwrap();
+        assert_eq!(picked, hashes[1], "ties resolve by sorted name");
         for _ in 0..8 {
-            assert_eq!(latest_complete(&domain).unwrap().unwrap().1, picked);
+            assert_eq!(pick(&domain).unwrap().unwrap(), picked);
         }
     }
 
@@ -398,11 +441,11 @@ mod tests {
     fn newer_baselines_still_win_over_older_ones() {
         let dir = tempfile::tempdir().unwrap();
         let domain = dir.path().join("static");
-        manifest(10).save(&domain.join("ffff11112222")).unwrap();
-        manifest(20).save(&domain.join("0000aaaabbbb")).unwrap();
+        file(&domain, &manifest(10, "zzz"));
+        let newer = file(&domain, &manifest(20, "aaa"));
         assert_eq!(
-            latest_complete(&domain).unwrap().unwrap().1,
-            "0000aaaabbbb",
+            pick(&domain).unwrap().unwrap(),
+            newer,
             "recency beats the tie-break"
         );
     }
@@ -411,13 +454,47 @@ mod tests {
     fn an_incomplete_baseline_is_never_picked() {
         let dir = tempfile::tempdir().unwrap();
         let domain = dir.path().join("static");
-        let mut partial = manifest(99);
+        let mut partial = manifest(99, "");
         partial.complete = false;
-        partial.save(&domain.join("ffff11112222")).unwrap();
-        assert!(latest_complete(&domain).unwrap().is_none());
-        assert!(latest_complete(&dir.path().join("absent"))
-            .unwrap()
-            .is_none());
+        file(&domain, &partial);
+        assert!(pick(&domain).unwrap().is_none());
+        assert!(pick(&dir.path().join("absent")).unwrap().is_none());
+    }
+
+    /// The pick is recorded as the screening's source, so what sits
+    /// under the domain root must be what the path says it is.
+    #[test]
+    fn a_misfiled_baseline_is_an_error_not_a_skip() {
+        use crate::block::results::Campaign;
+        let dir = tempfile::tempdir().unwrap();
+        let domain = dir.path().join("static");
+        let expect = |manifest: &Manifest, name: &str, needle: &str| {
+            manifest.save(&domain.join(name)).unwrap();
+            let error = pick(&domain).unwrap_err().to_string();
+            assert!(error.contains(needle), "{needle}: {error}");
+            fs::remove_dir_all(domain.join(name)).unwrap();
+        };
+        let good = manifest(1, "");
+        let hash = results::identity_hash(&good.identity).unwrap();
+        expect(&good, "0123456789ab", "hashes to");
+        let mut fuzz = good.clone();
+        fuzz.identity.domain = "fuzz".into();
+        let fuzz_hash = results::identity_hash(&fuzz.identity).unwrap();
+        expect(&fuzz, &fuzz_hash, "holds null_blk fuzz data");
+        let mut other = good.clone();
+        other.identity.driver = "brd".into();
+        let other_hash = results::identity_hash(&other.identity).unwrap();
+        expect(&other, &other_hash, "holds brd static data");
+        let mut filed = good.clone();
+        filed.p2 = Some(Campaign {
+            campaign: "trial".into(),
+            c_driver: "null_blk".into(),
+            rs_driver: "rnull".into(),
+            baseline: hash.clone(),
+        });
+        expect(&filed, &hash, "campaign record");
+        file(&domain, &good);
+        assert_eq!(pick(&domain).unwrap().unwrap(), hash);
     }
 
     /// Writes the two CSVs `static_surface` reads.
