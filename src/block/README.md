@@ -203,10 +203,14 @@ and scores four dimensions from 0 to 3:
 
 | Dimension            | Read from                             | Scored on                                                                          |
 | -------------------- | ------------------------------------- | ---------------------------------------------------------------------------------- |
-| `historical_risk`    | `commits.csv`, `commits_summary.csv`  | 3 at 40% safety-related commits or 25 of them; 2 at 20% or 10; 1 if any; else 0.   |
+| `historical_risk`    | `commits.csv`                         | 3 at 40% safety-related commits or 25 of them; 2 at 20% or 10; 1 if any; else 0.   |
 | `static_surface`     | `functions.csv`, `unsafe_density.csv` | 3 at 2000 lines or 500 implicit unsafe operations; 2 at 800 or 150; 1 if any.      |
 | `dynamic_robustness` | the fuzz baseline's campaigns         | 3 if any crash is target-attributable; 2 if any is unknown; 1 if only infra noise. |
 | `tractability`       | which baselines are cached            | 3 if static and fuzz are both cached with 10 or more campaigns; 2 if both; else 1. |
+
+Historical risk is scored from the commit rows themselves, not from
+`commits_summary.csv`, and is `manually_validated` on the safety
+gate's rule: every classified commit signed by a validator.
 
 The mean of the available scores becomes the band:
 `strong_candidate` at 2.5 or above, `moderate` at 1.5, otherwise

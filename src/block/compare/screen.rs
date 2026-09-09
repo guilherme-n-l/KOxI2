@@ -164,29 +164,31 @@ fn latest_complete(domain_root: &Path) -> anyhow::Result<Option<(PathBuf, String
     Ok(best.map(|(_, path, hash)| (path, hash)))
 }
 
+/// Validated CWE wins over the automatic one, as in the safety gate.
+fn cwe(row: &super::safety::Row) -> &str {
+    let manual = get(row, "manual_cwe").trim();
+    if manual.is_empty() {
+        get(row, "auto_cwe").trim()
+    } else {
+        manual
+    }
+}
+
+/// Scored from commits.csv itself. commits_summary.csv is derived
+/// from the same rows by the static phase; reading the totals from
+/// it scored a driver whose summary was absent at zero, with ten
+/// safety-related commits sitting in the table beside it.
 fn historical_risk(static_dir: &Path) -> serde_json::Value {
     let commits = read_csv(&static_dir.join("commits.csv"));
-    let summary = read_csv(&static_dir.join("commits_summary.csv"));
-    if commits.is_empty() && summary.is_empty() {
+    if commits.is_empty() {
         return missing("missing commit-history artifacts");
     }
-    let metric = |name: &str| -> f64 {
-        summary
-            .iter()
-            .find(|row| get(row, "metric") == name)
-            .and_then(|row| get(row, "value").trim().parse().ok())
-            .unwrap_or(0.0)
-    };
-    let total_commits = {
-        let from_summary = metric("total_commits") as u64;
-        if from_summary > 0 {
-            from_summary
-        } else {
-            commits.len() as u64
-        }
-    };
-    let safety_related = metric("safety_related") as u64;
-    let safety_pct = metric("safety_pct");
+    let total_commits = commits.len() as u64;
+    let safety_related = commits
+        .iter()
+        .filter(|row| get(row, "safety_related").trim() == "true" || !cwe(row).is_empty())
+        .count() as u64;
+    let safety_pct = safety_related as f64 * 100.0 / total_commits as f64;
 
     let score = if safety_pct >= 40.0 || safety_related >= 25 {
         3
@@ -195,9 +197,15 @@ fn historical_risk(static_dir: &Path) -> serde_json::Value {
     } else {
         u8::from(safety_related > 0)
     };
-    let quality = if commits
-        .iter()
-        .any(|row| !get(row, "manual_cwe").trim().is_empty())
+    // The same rule as the safety gate: validated means every
+    // classified commit was reviewed by a person, whose signature is
+    // the validator column, not that one row carries a manual CWE.
+    let classified: Vec<&super::safety::Row> =
+        commits.iter().filter(|row| !cwe(row).is_empty()).collect();
+    let quality = if !classified.is_empty()
+        && classified
+            .iter()
+            .all(|row| !get(row, "validator").trim().is_empty())
     {
         "manually_validated"
     } else {
@@ -420,36 +428,60 @@ mod tests {
         dir
     }
 
-    fn commits_dir(summary: &str, commits: &str) -> tempfile::TempDir {
+    fn commits_dir(commits: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("commits_summary.csv"), summary).unwrap();
         fs::write(dir.path().join("commits.csv"), commits).unwrap();
         dir
     }
 
     /// The v1 screening bands. These numbers are the Phase-1 rubric:
     /// moving one re-rates every candidate, so they are pinned here
-    /// rather than left to the next reader to infer.
+    /// rather than left to the next reader to infer. Scored from the
+    /// commit rows, not from a summary table that may be absent.
     #[test]
     fn historical_risk_follows_the_v1_bands() {
-        let commits = "sha,subject,manual_cwe\nabc,fix,\n";
-        let band = |total: u32, safety: u32, pct: &str| -> u64 {
-            let summary = format!(
-                "metric,value\ntotal_commits,{total}\nsafety_related,{safety}\nsafety_pct,{pct}\n"
-            );
-            let dir = commits_dir(&summary, commits);
+        use std::fmt::Write as _;
+        let table = |total: u32, safety: u32, validator: &str| {
+            let mut csv = String::from("hash,safety_related,auto_cwe,manual_cwe,validator\n");
+            for index in 0..total {
+                let related = index < safety;
+                let _ = writeln!(
+                    csv,
+                    "{index},{related},{},,{}",
+                    if related { "CWE-416" } else { "" },
+                    if related { validator } else { "" }
+                );
+            }
+            csv
+        };
+        let band = |total: u32, safety: u32| -> u64 {
+            let dir = commits_dir(&table(total, safety, ""));
             historical_risk(dir.path())["score"].as_u64().unwrap()
         };
-        assert_eq!(band(100, 40, "40.0"), 3, "40% is the top band");
+        assert_eq!(band(100, 40), 3, "40% is the top band");
+        assert_eq!(band(200, 25), 3, "25 safety commits also reaches it");
+        assert_eq!(band(100, 20), 2, "20% is the middle band");
+        assert_eq!(band(200, 10), 2, "10 commits also reaches it");
+        assert_eq!(band(100, 1), 1, "any safety commit scores");
+        assert_eq!(band(100, 0), 0, "none does not");
+
+        // Validated means every classified row signed, as in the
+        // safety gate; one manual CWE without a validator is not.
+        let signed = commits_dir(&table(10, 10, "reviewer"));
         assert_eq!(
-            band(100, 25, "25.0"),
-            3,
-            "25 safety commits also reaches it"
+            historical_risk(signed.path())["data_quality"],
+            "manually_validated"
         );
-        assert_eq!(band(100, 20, "20.0"), 2, "20% is the middle band");
-        assert_eq!(band(100, 10, "10.0"), 2, "10 commits also reaches it");
-        assert_eq!(band(100, 1, "1.0"), 1, "any safety commit scores");
-        assert_eq!(band(100, 0, "0.0"), 0, "none does not");
+        let unsigned = commits_dir(&table(10, 10, ""));
+        assert_eq!(historical_risk(unsigned.path())["data_quality"], "inferred");
+        let one_manual = commits_dir(
+            "hash,safety_related,auto_cwe,manual_cwe,validator\n\
+             a,true,CWE-401,CWE-416,\nb,true,CWE-416,,\n",
+        );
+        assert_eq!(
+            historical_risk(one_manual.path())["data_quality"],
+            "inferred"
+        );
     }
 
     #[test]
