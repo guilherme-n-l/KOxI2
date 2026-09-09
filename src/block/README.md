@@ -301,12 +301,16 @@ from the gate, listed under `campaigns_excluded`, and a side left
 with no usable campaign makes the gate `inconclusive`, since a
 campaign that never ran cannot vouch for a driver. A completion
 marker that exists but cannot be read is an error rather than either.
-Rows of `--validated-crashes` that match no crash on disk are listed
-under `data_quality.manual_overrides.unmatched`, since a mistyped
-crash id otherwise leaves the automatic classification in force
-without a word. Its `verdict.outcome` is one of three words: with zero events on both
-sides, or too few to bound the ratio, it is `inconclusive` and `pass`
-is null, so the gate is never passed by a campaign that found nothing.
+`--validated-crashes` is read by header and quote-aware, so a
+spreadsheet export with every field quoted and a comma in its notes
+reads as written; a file without the `campaign`, `crash_id` and
+`classification` columns is refused. Rows that match no crash on disk
+are listed under `data_quality.manual_overrides.unmatched`, since a
+mistyped crash id otherwise leaves the automatic classification in
+force without a word. Its `verdict.outcome` is one of three words:
+with zero events on both sides, or too few to bound the ratio, it is
+`inconclusive` and `pass` is null, so the gate is never passed by a
+campaign that found nothing.
 
 `safety.json` needs the three static tables of each side with the
 columns the gate reads; a missing file or a renamed column used to

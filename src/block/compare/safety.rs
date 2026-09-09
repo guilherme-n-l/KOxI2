@@ -122,7 +122,7 @@ fn load_table(path: &Path, required: &[&str]) -> anyhow::Result<Vec<Row>> {
     Ok(rows)
 }
 
-fn parse_csv(content: &str) -> (Vec<String>, Vec<Row>) {
+pub(super) fn parse_csv(content: &str) -> (Vec<String>, Vec<Row>) {
     let mut records: Vec<Vec<String>> = Vec::new();
     let mut record: Vec<String> = Vec::new();
     let mut field = String::new();

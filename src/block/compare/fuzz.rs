@@ -150,16 +150,31 @@ pub(super) struct OverrideRow {
 }
 
 /// Sidecar override CSV: campaign,crash_id,classification,validator,date,notes.
+/// Read by header, quote-aware: the file is hand-edited, and a
+/// spreadsheet export quotes every field and puts commas in notes.
 pub(super) fn load_validated_crashes(
     path: &Path,
 ) -> anyhow::Result<HashMap<(String, String), OverrideRow>> {
     let mut overrides = HashMap::new();
     let content =
         fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    for line in content.lines().skip(1) {
-        let fields: Vec<&str> = line.split(',').collect();
-        let get = |index: usize| fields.get(index).map_or("", |field| field.trim());
-        let (campaign, crash_id, class) = (get(0), get(1), get(2));
+    let (header, rows) = super::safety::parse_csv(&content);
+    let required = ["campaign", "crash_id", "classification"];
+    let missing: Vec<&str> = required
+        .iter()
+        .copied()
+        .filter(|column| !header.iter().any(|found| found == column))
+        .collect();
+    ensure!(
+        missing.is_empty(),
+        "{}: missing column(s) {}; the header must name {}",
+        path.display(),
+        missing.join(", "),
+        required.join(", ")
+    );
+    for row in &rows {
+        let get = |column: &str| super::safety::get(row, column).trim();
+        let (campaign, crash_id, class) = (get("campaign"), get("crash_id"), get("classification"));
         if campaign.is_empty() || crash_id.is_empty() || class.is_empty() {
             continue;
         }
@@ -173,13 +188,42 @@ pub(super) fn load_validated_crashes(
             (campaign.to_string(), crash_id.to_string()),
             OverrideRow {
                 classification: class.to_string(),
-                validator: get(3).to_string(),
-                date: get(4).to_string(),
-                notes: get(5).to_string(),
+                validator: get("validator").to_string(),
+                date: get("date").to_string(),
+                notes: get("notes").to_string(),
             },
         );
     }
     Ok(overrides)
+}
+
+/// Adjudication rows that matched no crash on disk, as
+/// `campaign/crash_id`, sorted. Worth a word wherever overrides are
+/// applied: a typo in a crash id silently leaves the automatic
+/// classification in force.
+pub(super) fn unmatched_overrides(
+    overrides: &HashMap<(String, String), OverrideRow>,
+    campaigns: &[&CampaignSummary],
+) -> Vec<String> {
+    let applied: HashSet<(&str, &str)> = campaigns
+        .iter()
+        .flat_map(|campaign| {
+            campaign
+                .manual
+                .iter()
+                .map(|crash| (campaign.id.as_str(), crash.as_str()))
+        })
+        .collect();
+    let mut unmatched: Vec<String> = overrides
+        .keys()
+        .filter(|(campaign, crash)| !applied.contains(&(campaign.as_str(), crash.as_str())))
+        .map(|(campaign, crash)| format!("{campaign}/{crash}"))
+        .collect();
+    unmatched.sort();
+    for row in &unmatched {
+        warn!("--validated-crashes row {row} matched no crash on disk");
+    }
+    unmatched
 }
 
 #[derive(Default)]
@@ -203,6 +247,10 @@ pub(super) struct CampaignSummary {
 }
 
 impl CampaignSummary {
+    pub(super) fn id(&self) -> &str {
+        &self.id
+    }
+
     fn count(&self, class: &str) -> u64 {
         match class {
             TARGET => self.counts.target,
@@ -689,28 +737,9 @@ pub fn compare_fuzz(
             campaigns.len()
         );
     }
-    // Adjudication rows that matched no crash on disk are worth a
-    // word: a typo in a crash id silently leaves the automatic
-    // classification in force.
-    let applied: HashSet<(String, String)> = c_side
-        .iter()
-        .chain(&rs_side)
-        .flat_map(|campaign| {
-            campaign
-                .manual
-                .iter()
-                .map(|crash| (campaign.id.clone(), crash.clone()))
-        })
-        .collect();
-    let mut unmatched: Vec<String> = overrides
-        .keys()
-        .filter(|key| !applied.contains(key))
-        .map(|(campaign, crash)| format!("{campaign}/{crash}"))
-        .collect();
-    unmatched.sort();
-    for row in &unmatched {
-        warn!("--validated-crashes row {row} matched no crash on disk");
-    }
+    let all_campaigns: Vec<&CampaignSummary> = c_side.iter().chain(&rs_side).collect();
+    let applied: usize = all_campaigns.iter().map(|c| c.manual.len()).sum();
+    let unmatched = unmatched_overrides(&overrides, &all_campaigns);
     // A campaign that neither completed nor crashed anything is not
     // a clean campaign: it may have run for a minute or never
     // started. Counting it as zero crashes over its budgeted hours
@@ -755,7 +784,7 @@ pub fn compare_fuzz(
             "status": evidence.status(),
             "crash_attribution": evidence.attribution_quality,
             "manual_overrides": {
-                "applied": applied.len(),
+                "applied": applied,
                 "unmatched": unmatched,
             },
         },
