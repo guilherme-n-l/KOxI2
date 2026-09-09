@@ -395,13 +395,21 @@ pub fn compare_safety(
     } else {
         0.0
     };
+    // No classified commit, no rate: 0 of 0 is not 0%. The gate is
+    // undecided, and the verdict reads a null pass as such rather
+    // than as a failure the driver's history never earned.
+    let decidable = total_classified > 0;
     let total_rs_unsafe = rs_current.driver_unsafe + rs_current.abstraction_unsafe;
     let abstraction_ratio = if total_rs_unsafe > 0 {
         rs_current.abstraction_unsafe as f64 / total_rs_unsafe as f64
     } else {
         0.0
     };
-    let passed = elimination_rate >= threshold / 100.0;
+    let passed = if decidable {
+        json!(elimination_rate >= threshold / 100.0)
+    } else {
+        serde_json::Value::Null
+    };
     // The gate is a threshold rule on a point estimate, and the
     // denominator is small (eleven commits, for the published pair),
     // so the estimate travels with its exact 95% interval and its n.
@@ -439,17 +447,23 @@ pub fn compare_safety(
         "elimination_ci95": [round(ci_lo, 4), round(ci_hi, 4)],
         "n_classified": total_classified,
         "threshold_inside_ci": threshold_inside_ci,
-        "elimination_detail": format!(
-            "{auto_eliminated} of {total_classified} CWE-classified fix commits \
-             eliminated by Rust type system (95% CI {:.1}%-{:.1}%{})",
-            ci_lo * 100.0,
-            ci_hi * 100.0,
-            if threshold_inside_ci {
-                ", threshold inside the interval"
-            } else {
-                ""
-            }
-        ),
+        "elimination_detail": if decidable {
+            format!(
+                "{auto_eliminated} of {total_classified} CWE-classified fix commits \
+                 eliminated by Rust type system (95% CI {:.1}%-{:.1}%{})",
+                ci_lo * 100.0,
+                ci_hi * 100.0,
+                if threshold_inside_ci {
+                    ", threshold inside the interval"
+                } else {
+                    ""
+                }
+            )
+        } else {
+            "no CWE-classified fix commits: the elimination rate is undefined and the \
+             gate is inconclusive"
+                .to_owned()
+        },
         "abstraction_ratio": round(abstraction_ratio, 4),
         "abstraction_detail": format!(
             "{:.0}% of Rust unsafe is in rust/kernel/ abstractions, not driver code",
@@ -493,7 +507,11 @@ pub fn compare_safety(
         elimination_rate * 100.0,
         ci_lo * 100.0,
         ci_hi * 100.0,
-        if passed { "PASS" } else { "FAIL" }
+        match passed.as_bool() {
+            Some(true) => "PASS",
+            Some(false) => "FAIL",
+            None => "INCONCLUSIVE",
+        }
     );
     Ok(())
 }
@@ -563,8 +581,8 @@ mod tests {
         fs::write(dir.join(name), content).unwrap();
     }
 
-    fn fake_static_dirs() -> (std::path::PathBuf, std::path::PathBuf) {
-        let base = std::env::temp_dir().join(format!("koxi-safety-{}", std::process::id()));
+    fn fake_static_dirs(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!("koxi-safety-{tag}-{}", std::process::id()));
         let c_dir = base.join("c");
         let rs_dir = base.join("rs");
         fs::create_dir_all(&c_dir).unwrap();
@@ -625,7 +643,7 @@ mod tests {
 
     #[test]
     fn safety_comparison_matches_v1_semantics() {
-        let (c_dir, rs_dir) = fake_static_dirs();
+        let (c_dir, rs_dir) = fake_static_dirs("v1");
         let c_baseline = analyze_c_baseline(&c_dir);
 
         // Validated CWE-416 (auto-eliminated) overrides auto CWE-401
@@ -644,6 +662,51 @@ mod tests {
         assert_eq!(rs_current.json["unsafe_blocks"], 3);
         assert_eq!(rs_current.json["classifications"]["ffi"], 2);
         assert_eq!(rs_current.json["by_source"]["abstraction"]["density"], 2.0);
+
+        fs::remove_dir_all(c_dir.parent().unwrap()).unwrap();
+    }
+
+    /// The published pair has eleven classified commits; a driver
+    /// with none has no rate, and "0 of 0" must not read as 0%.
+    #[test]
+    fn no_classified_commits_leaves_the_gate_undecided() {
+        use crate::block::cli::{CompareOpts, ScreenOpts};
+        let (c_dir, rs_dir) = fake_static_dirs("undecided");
+        let out = c_dir.parent().unwrap().join("out");
+        fs::create_dir_all(&out).unwrap();
+        let opts = CompareOpts {
+            alpha: 0.05,
+            perf_threshold: 5.0,
+            bootstrap_resamples: 200,
+            fuzz_rate_margin: 2.0,
+            safety_threshold: 34.2,
+            seed: Some(7),
+            screen: ScreenOpts {
+                validated_crashes: None,
+            },
+        };
+        let gate = || {
+            compare_safety(&c_dir, &rs_dir, &opts, &out).map(|()| {
+                serde_json::from_str::<serde_json::Value>(
+                    &fs::read_to_string(out.join("safety.json")).unwrap(),
+                )
+                .unwrap()
+            })
+        };
+        assert_eq!(gate().unwrap()["verdict"]["pass"], true);
+
+        let header = "hash,driver,safety_related,auto_cwe,manual_cwe,validator\n";
+        write(&c_dir, "commits.csv", header);
+        let stats = gate().unwrap();
+        assert_eq!(stats["verdict"]["pass"], serde_json::Value::Null);
+        assert_eq!(stats["comparison"]["n_classified"], 0);
+        // Safety-related but never given a CWE: the same undefined rate.
+        write(
+            &c_dir,
+            "commits.csv",
+            &format!("{header}a,null_blk,true,,,\nb,null_blk,true,,,\n"),
+        );
+        assert_eq!(gate().unwrap()["verdict"]["pass"], serde_json::Value::Null);
 
         fs::remove_dir_all(c_dir.parent().unwrap()).unwrap();
     }
