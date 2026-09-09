@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
+use anyhow::{bail, ensure, Context};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -96,6 +97,32 @@ pub(super) fn read_csv(path: &Path) -> Vec<Row> {
     let Ok(content) = fs::read_to_string(path) else {
         return Vec::new();
     };
+    parse_csv(&content).1
+}
+
+/// A static-analysis table the gate cannot do without. The file must
+/// exist and its header must carry every column the gate reads: a
+/// missing file or a renamed column used to read as an empty table,
+/// and an empty table is a zero, which is a verdict.
+fn load_table(path: &Path, required: &[&str]) -> anyhow::Result<Vec<Row>> {
+    let content =
+        fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let (header, rows) = parse_csv(&content);
+    let missing: Vec<&str> = required
+        .iter()
+        .copied()
+        .filter(|column| !header.iter().any(|found| found == column))
+        .collect();
+    ensure!(
+        missing.is_empty(),
+        "{}: missing column(s) {}",
+        path.display(),
+        missing.join(", ")
+    );
+    Ok(rows)
+}
+
+fn parse_csv(content: &str) -> (Vec<String>, Vec<Row>) {
     let mut records: Vec<Vec<String>> = Vec::new();
     let mut record: Vec<String> = Vec::new();
     let mut field = String::new();
@@ -164,7 +191,45 @@ pub(super) fn read_csv(path: &Path) -> Vec<Row> {
             }
         }
     }
-    rows
+    (header.unwrap_or_default(), rows)
+}
+
+const FUNCTIONS_COLUMNS: [&str; 1] = ["line_count"];
+const DENSITY_COLUMNS: [&str; 12] = [
+    "driver",
+    "file",
+    "language",
+    "total_functions",
+    "unsafe_blocks",
+    "unsafe_fns",
+    "unsafe_impls",
+    "ptr_derefs",
+    "alloc_calls",
+    "free_calls",
+    "memop_calls",
+    "cast_exprs",
+];
+const COMMITS_COLUMNS: [&str; 5] = [
+    "hash",
+    "safety_related",
+    "auto_cwe",
+    "manual_cwe",
+    "validator",
+];
+const SITES_COLUMNS: [&str; 3] = ["source", "file", "purpose"];
+
+/// `safety_related` is written as true/false and read back as a
+/// filter; a hand edit to "yes" or "TRUE" used to be neither.
+fn safety_related(commit: &Row, path: &Path) -> anyhow::Result<bool> {
+    match get(commit, "safety_related").trim() {
+        "true" => Ok(true),
+        "false" | "" => Ok(false),
+        other => bail!(
+            "{}: commit {} has safety_related {other:?}; expected true or false",
+            path.display(),
+            get(commit, "hash")
+        ),
+    }
 }
 
 pub(super) fn get<'a>(row: &'a Row, key: &str) -> &'a str {
@@ -190,10 +255,14 @@ struct CBaseline {
     acsac_counts: BTreeMap<&'static str, u64>,
 }
 
-fn analyze_c_baseline(static_dir: &Path) -> CBaseline {
-    let functions = read_csv(&static_dir.join("functions.csv"));
-    let densities = read_csv(&static_dir.join("unsafe_density.csv"));
-    let commits = read_csv(&static_dir.join("commits.csv"));
+fn analyze_c_baseline(static_dir: &Path) -> anyhow::Result<CBaseline> {
+    let functions = load_table(&static_dir.join("functions.csv"), &FUNCTIONS_COLUMNS)?;
+    let densities = load_table(&static_dir.join("unsafe_density.csv"), &DENSITY_COLUMNS)?;
+    let commits_path = static_dir.join("commits.csv");
+    let commits = load_table(&commits_path, &COMMITS_COLUMNS)?;
+    for commit in &commits {
+        safety_related(commit, &commits_path)?;
+    }
 
     let total_lines: u64 = functions.iter().map(|row| number(row, "line_count")).sum();
 
@@ -244,7 +313,7 @@ fn analyze_c_baseline(static_dir: &Path) -> CBaseline {
     let safety_commits = commits
         .iter()
         .filter(|commit| {
-            get(commit, "safety_related") == "true" || !effective_cwe(commit).is_empty()
+            get(commit, "safety_related").trim() == "true" || !effective_cwe(commit).is_empty()
         })
         .count();
 
@@ -267,7 +336,7 @@ fn analyze_c_baseline(static_dir: &Path) -> CBaseline {
         .collect::<serde_json::Map<String, serde_json::Value>>()
         .into();
 
-    CBaseline {
+    Ok(CBaseline {
         json: json!({
             "total_functions": functions.len(),
             "total_lines": total_lines,
@@ -281,7 +350,7 @@ fn analyze_c_baseline(static_dir: &Path) -> CBaseline {
             },
         }),
         acsac_counts,
-    }
+    })
 }
 
 struct RsCurrent {
@@ -290,10 +359,10 @@ struct RsCurrent {
     abstraction_unsafe: u64,
 }
 
-fn analyze_rs_current(static_dir: &Path) -> RsCurrent {
-    let functions = read_csv(&static_dir.join("functions.csv"));
-    let unsafe_sites = read_csv(&static_dir.join("unsafe_sites.csv"));
-    let densities = read_csv(&static_dir.join("unsafe_density.csv"));
+fn analyze_rs_current(static_dir: &Path) -> anyhow::Result<RsCurrent> {
+    let functions = load_table(&static_dir.join("functions.csv"), &FUNCTIONS_COLUMNS)?;
+    let unsafe_sites = load_table(&static_dir.join("unsafe_sites.csv"), &SITES_COLUMNS)?;
+    let densities = load_table(&static_dir.join("unsafe_density.csv"), &DENSITY_COLUMNS)?;
 
     let total_functions = functions.len() as u64;
     let total_lines: u64 = functions.iter().map(|row| number(row, "line_count")).sum();
@@ -362,7 +431,7 @@ fn analyze_rs_current(static_dir: &Path) -> RsCurrent {
             0.0
         }
     };
-    RsCurrent {
+    Ok(RsCurrent {
         json: json!({
             "total_functions": total_functions,
             "total_lines": total_lines,
@@ -375,7 +444,7 @@ fn analyze_rs_current(static_dir: &Path) -> RsCurrent {
         }),
         driver_unsafe: split["driver"],
         abstraction_unsafe: split["abstraction"],
-    }
+    })
 }
 
 pub fn compare_safety(
@@ -385,8 +454,8 @@ pub fn compare_safety(
     outdir: &Path,
 ) -> anyhow::Result<()> {
     let threshold = opts.safety_threshold;
-    let c_baseline = analyze_c_baseline(p1_static);
-    let rs_current = analyze_rs_current(p2_static);
+    let c_baseline = analyze_c_baseline(p1_static)?;
+    let rs_current = analyze_rs_current(p2_static)?;
 
     let auto_eliminated = c_baseline.acsac_counts["auto_eliminated"];
     let total_classified: u64 = c_baseline.acsac_counts.values().sum();
@@ -644,7 +713,7 @@ mod tests {
     #[test]
     fn safety_comparison_matches_v1_semantics() {
         let (c_dir, rs_dir) = fake_static_dirs("v1");
-        let c_baseline = analyze_c_baseline(&c_dir);
+        let c_baseline = analyze_c_baseline(&c_dir).unwrap();
 
         // Validated CWE-416 (auto-eliminated) overrides auto CWE-401
         // (needs discipline): 2 auto_eliminated, 0 discipline, 1
@@ -656,7 +725,7 @@ mod tests {
         assert_eq!(c_baseline.json["implicit_unsafe_operations"], 120);
         assert_eq!(c_baseline.json["total_lines"], 30);
 
-        let rs_current = analyze_rs_current(&rs_dir);
+        let rs_current = analyze_rs_current(&rs_dir).unwrap();
         assert_eq!(rs_current.driver_unsafe, 1);
         assert_eq!(rs_current.abstraction_unsafe, 2);
         assert_eq!(rs_current.json["unsafe_blocks"], 3);
@@ -707,6 +776,26 @@ mod tests {
             &format!("{header}a,null_blk,true,,,\nb,null_blk,true,,,\n"),
         );
         assert_eq!(gate().unwrap()["verdict"]["pass"], serde_json::Value::Null);
+
+        // The tables are required, with their columns and their
+        // booleans: none of these is an empty table.
+        write(&c_dir, "commits.csv", "hash,driver\n1,null_blk\n");
+        let error = gate().unwrap_err().to_string();
+        assert!(error.contains("missing column"), "{error}");
+        write(
+            &c_dir,
+            "commits.csv",
+            &format!("{header}a,null_blk,yes,CWE-416,,reviewer\n"),
+        );
+        let error = gate().unwrap_err().to_string();
+        assert!(error.contains("safety_related \"yes\""), "{error}");
+        fs::remove_file(c_dir.join("commits.csv")).unwrap();
+        let error = gate().unwrap_err().to_string();
+        assert!(error.contains("commits.csv"), "{error}");
+        write(&c_dir, "commits.csv", header);
+        fs::remove_file(rs_dir.join("unsafe_sites.csv")).unwrap();
+        let error = gate().unwrap_err().to_string();
+        assert!(error.contains("unsafe_sites.csv"), "{error}");
 
         fs::remove_dir_all(c_dir.parent().unwrap()).unwrap();
     }

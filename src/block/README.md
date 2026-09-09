@@ -302,6 +302,12 @@ without a word. Its `verdict.outcome` is one of three words: with zero events on
 sides, or too few to bound the ratio, it is `inconclusive` and `pass`
 is null, so the gate is never passed by a campaign that found nothing.
 
+`safety.json` needs the three static tables of each side with the
+columns the gate reads; a missing file or a renamed column used to
+read as an empty table, and an empty table is a zero. A driver whose
+history holds no CWE-classified fix commit has no elimination rate,
+and the gate is inconclusive rather than failed at 0 of 0.
+
 `perf_stats.json` reports `data_quality.device_geometry`: the block
 queue limits and configfs attributes each device actually presented,
 read from the guest, and whether the two sides matched. A mismatch
