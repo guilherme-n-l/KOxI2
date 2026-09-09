@@ -4,11 +4,11 @@
 //! the collector itself.
 
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use tracing::info;
+use crate::util::FileLock;
 
 /// Reusable downloads: tarballs, extracted source trees, git
 /// checkouts and history mirrors (`koxi clean --cache` collects).
@@ -43,7 +43,7 @@ pub fn koxi_home() -> Result<PathBuf, NoHome> {
 /// holder dies, so a killed run never wedges the cache.
 #[derive(Debug)]
 pub struct CacheLock {
-    _file: File,
+    _lock: FileLock,
 }
 
 impl CacheLock {
@@ -52,25 +52,9 @@ impl CacheLock {
     pub fn acquire(home: &Path) -> io::Result<Self> {
         let cache = home.join(CACHE_DIR);
         fs::create_dir_all(&cache)?;
-        let path = cache.join(CACHE_LOCK);
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)?;
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => {
-                info!(
-                    "waiting for the cache lock at {} (another koxi run holds it)",
-                    path.display()
-                );
-                file.lock()?;
-            }
-            Err(TryLockError::Error(err)) => return Err(err),
-        }
-        Ok(Self { _file: file })
+        Ok(Self {
+            _lock: FileLock::acquire(&cache.join(CACHE_LOCK), "cache")?,
+        })
     }
 }
 
@@ -159,6 +143,7 @@ pub fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{OpenOptions, TryLockError};
 
     #[test]
     fn cache_lock_excludes_a_second_holder() {

@@ -2,7 +2,7 @@
 //! rounding, hashing, in-memory CSV rendering, filesystem walks,
 //! tool probes, and the yes/no prompt.
 
-use std::fs;
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -12,6 +12,38 @@ use sha2::{Digest, Sha256};
 use tracing::info;
 
 /// Seconds since the Unix epoch (0 when the clock predates it).
+/// Exclusive advisory lock on a file, held for the guard's lifetime.
+/// Released when dropped or when the holder dies, so a killed run
+/// never wedges what it guarded. `what` names the guarded thing on
+/// the console while another run holds it.
+#[derive(Debug)]
+pub struct FileLock {
+    _file: File,
+}
+
+impl FileLock {
+    pub fn acquire(path: &Path, what: &str) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                info!(
+                    "waiting for the {what} lock at {} (another koxi run holds it)",
+                    path.display()
+                );
+                file.lock()?;
+            }
+            Err(TryLockError::Error(err)) => return Err(err),
+        }
+        Ok(Self { _file: file })
+    }
+}
+
 pub fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
