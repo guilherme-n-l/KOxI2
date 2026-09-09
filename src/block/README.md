@@ -239,7 +239,9 @@ baseline the campaign recorded rather than whatever is newest:
    checkable after the fact.
 
 Each domain that survives that feeds its gate, and the artifacts land
-in `<campaign>/compare/`.
+in `<campaign>/compare/`. A campaign directory with no usable domain
+gets no verdict at all: an all-unavailable `verdict.json` behind a
+failed compare reads too much like a result.
 
 Because the baseline is recorded by hash and not by symlink, a
 results tree can be moved between machines and re-gated there:

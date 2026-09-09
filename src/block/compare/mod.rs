@@ -74,6 +74,7 @@ pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow
         // a fuzz campaign under TCG beside a KVM perf run must not
         // borrow the perf run's substrate and travel as measured.
         let mut substrates: BTreeMap<String, Substrate> = BTreeMap::new();
+        let mut domains = 0;
         let mut record = |domain: &str,
                           manifest: &Manifest,
                           baselines: &mut BTreeMap<_, _>,
@@ -91,7 +92,7 @@ pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow
                     },
                 );
             }
-            compared += 1;
+            domains += 1;
         };
 
         // Performance gate.
@@ -142,6 +143,19 @@ pub(crate) fn drive(scope: &Scope, campaign: &str, opts: &CompareOpts) -> anyhow
         } else {
             info!("safety comparison: missing static data; skipping");
         }
+
+        // A campaign directory with no domain in it has nothing to
+        // gate. Writing a verdict here would leave an all-unavailable
+        // verdict.json behind a failed compare, and the next reader
+        // would take it for this campaign's result.
+        if domains == 0 {
+            warn!(
+                "no domain data for {c_name}::{rs_name} under {}",
+                campaign_root.display()
+            );
+            continue;
+        }
+        compared += domains;
 
         // Fold whatever landed into the overall verdict.
         // An unreadable screening.json is not an absent one. Chaining
