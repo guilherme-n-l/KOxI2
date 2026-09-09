@@ -212,6 +212,15 @@ fn load_domain(
     if !baseline.complete {
         bail!("baseline {} is incomplete", p1_dir.display());
     }
+    let actual_hash = results::identity_hash(&baseline.identity)?;
+    if actual_hash != p2.baseline {
+        bail!(
+            "baseline {} has identity hash {actual_hash}, but the campaign records {}; \
+             restore the recorded baseline or re-run the {domain} phase",
+            p1_dir.display(),
+            p2.baseline
+        );
+    }
     // Same-substrate guard: the identity carries host+accel exactly
     // so cross-machine or KVM-vs-TCG data can never be pooled.
     if baseline.identity.host != manifest.identity.host
@@ -226,4 +235,69 @@ fn load_domain(
         );
     }
     Ok(Some((p2_dir, p1_dir, manifest)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::results::Campaign;
+
+    fn baseline_manifest() -> Manifest {
+        toml::from_str(
+            r#"
+            complete = true
+            created = 1
+            seed = 42
+            koxi = "test"
+            [identity]
+            domain = "perf"
+            driver = "null_blk"
+            spec = "c:null_blk:null_blk.ko:/dev/nullb0:::"
+            prep = ""
+            host = "test"
+            accel = "kvm"
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_recorded_baseline_hash_must_match_its_manifest() {
+        let root = std::env::temp_dir().join(format!("koxi-baseline-hash-{}", std::process::id()));
+        let campaign_root = root.join("p2/null_blk::rnull/trial");
+        let mut baseline = baseline_manifest();
+        let hash = results::identity_hash(&baseline.identity).unwrap();
+        let p1 = results::p1_dir(&root, "null_blk", "perf", &hash);
+        baseline.save(&p1).unwrap();
+        let mut campaign = baseline.clone();
+        campaign.identity.driver = "rnull".into();
+        campaign.p2 = Some(Campaign {
+            campaign: "trial".into(),
+            c_driver: "null_blk".into(),
+            rs_driver: "rnull".into(),
+            baseline: hash,
+        });
+        campaign.save(&campaign_root.join("perf")).unwrap();
+        assert!(load_domain(&root, &campaign_root, "null_blk", "perf")
+            .unwrap()
+            .is_some());
+
+        // State and read-back geometry are not part of the identity.
+        baseline.created += 1;
+        baseline
+            .device
+            .insert("queue.scheduler".into(), "none".into());
+        baseline.save(&p1).unwrap();
+        assert!(load_domain(&root, &campaign_root, "null_blk", "perf")
+            .unwrap()
+            .is_some());
+
+        // A changed setup contract must not masquerade as the old baseline.
+        baseline.identity.prep = "echo mq-deadline > /sys/block/nullb0/queue/scheduler".into();
+        baseline.save(&p1).unwrap();
+        let error = load_domain(&root, &campaign_root, "null_blk", "perf").unwrap_err();
+        assert!(error.to_string().contains("identity hash"));
+        assert!(error.to_string().contains(&p1.display().to_string()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
