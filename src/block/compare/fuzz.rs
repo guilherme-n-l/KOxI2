@@ -242,9 +242,9 @@ pub(super) fn classify_campaign(
             .collect::<Vec<_>>()
             .join("\n");
         let auto = classifier.classify(&text);
-        let manual = overrides.get(&(campaign.clone(), crash_id.clone()));
-        let effective = manual.map_or(auto, |row| row.classification.as_str());
-        if manual.is_some() {
+        let row = overrides.get(&(campaign.clone(), crash_id.clone()));
+        let effective = row.map_or(auto, |row| row.classification.as_str());
+        if row.is_some() {
             manual_applied += 1;
         }
         match effective {
@@ -256,11 +256,11 @@ pub(super) fn classify_campaign(
             "crash_id": crash_id,
             "classification": effective,
             "auto_classification": auto,
-            "manual_classification": manual.map(|row| row.classification.clone())
+            "manual_classification": row.map(|row| row.classification.clone())
                 .unwrap_or_default(),
-            "validator": manual.map(|row| row.validator.clone()).unwrap_or_default(),
-            "validation_date": manual.map(|row| row.date.clone()).unwrap_or_default(),
-            "notes": manual.map(|row| row.notes.clone()).unwrap_or_default(),
+            "validator": row.map(|row| row.validator.clone()).unwrap_or_default(),
+            "validation_date": row.map(|row| row.date.clone()).unwrap_or_default(),
+            "notes": row.map(|row| row.notes.clone()).unwrap_or_default(),
             "evidence_files": evidence
                 .iter()
                 .filter_map(|path| path.strip_prefix(campaign_dir).ok())
@@ -275,9 +275,10 @@ pub(super) fn classify_campaign(
     // completed campaign means zero crashes, not missing data. Only a
     // campaign that neither completed nor left any crashes behind is
     // genuinely unavailable.
+    let marker = read_marker(campaign_dir)?;
     let quality = if manual_applied > 0 {
         "manually_validated"
-    } else if campaign_dir.join(CAMPAIGN_DONE).is_file() || campaign_dir.join("crashes").is_dir() {
+    } else if marker.is_some() || campaign_dir.join("crashes").is_dir() {
         "measured"
     } else {
         "unavailable"
@@ -304,19 +305,36 @@ pub(super) fn classify_campaign(
         unique_crashes: groups.len() as u64,
         counts,
         quality,
-        hours: measured_hours(campaign_dir),
+        hours: marker.as_deref().and_then(parse_hours),
     })
+}
+
+/// The completion marker's text, None when the campaign never wrote
+/// one. A marker that exists but cannot be read (a directory under
+/// that name, say) is an error: it is neither a completed campaign
+/// nor a dead one, and guessing either way would count it wrong.
+fn read_marker(campaign_dir: &Path) -> anyhow::Result<Option<String>> {
+    let path = campaign_dir.join(CAMPAIGN_DONE);
+    match fs::read_to_string(&path) {
+        Ok(text) => Ok(Some(text)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("reading {}", path.display())),
+    }
 }
 
 /// The exposure a campaign actually bought, from the seconds its
 /// completion marker records. An empty marker (v1, and koxi before
 /// the marker carried a number) reads as unknown rather than zero.
-fn measured_hours(campaign_dir: &Path) -> Option<f64> {
-    let text = fs::read_to_string(campaign_dir.join(CAMPAIGN_DONE)).ok()?;
-    let seconds: f64 = text.trim().parse().ok()?;
+fn parse_hours(marker: &str) -> Option<f64> {
+    let seconds: f64 = marker.trim().parse().ok()?;
     // Rust's parser accepts "inf" and "NaN"; neither is a duration,
     // and an infinite denominator panics inside the beta function.
     (seconds.is_finite() && seconds > 0.0).then_some(seconds / 3600.0)
+}
+
+#[cfg(test)]
+fn measured_hours(campaign_dir: &Path) -> anyhow::Result<Option<f64>> {
+    Ok(read_marker(campaign_dir)?.as_deref().and_then(parse_hours))
 }
 
 /// syzkaller's crashes/ dir: one bucket per unique crash, either a
@@ -1362,15 +1380,30 @@ mod tests {
             campaign
         };
         // A campaign killed at six minutes of a one-hour budget.
-        assert_eq!(measured_hours(&write("short", "360.000\n")), Some(0.1));
+        assert_eq!(
+            measured_hours(&write("short", "360.000\n")).unwrap(),
+            Some(0.1)
+        );
         // v1 and pre-marker koxi wrote an empty marker: unknown, not zero.
-        assert_eq!(measured_hours(&write("legacy", "")), None);
-        assert_eq!(measured_hours(&write("odd", "not a number")), None);
-        assert_eq!(measured_hours(&dir.path().join("absent")), None);
+        assert_eq!(measured_hours(&write("legacy", "")).unwrap(), None);
+        assert_eq!(measured_hours(&write("odd", "not a number")).unwrap(), None);
+        assert_eq!(measured_hours(&dir.path().join("absent")).unwrap(), None);
         // Parseable but not a duration: the gate must not divide by these.
         for marker in ["inf\n", "-inf\n", "NaN\n", "0\n", "-1\n"] {
-            assert_eq!(measured_hours(&write("bad", marker)), None, "{marker:?}");
+            assert_eq!(
+                measured_hours(&write("bad", marker)).unwrap(),
+                None,
+                "{marker:?}"
+            );
         }
+        // A marker that exists but cannot be read is neither completed
+        // nor dead: an error, not a guess.
+        let odd = dir.path().join("dir-marker");
+        fs::create_dir_all(odd.join(CAMPAIGN_DONE)).unwrap();
+        assert!(measured_hours(&odd)
+            .unwrap_err()
+            .to_string()
+            .contains(CAMPAIGN_DONE));
 
         let campaign = |hours: Option<f64>| CampaignSummary {
             id: "c".to_owned(),
