@@ -1100,4 +1100,28 @@ mod tests {
         assert_eq!((lo, hi), (-10.0, -10.0));
         assert!(bootstrap_median_delta_ci(&[], &rs, 10, 1).is_err());
     }
+
+    #[test]
+    fn degenerate_counts_and_levels_do_not_panic() {
+        // k > n is impossible evidence; before the guard this underflowed,
+        // panicking in debug and wrapping into a bound in release.
+        assert_eq!(clopper_pearson(5, 3, 0.95), (0.0, 1.0));
+        assert_eq!(clopper_pearson(1, 0, 0.95), (0.0, 1.0));
+        // Out-of-range and NaN confidence levels clamp instead of tripping
+        // the beta inverse-cdf assertion.
+        for conf in [1.5, -0.5, f64::NAN] {
+            let (lo, hi) = clopper_pearson(2, 10, conf);
+            assert!((0.0..=1.0).contains(&lo) && (0.0..=1.0).contains(&hi));
+        }
+        // k + 1 used to overflow at the top of the range, and a NaN level
+        // used to panic; both mean no usable bound.
+        assert!(poisson_upper(u64::MAX, 0.95).is_infinite());
+        assert!(poisson_upper(1, f64::NAN).is_infinite());
+        // A NaN exposure used to panic; it is not a testable effect.
+        assert_eq!(binomial_mde_ratio(5, f64::NAN, 1.0, 0.05, 0.8), None);
+        // The ordinary paths are untouched.
+        assert!((poisson_upper(0, 0.95) - 2.995732).abs() < 1e-5);
+        let (lo, hi) = clopper_pearson(2, 10, 0.95);
+        assert!(lo < 0.03 && hi > 0.55);
+    }
 }
