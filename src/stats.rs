@@ -607,6 +607,18 @@ pub fn binomial_sf(k: u64, n: u64, p: f64) -> f64 {
 /// 1 - alpha bound is the corresponding side of the 1 - 2*alpha
 /// interval.
 pub fn clopper_pearson(k: u64, n: u64, conf_level: f64) -> (f64, f64) {
+    // A count above the trial total is impossible evidence: report the
+    // widest interval instead of letting n - k underflow (a panic in a
+    // debug build, a wrapped bound in a release one).
+    if k > n {
+        return (0.0, 1.0);
+    }
+    // The tails must stay inside [0, 1] for the beta quantile; 1.5 or
+    // NaN used to trip an assertion deep inside statrs.
+    if conf_level.is_nan() {
+        return (0.0, 1.0);
+    }
+    let conf_level = conf_level.clamp(0.0, 1.0);
     let tail = (1.0 - conf_level) / 2.0;
     let lo = if k == 0 {
         0.0
@@ -625,9 +637,14 @@ pub fn clopper_pearson(k: u64, n: u64, conf_level: f64) -> (f64, f64) {
 /// observed count (gamma quantile; k = 0 at 95% is the rule of
 /// three, 2.9957). Divide by the exposure for a rate bound.
 pub fn poisson_upper(k: u64, level: f64) -> f64 {
+    // A NaN or out-of-range level is not a level, and k + 1 overflows at
+    // the top of the range; both mean no usable bound.
+    if level.is_nan() || k == u64::MAX {
+        return f64::INFINITY;
+    }
     Gamma::new((k + 1) as f64, 1.0)
         .expect("valid gamma parameters")
-        .inverse_cdf(level)
+        .inverse_cdf(level.clamp(0.0, 1.0))
 }
 
 /// Analytic minimum detectable effect for the exact conditional
@@ -638,7 +655,9 @@ pub fn poisson_upper(k: u64, level: f64) -> f64 {
 /// test rejects with probability >= `power` — None when the test can
 /// never reject at this total (too few events).
 pub fn binomial_mde_ratio(total: u64, t_c: f64, t_rs: f64, alpha: f64, power: f64) -> Option<f64> {
-    if total == 0 || t_c <= 0.0 || t_rs <= 0.0 {
+    // Comparisons with NaN are false, so the negated forms catch a NaN
+    // exposure, which used to panic inside the beta quantile below.
+    if total == 0 || !(t_c > 0.0) || !(t_rs > 0.0) || !alpha.is_finite() || !power.is_finite() {
         return None;
     }
     let p_of = |rho: f64| rho * t_rs / (rho * t_rs + t_c);
@@ -1080,5 +1099,29 @@ mod tests {
         let (lo, hi) = bootstrap_median_delta_ci(&[100.0; 5], &[90.0; 5], 100, 7).unwrap();
         assert_eq!((lo, hi), (-10.0, -10.0));
         assert!(bootstrap_median_delta_ci(&[], &rs, 10, 1).is_err());
+    }
+
+    #[test]
+    fn degenerate_counts_and_levels_do_not_panic() {
+        // k > n is impossible evidence; before the guard this underflowed,
+        // panicking in debug and wrapping into a bound in release.
+        assert_eq!(clopper_pearson(5, 3, 0.95), (0.0, 1.0));
+        assert_eq!(clopper_pearson(1, 0, 0.95), (0.0, 1.0));
+        // Out-of-range and NaN confidence levels clamp instead of tripping
+        // the beta inverse-cdf assertion.
+        for conf in [1.5, -0.5, f64::NAN] {
+            let (lo, hi) = clopper_pearson(2, 10, conf);
+            assert!((0.0..=1.0).contains(&lo) && (0.0..=1.0).contains(&hi));
+        }
+        // k + 1 used to overflow at the top of the range, and a NaN level
+        // used to panic; both mean no usable bound.
+        assert!(poisson_upper(u64::MAX, 0.95).is_infinite());
+        assert!(poisson_upper(1, f64::NAN).is_infinite());
+        // A NaN exposure used to panic; it is not a testable effect.
+        assert_eq!(binomial_mde_ratio(5, f64::NAN, 1.0, 0.05, 0.8), None);
+        // The ordinary paths are untouched.
+        assert!((poisson_upper(0, 0.95) - 2.995732).abs() < 1e-5);
+        let (lo, hi) = clopper_pearson(2, 10, 0.95);
+        assert!(lo < 0.03 && hi > 0.55);
     }
 }
